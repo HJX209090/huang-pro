@@ -752,6 +752,29 @@ export const useAppStore = defineStore('app', {
           this.addLog('warning', '定时', message)
           return message
         }
+        if (window.tujian?.ensurePublishLogin) {
+          try {
+            const ensured = await window.tujian.ensurePublishLogin({
+              id: account.id,
+              name: account.name,
+              login: account.login,
+              mode: account.loginMode || 'password',
+              url: 'https://creator.douyin.com/creator-micro/content/upload'
+            })
+            if (ensured?.loginStatus) account.loginStatus = ensured.loginStatus
+            this.persist()
+            if (!ensured?.ok && ensured?.loginStatus !== '已登录') {
+              const message = `${task.name}：${ensured.message || '达人账号未登录，已尝试自动重登'}`
+              this.endTask(taskId, message, 'failed')
+              this.addLog('warning', '定时', message)
+              return message
+            }
+            if (ensured?.reused) this.addLog('info', '定时', `${account.name}：沿用已保存登录态`)
+            else this.addLog('info', '定时', `${account.name}：${ensured.message || '登录态已就绪'}`)
+          } catch (error) {
+            this.addLog('warning', '定时', `${account.name}：检查登录态失败 ${error.message || ''}`)
+          }
+        }
         const posted = await this.publishWorksBatch(ready, account)
         if (posted > 0) {
           task.lastSuccessDay = stamp.slice(0, 10)

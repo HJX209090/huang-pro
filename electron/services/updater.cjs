@@ -60,9 +60,20 @@ function setupUpdater() {
     })
   })
   autoUpdater.on('error', (error) => {
+    const raw = error?.message || String(error || '更新失败')
+    // 还没发过 Release / 仓库私有时 GitHub 会 404，不当成硬错误吓人
+    if (/404|releases\.atom|ERR_CONNECTION|ENOTFOUND|net::/i.test(raw)) {
+      broadcast({
+        status: 'not-available',
+        message: '当前已是最新版本（或云端尚未发布安装包）',
+        version: app.getVersion(),
+        softError: raw
+      })
+      return
+    }
     broadcast({
       status: 'error',
-      message: error?.message || String(error || '更新失败')
+      message: raw
     })
   })
 }
@@ -71,7 +82,8 @@ async function checkForUpdates({ manual = false } = {}) {
   if (!app.isPackaged) {
     const payload = {
       status: 'dev',
-      message: '开发模式不检查更新，请使用安装版体验自动更新'
+      message: '开发模式不检查更新，请使用安装版体验自动更新',
+      manual: Boolean(manual)
     }
     broadcast(payload)
     return { ok: false, ...payload }
@@ -88,9 +100,22 @@ async function checkForUpdates({ manual = false } = {}) {
       currentVersion: app.getVersion()
     }
   } catch (error) {
+    const raw = error?.message || '检查更新失败，请确认已联网'
+    if (/404|releases\.atom|ERR_CONNECTION|ENOTFOUND|net::/i.test(raw)) {
+      const payload = {
+        status: 'not-available',
+        message: manual ? '没有检测到新版本（请确认 GitHub Releases 已发布安装包）' : '已是最新版本',
+        version: app.getVersion(),
+        manual: Boolean(manual),
+        softError: raw
+      }
+      broadcast(payload)
+      return { ok: true, ...payload }
+    }
     const payload = {
       status: 'error',
-      message: error?.message || '检查更新失败，请确认已联网'
+      message: raw,
+      manual: Boolean(manual)
     }
     broadcast(payload)
     return { ok: false, ...payload }

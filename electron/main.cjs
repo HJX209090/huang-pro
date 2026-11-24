@@ -262,6 +262,7 @@ ipcMain.handle('account:status', (_event, payload) => browserSession.accountStat
 ipcMain.handle('account:code', (_event, payload) => browserSession.submitCode(payload || {}))
 ipcMain.handle('account:send-code', (_event, payload) => browserSession.requestCode(payload || {}))
 ipcMain.handle('doubao:bootstrap-login', (_event, payload) => browserSession.bootstrapDoubaoLogin(payload || {}))
+ipcMain.handle('account:ensure-login', (_event, payload) => browserSession.ensurePublishLogin(payload || {}))
 ipcMain.handle('dialog:images', async () => {
   const result = await dialog.showOpenDialog({
     title: '选择商品图',

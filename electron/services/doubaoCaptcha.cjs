@@ -424,23 +424,41 @@ function normalizeConfig(raw) {
   }
 }
 
+function framesOf(frame, list = []) {
+  list.push(frame)
+  for (const child of frame.frames || []) framesOf(child, list)
+  return list
+}
+
 function tilesScript() {
   return `(() => {
-    const body = String(document.body?.innerText || '').slice(0, 16000)
-    const promptLine = (body.split(/\\n+/).map((line) => line.trim()).find((line) =>
-      line.length >= 2 && line.length <= 48 && /(请选择|符合上文|拖拽到这里|露营|厨房|浴室|办公室|物品|可以用到)/.test(line) && !/刷新|反馈|提交/.test(line)
-    ) || '')
-    const drop = Array.from(document.querySelectorAll('div,section,span')).find((el) => {
+    const body = String(document.body?.innerText || document.documentElement?.innerText || '').slice(0, 20000)
+    const lines = body.split(/\\n+/).map((line) => line.trim()).filter(Boolean)
+    let promptLine = ''
+    for (const line of lines) {
+      if (line.length >= 2 && line.length <= 60 && /(请选择|符合上文|拖拽到这里|露营|厨房|浴室|办公室|物品|可以用到|所有符合)/.test(line) && !/刷新|反馈|提交成功/.test(line)) {
+        promptLine = line
+        break
+      }
+    }
+    if (!promptLine) {
+      for (const line of lines) {
+        if (line.length >= 4 && line.length <= 24 && !/刷新|反馈|提交|拖拽到这里/.test(line)) {
+          promptLine = line
+          break
+        }
+      }
+    }
+    const drop = Array.from(document.querySelectorAll('div,section,span,p')).find((el) => {
       const text = String(el.innerText || '').replace(/\\s+/g, '')
       const rect = el.getBoundingClientRect()
-      return text.includes('拖拽到这里') && rect.width >= 80 && rect.height >= 40
+      return /拖拽到这里|拖到此处|放到这里/.test(text) && rect.width >= 60 && rect.height >= 36
     })
     const dropRect = drop ? drop.getBoundingClientRect() : null
     const imgs = Array.from(document.querySelectorAll('img, canvas'))
       .map((el) => {
         const rect = el.getBoundingClientRect()
         return {
-          el,
           left: rect.left,
           top: rect.top,
           width: rect.width,
@@ -449,17 +467,19 @@ function tilesScript() {
           cy: rect.top + rect.height / 2
         }
       })
-      .filter((item) => item.width >= 48 && item.height >= 48 && item.width <= 220 && item.height <= 220)
+      .filter((item) => item.width >= 40 && item.height >= 40 && item.width <= 260 && item.height <= 260)
       .sort((a, b) => (a.top - b.top) || (a.left - b.left))
-    // 取最整齐的 3x3 / 2xN 网格
     let tiles = imgs.slice(0, 12)
-    if (tiles.length >= 9) {
-      const firstNine = tiles.slice(0, 9)
-      const tops = [...new Set(firstNine.map((item) => Math.round(item.top / 8) * 8))]
-      if (tops.length >= 2) tiles = firstNine
-    }
+    if (tiles.length >= 9) tiles = tiles.slice(0, 9)
+    const submit = Array.from(document.querySelectorAll('button, [role="button"], div, span')).find((el) => {
+      const text = String(el.innerText || '').replace(/\\s+/g, '')
+      const rect = el.getBoundingClientRect()
+      return /^(提交|确认|完成验证|确定)$/.test(text) && rect.width >= 40 && rect.height >= 18
+    })
+    const submitRect = submit ? submit.getBoundingClientRect() : null
     return {
       prompt: promptLine,
+      hit: tiles.length >= 3 || /拖拽到这里|请选择所有符合|请完成安全验证/.test(body),
       drop: dropRect ? {
         left: Math.round(dropRect.left),
         top: Math.round(dropRect.top),
@@ -467,6 +487,10 @@ function tilesScript() {
         height: Math.round(dropRect.height),
         cx: Math.round(dropRect.left + dropRect.width / 2),
         cy: Math.round(dropRect.top + dropRect.height / 2)
+      } : null,
+      submit: submitRect ? {
+        cx: Math.round(submitRect.left + submitRect.width / 2),
+        cy: Math.round(submitRect.top + submitRect.height / 2)
       } : null,
       tiles: tiles.map((item, index) => ({
         index,
@@ -479,6 +503,61 @@ function tilesScript() {
       }))
     }
   })()`
+}
+
+function iframeOffsetScript() {
+  return `(() => {
+    const KEYS = ${JSON.stringify(CAPTCHA_KEYS)}
+    const frames = Array.from(document.querySelectorAll('iframe'))
+    for (const frame of frames) {
+      const src = String(frame.getAttribute('src') || frame.src || '').toLowerCase()
+      if (!KEYS.some((key) => src.includes(key))) continue
+      const rect = frame.getBoundingClientRect()
+      if (rect.width >= 80 && rect.height >= 60) {
+        return { left: Math.round(rect.left), top: Math.round(rect.top), width: Math.round(rect.width), height: Math.round(rect.height), src: src.slice(0, 180) }
+      }
+    }
+    return { left: 0, top: 0, width: 0, height: 0, src: '' }
+  })()`
+}
+
+function shiftLayout(layout, ox, oy) {
+  if (!layout) return layout
+  const move = (box) => box ? {
+    ...box,
+    left: Math.round((box.left || 0) + ox),
+    top: Math.round((box.top || 0) + oy),
+    cx: Math.round((box.cx || 0) + ox),
+    cy: Math.round((box.cy || 0) + oy)
+  } : null
+  return {
+    ...layout,
+    drop: move(layout.drop),
+    submit: layout.submit ? { cx: layout.submit.cx + ox, cy: layout.submit.cy + oy } : null,
+    tiles: (layout.tiles || []).map((tile) => ({
+      ...tile,
+      left: tile.left + ox,
+      top: tile.top + oy,
+      cx: tile.cx + ox,
+      cy: tile.cy + oy
+    }))
+  }
+}
+
+async function readCaptchaLayout(win) {
+  if (!win || win.isDestroyed()) return null
+  let best = null
+  const offset = await win.webContents.executeJavaScript(iframeOffsetScript(), true).catch(() => ({ left: 0, top: 0 }))
+  for (const frame of framesOf(win.webContents.mainFrame)) {
+    try {
+      const layout = await frame.executeJavaScript(tilesScript(), true)
+      if (!layout?.hit && !(layout?.tiles?.length >= 3)) continue
+      const isChild = frame !== win.webContents.mainFrame
+      const shifted = isChild ? shiftLayout(layout, offset?.left || 0, offset?.top || 0) : layout
+      if (!best || (shifted.tiles?.length || 0) > (best.tiles?.length || 0)) best = shifted
+    } catch { /* cross-origin or detached */ }
+  }
+  return best
 }
 
 function promptCategory(prompt) {
@@ -554,47 +633,56 @@ async function scoreTile(win, tile, category) {
 }
 
 async function localSemanticSolve(win, notify) {
-  const layout = await win.webContents.executeJavaScript(tilesScript(), true).catch(() => null)
+  const layout = await readCaptchaLayout(win)
   if (!layout?.tiles?.length || layout.tiles.length < 3) {
-    return { ok: false, error: '没有找到可拖拽图片' }
+    return { ok: false, error: '没有找到可拖拽图片（含验证 iframe）' }
   }
   const category = promptCategory(layout.prompt)
-  notify?.({ confirmNote: `本地识别验证图（${category}），准备拖拽` })
+  notify?.({ confirmNote: `正在识别验证图「${layout.prompt || category}」并自动拖拽` })
   const scored = []
   for (const tile of layout.tiles) {
     const score = await scoreTile(win, tile, category)
     scored.push({ tile, score })
   }
   scored.sort((a, b) => b.score - a.score)
-  const positive = scored.filter((item) => item.score > 0.35).slice(0, category === 'camping' ? 5 : 4)
-  const picks = (positive.length >= 2 ? positive : scored.slice(0, Math.min(3, scored.length)))
+  const threshold = category === 'camping' ? 0.28 : 0.32
+  const positive = scored.filter((item) => item.score > threshold)
+  const need = category === 'camping' ? Math.min(5, Math.max(2, positive.length || 3)) : Math.min(4, Math.max(2, positive.length || 3))
+  const picks = (positive.length >= 2 ? positive : scored.slice(0, need))
+    .slice(0, need)
     .map((item) => item.tile)
   if (!picks.length) return { ok: false, error: '本地识别没有选出图片' }
   const drop = layout.drop || {
-    cx: picks[0].cx,
-    cy: picks[0].top + picks[0].height * 2.2
+    cx: Math.round((Math.min(...layout.tiles.map((t) => t.left)) + Math.max(...layout.tiles.map((t) => t.left + t.width))) / 2),
+    cy: Math.round(Math.max(...layout.tiles.map((t) => t.top + t.height)) + 48)
   }
   await withDebugger(win, async (dbg) => {
     for (let index = 0; index < picks.length; index += 1) {
       const tile = picks[index]
-      const dx = drop.cx + (index % 3) * 12 - 12
-      const dy = drop.cy + Math.floor(index / 3) * 10
+      const dx = drop.cx + ((index % 3) - 1) * 16
+      const dy = drop.cy + Math.floor(index / 3) * 12
       await drag(dbg, tile.cx, tile.cy, dx, dy, {
-        steps: index === 0 ? 34 : 24,
-        holdSec: index === 0 ? 0.3 : 0.2,
-        settleSec: 0.22
+        steps: index === 0 ? 36 : 26,
+        holdSec: index === 0 ? 0.34 : 0.22,
+        settleSec: 0.24
       })
-      await wait(index === 0 ? 650 : 380)
+      await wait(index === 0 ? 720 : 420)
     }
-    const box = {
-      left: Math.min(...layout.tiles.map((item) => item.left)),
-      top: Math.min(...layout.tiles.map((item) => item.top)),
-      width: Math.max(...layout.tiles.map((item) => item.left + item.width)) - Math.min(...layout.tiles.map((item) => item.left)),
-      height: (layout.drop ? layout.drop.top + layout.drop.height : Math.max(...layout.tiles.map((item) => item.top + item.height))) - Math.min(...layout.tiles.map((item) => item.top))
+    if (layout.submit?.cx) {
+      await clickAt(dbg, layout.submit.cx, layout.submit.cy)
+      await wait(260)
+      await clickAt(dbg, layout.submit.cx, layout.submit.cy)
+    } else {
+      const box = {
+        left: Math.min(...layout.tiles.map((item) => item.left)),
+        top: Math.min(...layout.tiles.map((item) => item.top)),
+        width: Math.max(...layout.tiles.map((item) => item.left + item.width)) - Math.min(...layout.tiles.map((item) => item.left)),
+        height: (layout.drop ? layout.drop.top + layout.drop.height : Math.max(...layout.tiles.map((item) => item.top + item.height))) - Math.min(...layout.tiles.map((item) => item.top)) + 80
+      }
+      await clickSubmit(win, dbg, box)
     }
-    await clickSubmit(win, dbg, box)
   })
-  return { ok: true, picks: picks.length, category, prompt: layout.prompt }
+  return { ok: true, picks: picks.length, category, prompt: layout.prompt, scores: scored.map((s) => Number(s.score.toFixed(2))) }
 }
 
 async function clickSubmit(win, dbg, box) {
@@ -702,7 +790,7 @@ async function tryAutoSolve(win, config, notify) {
     const typeId = cfg.types[kind] || cfg.type
     notify?.({ confirmNote: `检测到${kindLabel(kind)}验证码，自动处理第 ${attempt}/${cfg.maxRetries} 次` })
 
-    // 点选/拖拽：优先本地语义拖拽，不依赖云码 token
+    // 点选/拖拽：优先本地语义拖拽（含 iframe），不依赖云码 token
     if (kind === 'click') {
       const local = await localSemanticSolve(win, notify)
       if (local.ok) {
@@ -711,9 +799,23 @@ async function tryAutoSolve(win, config, notify) {
           out.ok = true
           out.cleared = true
           out.error = ''
-          notify?.({ confirmNote: '验证码已自动通过（本地识别）' })
+          notify?.({ confirmNote: `验证码已自动通过（拖了 ${local.picks} 张）` })
           return out
         }
+        // 没过就点刷新再试
+        await withDebugger(win, async (dbg) => {
+          const refresh = await win.webContents.executeJavaScript(`(() => {
+            const el = Array.from(document.querySelectorAll('button,span,div,a')).find((node) => {
+              const text = String(node.innerText || '').replace(/\\s+/g, '')
+              return text === '刷新' || text.includes('刷新')
+            })
+            if (!el) return null
+            const rect = el.getBoundingClientRect()
+            return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+          })()`, true).catch(() => null)
+          if (refresh?.x) await clickAt(dbg, refresh.x, refresh.y)
+        }).catch(() => {})
+        await wait(900)
       } else if (!cfg.token) {
         out.error = local.error || '本地识别未通过'
       }

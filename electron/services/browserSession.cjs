@@ -107,36 +107,81 @@ async function loadPage(win, url, { quiet = false } = {}) {
   return !win.isDestroyed()
 }
 
+function isSessionCookie(name = '') {
+  return /sessionid|sid_guard|uid_tt|sid_tt|passport_auth|odin_tt|SASID|session|sid|uid|passport/i.test(name)
+}
+
 function loggedIn(cookies, kind) {
   return cookies.some((item) => {
     const domain = item.domain || ''
     const name = item.name || ''
-    if (kind === 'doubao') return /doubao|volces|bytedance|douyin/.test(domain) && /session|sid|uid|passport/i.test(name)
-    return /douyin|jinritemai|bytedance/.test(domain) && /sessionid|sid_guard|uid_tt|sid_tt|passport_auth|odin_tt/i.test(name)
+    if (kind === 'doubao') return /doubao|volces|bytedance|douyin/.test(domain) && isSessionCookie(name)
+    // 达人工作台 / 创作者中心 / 抖音通行证共用同一分区登录态
+    return /douyin|jinritemai|bytedance|buyin/.test(domain) && isSessionCookie(name)
   })
 }
 
 function buyinLoggedIn(cookies) {
-  return cookies.some((item) => {
-    const domain = item.domain || ''
-    const name = item.name || ''
-    return /buyin\.jinritemai\.com|jinritemai\.com/.test(domain) && /sessionid|sid_guard|uid_tt|sid_tt|passport_auth|SASID|buyin/i.test(name)
-  })
+  return loggedIn(cookies, 'publish')
 }
 
 function creatorLoggedIn(cookies) {
-  return cookies.some((item) => {
-    const domain = item.domain || ''
-    const name = item.name || ''
-    return /creator\.douyin\.com|(^|\.)douyin\.com/.test(domain) && !/jinritemai/.test(domain) && /sessionid|sid_guard|uid_tt|sid_tt|passport/i.test(name)
-  })
+  return loggedIn(cookies, 'publish')
 }
 
 async function accountStatus({ kind, id }) {
   const ses = session.fromPartition(`persist:huang-${kind}-${id}`)
   const cookies = await ses.cookies.get({})
   const ok = kind === 'publish' ? buyinLoggedIn(cookies) : loggedIn(cookies, kind)
-  return { loginStatus: ok ? '已登录' : '待登录' }
+  return { loginStatus: ok ? '已登录' : '待登录', cookieCount: cookies.length }
+}
+
+/** 发布前确保达人分区已登录：已登录直接过；过期且有账密则自动填密登录 */
+async function ensurePublishLogin({ id, name, login, mode, url, captcha }) {
+  const status = await accountStatus({ kind: 'publish', id })
+  if (status.loginStatus === '已登录') {
+    return { ok: true, loginStatus: '已登录', reused: true, message: '沿用已保存的达人登录态' }
+  }
+  const secret = secrets.read(id)
+  const account = String(login || secret?.login || '').trim()
+  const password = String(secret?.password || '').trim()
+  const preferMode = password ? 'password' : (mode || 'qr')
+  const opened = await openAccount({
+    kind: 'publish',
+    id,
+    name,
+    login: account,
+    mode: preferMode,
+    url: url || URLS.publish,
+    already: false,
+    captcha
+  })
+  if (opened?.loginStatus === '已登录') {
+    return { ok: true, loginStatus: '已登录', reused: false, message: '登录态已刷新' }
+  }
+  if (password && preferMode === 'password') {
+    const key = sessionKey('publish', id, url || URLS.publish)
+    const win = windows.get(key) || [...windows.entries()].find(([k]) => k.startsWith(`publish:${id}`))?.[1]
+    if (win && !win.isDestroyed()) {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        await runInFrames(win, clickTextScript(['密码登录', '账号登录']))
+        await fillLogin(win, account, password)
+        await wait(1200)
+        const cookies = await win.webContents.session.cookies.get({})
+        if (buyinLoggedIn(cookies) || creatorLoggedIn(cookies) || loggedIn(cookies, 'publish')) {
+          return { ok: true, loginStatus: '已登录', reused: false, message: '已用保存的账密自动登录' }
+        }
+      }
+    }
+  }
+  return {
+    ok: false,
+    loginStatus: opened?.loginStatus || '待登录',
+    reused: false,
+    message: password
+      ? '登录态已过期，自动填密后仍未登录成功，请在打开的窗口里完成一次登录'
+      : '登录态已过期。请编辑账号保存密码，或先扫码/验证码登录一次'
+  }
 }
 
 function loginScript(login, password) {
@@ -669,15 +714,23 @@ async function collectProducts({ id, target, pageLimit = 0, onPage }) {
 
 async function warmWorkbench(id, pageUrl) {
   const secret = secrets.read(id)
+  await ensurePublishLogin({
+    id,
+    name: '达人工作台',
+    login: secret?.login || '',
+    mode: secret?.password ? 'password' : 'qr',
+    url: pageUrl || URLS.publish
+  })
   await openAccount({
     kind: 'publish',
     id,
     name: '达人工作台',
-    mode: 'password',
+    mode: secret?.password ? 'password' : 'qr',
     login: secret?.login || '',
-    url: pageUrl
+    url: pageUrl || URLS.publish,
+    already: true
   })
-  await wait(1200)
+  await wait(800)
   return session.fromPartition(`persist:huang-publish-${id}`).cookies.get({})
 }
 
@@ -1623,7 +1676,7 @@ async function generateOnDoubao({ id, name, login, mode, prompt, image, images, 
       await endChain()
       return withConfirm({ ok: false, saveDir: folder, message: `豆包拒绝生成：${state.failMarker || '页面出现失败话术'}` })
     }
-    if (tick % 2 === 0) {
+    {
       const midGate = await doubaoCaptcha.checkNow(win, captchaConfig, (data) => notify?.({ workId, progress: Math.min(90, 50 + tick), status: '生成中', ...data }))
       if (midGate.hit && !midGate.cleared) {
         await endChain()
@@ -2529,13 +2582,33 @@ async function publishOnCreator(payload) {
 async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, tags, options, productLink, workId, notify }) {
   const page = 'https://creator.douyin.com/creator-micro/content/upload'
   const opts = options && typeof options === 'object' ? options : {}
-  const opened = await openAccount({ kind: 'publish', id, name, login, mode: mode || 'password', url: page })
+  const ensured = await ensurePublishLogin({ id, name, login, mode: mode || 'password', url: page })
+  if (!ensured.ok && ensured.loginStatus !== '已登录') {
+    notify?.({ workId, status: '发布中', confirmNote: ensured.message || '需要先登录达人账号' })
+  }
+  const opened = await openAccount({
+    kind: 'publish',
+    id,
+    name,
+    login,
+    mode: mode || 'password',
+    url: page,
+    already: ensured.loginStatus === '已登录'
+  })
+  const loginStatus = ensured.loginStatus === '已登录' ? '已登录' : (opened?.loginStatus || '待确认')
   const win = windows.get(sessionKey('publish', id, page))
-  if (!win || win.isDestroyed()) return { ok: false, attached: false, loginStatus: opened?.loginStatus || '待确认', message: '发布页没有打开' }
+  if (!win || win.isDestroyed()) return { ok: false, attached: false, loginStatus, message: '发布页没有打开' }
   try { win.setTitle(`${name || '发布账号'} · 上传成片`) } catch { /* 窗口已关 */ }
   bringToFront(win)
+  // 再次确认分区 cookie，避免 UI 误报未登录
+  try {
+    const cookies = await win.webContents.session.cookies.get({})
+    if (loggedIn(cookies, 'publish')) {
+      opened.loginStatus = '已登录'
+    }
+  } catch { /* ignore */ }
   if (!videoPath || !fs.existsSync(videoPath)) {
-    return { ok: false, attached: false, loginStatus: opened.loginStatus, message: '成片文件不在电脑上' }
+    return { ok: false, attached: false, loginStatus: opened.loginStatus || loginStatus, message: '成片文件不在电脑上' }
   }
   const stat = fs.statSync(videoPath)
   if (stat.size > 80 * 1024 * 1024) {
@@ -3513,6 +3586,7 @@ module.exports = {
   submitCode,
   requestCode,
   bootstrapDoubaoLogin,
+  ensurePublishLogin,
   accountStatus,
   loggedIn,
   warmWorkbench,

@@ -96,19 +96,25 @@ function applyPayload(payload = {}) {
   if (typeof payload.percent === 'number') percent.value = payload.percent
   if (payload.manual) manual.value = true
 
-  if (status.value === 'checking' || status.value === 'downloading' || status.value === 'available' || status.value === 'downloaded') {
+  // 自动检查：只有发现新版本 / 正在下载 / 下载完成才弹；已是最新保持安静
+  // 手动检查：最新版也弹一下提示；错误才弹失败
+  if (status.value === 'available' || status.value === 'downloading' || status.value === 'downloaded') {
     visible.value = true
+  } else if (status.value === 'checking') {
+    visible.value = Boolean(manual.value)
   } else if (status.value === 'not-available') {
     if (manual.value) {
       visible.value = true
       setTimeout(() => {
         if (status.value === 'not-available') visible.value = false
-      }, 1800)
+      }, 1600)
     } else {
       visible.value = false
     }
-  } else if (status.value === 'error' || status.value === 'dev') {
-    if (manual.value || status.value === 'error') visible.value = true
+  } else if (status.value === 'error') {
+    visible.value = true
+  } else if (status.value === 'dev') {
+    visible.value = Boolean(manual.value)
   }
 }
 

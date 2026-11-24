@@ -73,19 +73,19 @@
       </el-table>
     </div>
     <el-dialog v-model="visible" :title="form.id ? '编辑抖音账号' : '添加抖音账号'" width="520px">
-      <p class="muted">可以选择密码、短信验证码或扫码。扫码不用填手机号，保存后点「扫码登录」，用抖音 App 扫窗口里的二维码。</p>
+      <p class="muted">推荐保存账号密码：登录一次后分区会记住；过期时定时任务会自动填密重登，不用每次再扫码。</p>
       <el-form label-width="96px">
         <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>
         <el-form-item label="登录方式">
           <el-radio-group v-model="form.loginMode">
-            <el-radio value="password">密码</el-radio>
+            <el-radio value="password">密码（推荐）</el-radio>
             <el-radio value="code">验证码</el-radio>
             <el-radio value="qr">扫码</el-radio>
           </el-radio-group>
         </el-form-item>
-        <el-form-item v-if="form.loginMode !== 'qr'" label="抖音账号"><el-input v-model="form.login" placeholder="手机号" /></el-form-item>
+        <el-form-item v-if="form.loginMode !== 'qr'" label="抖音账号"><el-input v-model="form.login" placeholder="手机号 / 抖音号" /></el-form-item>
         <el-form-item v-if="form.loginMode === 'password'" label="密码">
-          <el-input v-model="form.password" type="password" show-password :placeholder="form.id ? '不修改可留空' : '登录密码'" />
+          <el-input v-model="form.password" type="password" show-password :placeholder="form.id ? '不修改可留空' : '登录密码，用于过期自动重登'" />
         </el-form-item>
         <el-form-item label="分组">
           <el-select v-model="form.group" style="width: 100%">
@@ -209,10 +209,10 @@ async function save() {
   }
   store.persist()
   visible.value = false
-  if (!form.id) {
-    const row = store.publishAccounts.find((item) => item.id === id)
+  const row = store.publishAccounts.find((item) => item.id === id)
+  if (row) {
     await openWorkbench(row)
-    store.syncPlazaQuiet(id)
+    if (!form.id) store.syncPlazaQuiet(id)
   }
 }
 
