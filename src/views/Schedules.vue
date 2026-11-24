@@ -58,6 +58,7 @@
             <el-option value="审核通过后发布" label="审核通过后发布" />
             <el-option value="选品采集" label="选品采集" />
             <el-option value="生成队列" label="生成队列" />
+            <el-option value="登录巡检" label="登录巡检" />
           </el-select>
         </el-form-item>
         <template v-if="form.type === '审核通过后发布' || !form.type">

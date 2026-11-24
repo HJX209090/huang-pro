@@ -44,6 +44,8 @@ contextBridge.exposeInMainWorld('tujian', {
   submitCode: (payload) => ipcRenderer.invoke('account:code', payload),
   requestCode: (payload) => ipcRenderer.invoke('account:send-code', payload),
   bootstrapDoubaoLogin: (payload) => ipcRenderer.invoke('doubao:bootstrap-login', JSON.parse(JSON.stringify(payload || {}))),
+  bootstrapPublishLogin: (payload) => ipcRenderer.invoke('publish:bootstrap-login', JSON.parse(JSON.stringify(payload || {}))),
+  silentPasswordLogin: (payload) => ipcRenderer.invoke('account:silent-login', JSON.parse(JSON.stringify(payload || {}))),
   ensurePublishLogin: (payload) => ipcRenderer.invoke('account:ensure-login', JSON.parse(JSON.stringify(payload || {}))),
   runGenerate: (workId) => ipcRenderer.invoke('task:generate', workId),
   onTaskProgress: (callback) => {

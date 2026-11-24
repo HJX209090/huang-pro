@@ -18,6 +18,7 @@
     <path v-else-if="name === 'account'" d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6l7-3zm0 6a2 2 0 110 4 2 2 0 010-4z" />
     <path v-else-if="name === 'key'" d="M8 14a5 5 0 116.3-4.8L21 8v4h-3v2h-2v-2h-2l-1.2 1.2A5 5 0 018 14zm2-1a1 1 0 100-2 1 1 0 000 2z" />
     <path v-else-if="name === 'play'" d="M9 7l8 5-8 5V7z" />
+    <path v-else-if="name === 'bell'" d="M12 3a5 5 0 00-5 5v2.2L5 13.5V15h14v-1.5l-2-3.3V8a5 5 0 00-5-5zm-1.5 14a1.5 1.5 0 003 0h-3z" />
   </svg>
 </template>
 

@@ -154,6 +154,7 @@ export function createSeed() {
     browsers: [],
     logs: [],
     doubaoChats: [],
+    inbox: [],
     settings: defaultPromptSettings(),
     license: null,
     generatedLicenses: []

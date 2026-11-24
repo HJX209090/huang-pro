@@ -72,7 +72,7 @@ let taskSeq = 0
 export const PERSIST_KEYS = [
   'points', 'publishNo', 'groups', 'activeAccountId', 'products', 'plaza', 'works',
   'doubaoAccounts', 'digitalHumans', 'publishAccounts', 'collectAccounts',
-  'schedules', 'rpaFlows', 'proxies', 'browsers', 'logs', 'doubaoChats', 'settings'
+  'schedules', 'rpaFlows', 'proxies', 'browsers', 'logs', 'doubaoChats', 'settings', 'inbox'
 ]
 
 let saveTimer = null
@@ -116,6 +116,7 @@ export const useAppStore = defineStore('app', {
     onlinePublishCount: (state) => state.publishAccounts.filter((item) => item.enabled).length,
     mySchedules: (state) => (state.schedules || []).filter((item) => !isBuiltinSchedule(item)),
     systemSchedules: (state) => (state.schedules || []).filter((item) => isBuiltinSchedule(item)),
+    unreadInbox: (state) => (state.inbox || []).filter((item) => !item.read && !item.done).length,
     licenseActive: (state) => {
       const license = state.license
       if (!license || !state.systemNow) return false
@@ -161,6 +162,7 @@ export const useAppStore = defineStore('app', {
       this.syncDoubaoStats()
       if (Array.isArray(data.generatedLicenses)) this.generatedLicenses = data.generatedLicenses
       if (!this.activeAccountId && this.publishAccounts[0]) this.activeAccountId = this.publishAccounts[0].id
+      if (!Array.isArray(this.inbox)) this.inbox = []
       const plazaById = new Map()
       if (!Array.isArray(this.settings.bannedWords) || !this.settings.bannedWords.length) {
         this.settings.bannedWords = defaultBannedWords()
@@ -686,6 +688,133 @@ export const useAppStore = defineStore('app', {
       this.generatedLicenses = []
       this.user = null
     },
+    pushReloginNotice({ accountKind, accountId, accountName, scope, text }) {
+      if (!Array.isArray(this.inbox)) this.inbox = []
+      const key = `${accountKind}:${accountId}:${scope || ''}`
+      if (this.inbox.some((item) => item.key === key && !item.done)) return
+      this.inbox.unshift({
+        id: uid('MSG'),
+        key,
+        accountKind,
+        accountId,
+        accountName: accountName || '',
+        scope: scope || '',
+        title: '需要重新登录',
+        text,
+        read: false,
+        done: false,
+        createdAt: formatTime(new Date())
+      })
+    },
+    clearReloginNotice(accountKind, accountId, scope) {
+      const key = `${accountKind}:${accountId}:${scope || ''}`
+      let changed = false
+      for (const item of this.inbox || []) {
+        if (item.key === key && !item.done) {
+          item.done = true
+          item.read = true
+          changed = true
+        }
+      }
+      return changed
+    },
+    async patrolAccountLogins() {
+      if (!window.tujian?.accountStatus) return '请在桌面窗口里检测登录'
+      let auto = 0
+      let pending = 0
+      for (const account of this.doubaoAccounts || []) {
+        if (account.enabled === false) continue
+        let st = { loginStatus: '待登录' }
+        try {
+          st = await window.tujian.accountStatus({ kind: 'doubao', id: account.id })
+        } catch { continue }
+        account.loginStatus = st.loginStatus === '已登录' ? '已登录' : '待登录'
+        if (account.loginStatus === '已登录') {
+          this.clearReloginNotice('doubao', account.id, 'doubao')
+          continue
+        }
+        if (account.loginMode === 'password' && window.tujian.silentPasswordLogin) {
+          try {
+            const result = await window.tujian.silentPasswordLogin({
+              kind: 'doubao',
+              id: account.id,
+              name: account.name,
+              login: account.login
+            })
+            if (result?.loginStatus === '已登录') {
+              account.loginStatus = '已登录'
+              auto += 1
+              this.clearReloginNotice('doubao', account.id, 'doubao')
+              this.addLog('info', '登录', `${account.name} 豆包已用保存的密码自动登录`)
+              continue
+            }
+          } catch { /* 静默失败只记日志 */ }
+          this.addLog('warning', '登录', `${account.name} 豆包自动登录未成功`)
+          continue
+        }
+        this.pushReloginNotice({
+          accountKind: 'doubao',
+          accountId: account.id,
+          accountName: account.name,
+          scope: 'doubao',
+          text: `${account.name} 的豆包需要重新登录，点「去登录」打开页面并发送验证码`
+        })
+        pending += 1
+      }
+      for (const account of this.publishAccounts || []) {
+        if (account.enabled === false) continue
+        let st = {}
+        try {
+          st = await window.tujian.accountStatus({ kind: 'publish', id: account.id })
+        } catch { continue }
+        account.buyinLoginStatus = st.buyinLoginStatus || (st.loginStatus === '已登录' ? '已登录' : '待登录')
+        account.creatorLoginStatus = st.creatorLoginStatus || '待登录'
+        account.loginStatus = account.buyinLoginStatus
+        const passwordMode = account.loginMode === 'password'
+        for (const scope of ['buyin', 'creator']) {
+          const field = scope === 'buyin' ? 'buyinLoginStatus' : 'creatorLoginStatus'
+          const label = scope === 'buyin' ? '达人工作台' : '抖音创作者'
+          if (account[field] === '已登录') {
+            this.clearReloginNotice('publish', account.id, scope)
+            continue
+          }
+          if (passwordMode && window.tujian.silentPasswordLogin) {
+            try {
+              const result = await window.tujian.silentPasswordLogin({
+                kind: 'publish',
+                id: account.id,
+                name: account.name,
+                login: account.login,
+                scope
+              })
+              const ok = scope === 'creator'
+                ? result?.creatorLoginStatus === '已登录' || result?.loginStatus === '已登录'
+                : result?.buyinLoginStatus === '已登录' || result?.loginStatus === '已登录'
+              if (ok) {
+                account[field] = '已登录'
+                if (scope === 'buyin') account.loginStatus = '已登录'
+                auto += 1
+                this.clearReloginNotice('publish', account.id, scope)
+                this.addLog('info', '登录', `${account.name} ${label}已用保存的密码自动登录`)
+                continue
+              }
+            } catch { /* ignore */ }
+            this.addLog('warning', '登录', `${account.name} ${label}自动登录未成功`)
+            continue
+          }
+          this.pushReloginNotice({
+            accountKind: 'publish',
+            accountId: account.id,
+            accountName: account.name,
+            scope,
+            text: `${account.name} 的${label}登录已过期，点「去登录」扫码`
+          })
+          pending += 1
+        }
+      }
+      this.persist()
+      return `登录巡检完成：自动登录 ${auto} 个，待扫码 ${pending} 条。扫码的在「消息」里点去登录`
+    },
     async refreshClock() {
       if (!this.user) return
       const data = await api.systemTime()
@@ -779,6 +908,15 @@ export const useAppStore = defineStore('app', {
       this.addLog('info', '定时', `${task.name}：${when}`)
       task._running = true
       try {
+      if (task.type === '登录巡检') {
+        const message = await this.patrolAccountLogins()
+        task.lastRun = stamp
+        task.lastSuccessDay = stamp.slice(0, 10)
+        this.persist()
+        this.endTask(taskId, message)
+        this.addLog('info', '定时', `${task.name}：${message}`)
+        return message
+      }
       if (task.type === '审核通过后发布' || task.type === '发布队列' || !task.type) {
         const ready = this.works.filter((item) => this.isPublishReady(item))
         const account = this.publishAccounts.find((item) => item.name === task.account)

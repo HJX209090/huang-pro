@@ -275,8 +275,18 @@ async function bridgeBuyinToCreator(win, targetUrl, { quiet = false, forceNav = 
 
 async function accountStatus({ kind, id }) {
   const ses = session.fromPartition(`persist:huang-${kind}-${id}`)
-  const cookies = await ses.cookies.get({})
-  const ok = kind === 'publish' ? buyinLoggedIn(cookies) : loggedIn(cookies, kind)
+  const cookies = await ses.cookies.get({}).catch(() => [])
+  if (kind === 'publish') {
+    const buyin = buyinLoggedIn(cookies)
+    const creator = creatorLoggedIn(cookies)
+    return {
+      loginStatus: buyin ? '已登录' : '待登录',
+      buyinLoginStatus: buyin ? '已登录' : '待登录',
+      creatorLoginStatus: creator ? '已登录' : '待登录',
+      cookieCount: cookies.length
+    }
+  }
+  const ok = loggedIn(cookies, kind)
   return { loginStatus: ok ? '已登录' : '待登录', cookieCount: cookies.length }
 }
 
@@ -582,7 +592,7 @@ async function autoFillPasswordLogin(win, login, password, { times = 8 } = {}) {
   return 'no-form'
 }
 
-/** 自动填手机号并点获取验证码 */
+/** 自动点登录 → 填手机号 → 下一步 → 发送验证码 */
 async function autoSendPhoneCode(win, phone, { times = 10 } = {}) {
   const mobile = String(phone || '').replace(/\D/g, '').slice(-11)
   if (!win || win.isDestroyed() || mobile.length < 6) return 'skip'
@@ -590,18 +600,30 @@ async function autoSendPhoneCode(win, phone, { times = 10 } = {}) {
   let last = 'miss'
   for (let attempt = 0; attempt < times; attempt += 1) {
     if (win.isDestroyed()) return 'destroyed'
-    await runInFrames(win, clickTextScript(['验证码登录', '短信登录', '手机号登录', '登录', '验证码']))
-    await wait(450)
+    await runInFrames(win, clickTextScript(['登录', '立即登录', '手机号登录', '验证码登录', '短信登录']))
+    await wait(500)
     last = await runInFrames(win, phoneScript(mobile))
     if (last === 'sent') {
       runtimeLog.success('login.sms', `第 ${attempt + 1} 次已发送验证码`)
       return 'sent'
     }
-    if (last === 'typed' || last === 'wait') {
-      runtimeLog.info('login.sms', `手机号已填 status=${last}`)
-      if (last === 'typed') return 'typed'
+    // 豆包常见：先填手机号，再点「下一步」，下一屏才有「获取验证码」
+    if (last === 'typed' || last === 'no-input' || last === 'wait') {
+      await runInFrames(win, clickTextScript(['下一步', '获取验证码', '发送验证码', '登录', '继续']))
+      await wait(900)
+      const again = await runInFrames(win, phoneScript(mobile))
+      if (again === 'sent') {
+        runtimeLog.success('login.sms', `下一步后已发送验证码`)
+        return 'sent'
+      }
+      const clicked = await runInFrames(win, clickTextScript(['获取验证码', '发送验证码', '重新获取']))
+      if (clicked === 'clicked') {
+        runtimeLog.success('login.sms', '已点击获取验证码')
+        return 'sent'
+      }
+      if (again === 'typed' || again === 'wait') last = again
     }
-    await wait(800)
+    await wait(700)
   }
   runtimeLog.warn('login.sms', `发码未完成 last=${last}`)
   return last
@@ -609,6 +631,70 @@ async function autoSendPhoneCode(win, phone, { times = 10 } = {}) {
 
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/** 关掉「下载豆包专业版」一类弹窗，避免挡住登录和对话 */
+function dismissDoubaoPromoScript() {
+  return `(() => {
+    const compact = (value) => String(value || '').replace(/\\s+/g, '')
+    const nodes = []
+    const walk = (root) => {
+      if (!root || !root.querySelectorAll) return
+      root.querySelectorAll('button, [role="button"], a, div, span, i, svg').forEach((el) => nodes.push(el))
+      root.querySelectorAll('*').forEach((el) => { if (el.shadowRoot) walk(el.shadowRoot) })
+    }
+    walk(document)
+    const promo = nodes.find((el) => {
+      const text = compact(el.innerText || el.textContent)
+      return text && text.length < 80 && /下载豆包专业版|豆包专业版|下载客户端|立即下载|体验专业版/.test(text)
+    })
+    if (!promo) return 'none'
+    const root = promo.closest('[role="dialog"], [class*="modal"], [class*="dialog"], [class*="popup"], [class*="mask"]') || document.body
+    const closer = Array.from(root.querySelectorAll('button, [role="button"], a, div, span, i')).find((el) => {
+      const text = compact(el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '')
+      const rect = el.getBoundingClientRect()
+      if (!(rect.width > 8 && rect.height > 8 && rect.width < 160)) return false
+      return /^(关闭|取消|暂不|以后再说|我知道了|跳过|×|✕)$/.test(text) || /close/i.test(String(el.className || ''))
+    })
+    if (closer) {
+      ;(closer.closest('button, [role="button"], a') || closer).click()
+      return 'closed'
+    }
+    const box = promo.closest('[role="dialog"], [class*="modal"], [class*="dialog"], [class*="popup"]')
+    if (box) {
+      box.style.display = 'none'
+      const mask = box.parentElement
+      if (mask && /mask|overlay|modal/i.test(String(mask.className || ''))) mask.style.display = 'none'
+      return 'hidden'
+    }
+    return 'miss'
+  })()`
+}
+
+async function dismissDoubaoPromo(win) {
+  if (!win || win.isDestroyed()) return 'none'
+  let last = 'none'
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    last = await runInFrames(win, dismissDoubaoPromoScript()).catch(() => 'none')
+    if (last === 'closed' || last === 'hidden') {
+      runtimeLog.info('doubao.promo', '已关闭下载专业版弹窗')
+      return last
+    }
+    await wait(400)
+  }
+  return last
+}
+
+function attachDoubaoPromoGuard(win) {
+  if (!win || win.isDestroyed() || win.__huangPromoGuard) return
+  win.__huangPromoGuard = true
+  const run = () => {
+    if (!win.isDestroyed()) dismissDoubaoPromo(win).catch(() => {})
+  }
+  win.webContents.on('did-finish-load', run)
+  win.webContents.on('did-navigate-in-page', run)
+  setTimeout(run, 600)
+  setTimeout(run, 1800)
 }
 
 async function fillPrompt(win, prompt) {
@@ -661,7 +747,7 @@ function findPublishMainWindow(id) {
   if (primary && !primary.isDestroyed()) return primary
   for (const [key, win] of windows) {
     if (!key.startsWith(`publish:${id}`) || !win || win.isDestroyed()) continue
-    if (/silent-lookup|lookup-|follow/i.test(key)) continue
+    if (/silent-lookup|lookup-|follow|creator-boot|buyin-silent/i.test(key)) continue
     return win
   }
   return null
@@ -708,6 +794,7 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
     }
   }
   if (existing && !existing.isDestroyed() && !force) {
+    if (kind === 'doubao') attachDoubaoPromoGuard(existing)
     if (!quiet) bringToFront(existing)
     let cookies = await existing.webContents.session.cookies.get({})
     const onBuyin = target.includes('buyin.jinritemai.com')
@@ -783,6 +870,7 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
     }
   })
   windows.set(key, win)
+  if (kind === 'doubao') attachDoubaoPromoGuard(win)
   if (quiet) hardenSilentWindow(win)
   if (!quiet) {
     const siblings = [...windows.keys()].filter((item) => item.startsWith(`${kind}:${id}`) && item !== key).length
@@ -957,6 +1045,8 @@ async function bootstrapDoubaoLogin({ id, name, login, captcha }) {
     return { ok: false, loginStatus: '待确认', message: opened?.message || '豆包窗口没有打开' }
   }
   bringToFront(target)
+  attachDoubaoPromoGuard(target)
+  await dismissDoubaoPromo(target)
   await wait(1200)
 
   // 有密码：先尝试账密登录
@@ -993,6 +1083,144 @@ async function bootstrapDoubaoLogin({ id, name, login, captcha }) {
     sendStatus,
     message: parts.join('；')
   }
+}
+
+function publishPartitionStatus(id) {
+  return session.fromPartition(`persist:huang-publish-${id}`).cookies.get({}).then((cookies) => ({
+    buyinLoginStatus: buyinLoggedIn(cookies) ? '已登录' : '待登录',
+    creatorLoginStatus: creatorLoggedIn(cookies) ? '已登录' : '待登录',
+    loginStatus: buyinLoggedIn(cookies) ? '已登录' : '待登录'
+  })).catch(() => ({
+    buyinLoginStatus: '待登录',
+    creatorLoginStatus: '待登录',
+    loginStatus: '待登录'
+  }))
+}
+
+/**
+ * 添加抖音账号：
+ * 有账密 → 创作者页在隐藏窗口自动填账密；只把达人工作台亮出来并点到扫码。
+ * 无账密 → 达人工作台和创作者中心都打开，并各自点出二维码。
+ * 两边登录态分开记。
+ */
+async function bootstrapPublishLogin({ id, name, login, mode }) {
+  const secret = secrets.read(id)
+  const account = String(login || secret?.login || '').trim()
+  const password = String(secret?.password || '').trim()
+  const realAccount = account && account !== '扫码登录' ? account : ''
+  const hasSecret = Boolean(password && realAccount && mode !== 'qr' && mode !== 'code')
+  const buyinUrl = 'https://buyin.jinritemai.com/dashboard'
+  const creatorUrl = 'https://creator.douyin.com/creator-micro/content/upload'
+  runtimeLog.info('publish.bootstrap', `达人+创作者 hasSecret=${hasSecret} mode=${mode || ''}`)
+
+  await openAccount({
+    kind: 'publish',
+    id,
+    name: name || '创作者',
+    login: realAccount,
+    mode: hasSecret ? 'password' : 'qr',
+    url: creatorUrl,
+    slot: 'creator-boot',
+    hidden: hasSecret
+  })
+  const creatorWin = windows.get(sessionKey('publish', id, creatorUrl, 'creator-boot'))
+  if (creatorWin && !creatorWin.isDestroyed()) {
+    if (hasSecret) {
+      hardenSilentWindow(creatorWin)
+      await autoFillPasswordLogin(creatorWin, realAccount, password, { times: 8 })
+      await wait(1200)
+      hardenSilentWindow(creatorWin)
+    } else {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const clicked = await runInFrames(creatorWin, clickTextScript(['扫码登录', '扫码']))
+        if (clicked === 'clicked') break
+        await wait(500)
+      }
+      try { creatorWin.show() } catch { /* ignore */ }
+      bringToFront(creatorWin)
+    }
+  }
+
+  await openAccount({
+    kind: 'publish',
+    id,
+    name: name || '达人',
+    login: realAccount,
+    mode: 'qr',
+    url: buyinUrl
+  })
+  const buyinWin = windows.get(sessionKey('publish', id, buyinUrl)) || findPublishMainWindow(id)
+  if (buyinWin && !buyinWin.isDestroyed()) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const clicked = await runInFrames(buyinWin, clickTextScript(['扫码登录', '扫码']))
+      if (clicked === 'clicked') break
+      await wait(500)
+    }
+    bringToFront(buyinWin)
+  }
+
+  const status = await publishPartitionStatus(id)
+  const message = hasSecret
+    ? '创作者登录已在后台自动填写账号密码（窗口不显示）。达人工作台已打开，请扫码。'
+    : '已打开达人工作台和创作者中心，请分别扫码。两边登录状态分开保存。'
+  return { ok: true, ...status, hiddenCreator: hasSecret, message }
+}
+
+/** 账密账号过期：隐藏窗口自动登录，不把页面亮给用户 */
+async function silentPasswordLogin({ kind, id, name, login, scope }) {
+  const secret = secrets.read(id)
+  const account = String(login || secret?.login || '').trim()
+  const password = String(secret?.password || '').trim()
+  if (!account || !password || account === '扫码登录') {
+    return { ok: false, loginStatus: '待登录', message: '没有保存密码' }
+  }
+  if (kind === 'doubao') {
+    const page = 'https://www.doubao.com/chat/'
+    await openAccount({
+      kind: 'doubao',
+      id,
+      name,
+      login: account,
+      mode: 'password',
+      url: page,
+      hidden: true
+    })
+    const win = windows.get(sessionKey('doubao', id, page))
+    if (win && !win.isDestroyed()) {
+      hardenSilentWindow(win)
+      await autoFillPasswordLogin(win, account, password, { times: 6 })
+      await wait(1200)
+      const cookies = await win.webContents.session.cookies.get({}).catch(() => [])
+      const ok = loggedIn(cookies, 'doubao')
+      return { ok, loginStatus: ok ? '已登录' : '待登录', silent: true }
+    }
+    return { ok: false, loginStatus: '待登录', silent: true }
+  }
+  const creator = scope === 'creator'
+  const url = creator
+    ? 'https://creator.douyin.com/creator-micro/content/upload'
+    : 'https://buyin.jinritemai.com/dashboard'
+  const slot = creator ? 'creator-boot' : 'buyin-silent'
+  await openAccount({
+    kind: 'publish',
+    id,
+    name,
+    login: account,
+    mode: 'password',
+    url,
+    slot,
+    hidden: true
+  })
+  const win = windows.get(sessionKey('publish', id, url, slot))
+  if (win && !win.isDestroyed()) {
+    hardenSilentWindow(win)
+    await autoFillPasswordLogin(win, account, password, { times: 8 })
+    await wait(1400)
+    hardenSilentWindow(win)
+  }
+  const status = await publishPartitionStatus(id)
+  const ok = creator ? status.creatorLoginStatus === '已登录' : status.buyinLoginStatus === '已登录'
+  return { ok, loginStatus: ok ? '已登录' : '待登录', ...status, silent: true, scope: scope || 'buyin' }
 }
 
 async function submitCode({ kind, id, name, login, code }) {
@@ -1875,8 +2103,11 @@ async function generateOnDoubao({ id, name, login, mode, prompt, image, images, 
   if (!win || win.isDestroyed()) return { ok: false, message: '网页版豆包没有打开' }
   win.setTitle(`${name || '豆包'} · 网页版`)
   bringToFront(win)
+  attachDoubaoPromoGuard(win)
+  await dismissDoubaoPromo(win)
   if (!String(win.webContents.getURL() || '').startsWith('https://www.doubao.com')) {
     await loadPage(win, page)
+    await dismissDoubaoPromo(win)
   }
   notify?.({ workId, progress: 20, status: '生成中' })
   const folder = saveDir || path.join(app.getPath('videos'), 'huang-plusplus-pro')
@@ -2458,8 +2689,8 @@ function pickCreatorTagScript(tag) {
       if (!(rect.width > 20 && rect.height > 12 && rect.height < 90)) return false
       if (el.children && el.children.length > 4) return false
       if (!text.startsWith('#')) return false
-      const bare = text.replace(/^#/, '')
-      return bare === tag || (bare.includes(tag) || tag.includes(bare)) && bare.length <= 16
+      const bare = text.replace(/^#/, '').replace(/\\d+$/, '')
+      return bare === tag
     })
     if (hit) {
       hit.click()
@@ -2513,26 +2744,31 @@ function clickPublishScript() {
     const buttons = []
     const walk = (root) => {
       if (!root || !root.querySelectorAll) return
-      root.querySelectorAll('button, [role="button"], span, div').forEach((el) => buttons.push(el))
+      root.querySelectorAll('button, [role="button"], span, div, a').forEach((el) => buttons.push(el))
       root.querySelectorAll('*').forEach((el) => { if (el.shadowRoot) walk(el.shadowRoot) })
     }
     walk(document)
-    const prefer = ['发布', '定时发布', '立即发布', '确认发布', '发布作品']
-    let publish = null
-    for (const label of prefer) {
-      publish = buttons.find((el) => {
-        const text = compact(el.innerText || el.textContent)
-        const rect = el.getBoundingClientRect()
-        if (!(rect.width > 40 && rect.height > 18)) return false
-        if (el.disabled || el.getAttribute('aria-disabled') === 'true') return false
-        return text === label || (label.length >= 4 && text.includes(label) && text.length <= 8)
-      })
-      if (publish) break
+    const order = { '确认发布': 0, '确定发布': 1, '立即发布': 2, '发布作品': 3, '发布': 4 }
+    const candidates = []
+    for (const el of buttons) {
+      const text = compact(el.innerText || el.textContent)
+      if (!Object.prototype.hasOwnProperty.call(order, text)) continue
+      const rect = el.getBoundingClientRect()
+      if (!(rect.width > 56 && rect.height > 24)) continue
+      if (rect.bottom < 0 || rect.top > window.innerHeight + 80) continue
+      const disabled = Boolean(el.disabled) || el.getAttribute('aria-disabled') === 'true' || /disabled|is-disabled/.test(String(el.className || ''))
+      candidates.push({ el, text, disabled, top: rect.top, left: rect.left })
     }
-    if (!publish) return 'miss'
-    const target = publish.closest('button, [role="button"]') || publish
+    candidates.sort((a, b) => {
+      if (order[a.text] !== order[b.text]) return order[a.text] - order[b.text]
+      if (a.disabled !== b.disabled) return a.disabled ? 1 : -1
+      return b.top - a.top || b.left - a.left
+    })
+    const hit = candidates.find((item) => !item.disabled)
+    if (!hit) return candidates.length ? 'disabled' : 'miss'
+    const target = hit.el.closest('button, [role="button"]') || hit.el
     target.click()
-    return 'published'
+    return hit.text === '发布' ? 'published' : 'confirm'
   })()`
 }
 
@@ -3143,20 +3379,22 @@ async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, 
     titled = await fillCreatorTitle(win, shortTitle)
   }
   const placed = []
+  const topicLimit = 5
   if (topicTags.length) {
-    let raw = await runInFrames(win, pickRecommendedTopicsScript(topicTags))
-    try {
-      const list = typeof raw === 'string' ? JSON.parse(raw) : raw
-      if (Array.isArray(list)) list.forEach((tag) => { if (tag && !placed.includes(tag)) placed.push(tag) })
-    } catch { /* ignore */ }
-    for (const tag of topicTags) {
-      if (placed.length >= 5) break
-      if (placed.includes(tag)) continue
+    for (const tag of topicTags.slice(0, topicLimit)) {
+      if (placed.length >= topicLimit) break
+      const already = await runInFrames(win, `(() => {
+        const box = window.__huangBody
+        const text = String(box?.innerText || box?.textContent || box?.value || '')
+        return (text.match(/#[^#\\s]{1,16}/g) || []).length
+      })()`).catch(() => 0)
+      if (Number(already) >= topicLimit) break
       const typed = await runInFrames(win, insertCreatorTagScript(tag))
       if (typed === 'miss') continue
       await wait(280)
       const picked = await runInFrames(win, pickCreatorTagScript(tag))
       if (picked === 'picked' || typed === 'typed') placed.push(tag)
+      if (placed.length >= topicLimit) break
       await wait(180)
     }
   }
@@ -3190,17 +3428,32 @@ async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, 
     notify?.({ workId, progress: 94, status: '发布中', confirmNote: '检测超时，尝试继续点发布' })
   }
   let published = 'miss'
-  for (let attempt = 0; attempt < 16 && published !== 'published'; attempt += 1) {
+  for (let attempt = 0; attempt < 18 && published !== 'published'; attempt += 1) {
     await runInFrames(win, dismissAssistPanelScript()).catch(() => {})
-    await runInFrames(win, `(() => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
-      return 'ok'
-    })()`).catch(() => {})
-    const ready = await runInFrames(win, uploadReadyScript())
-    if (ready === 'ready' || ready === 'wait' || ready === 'fail' || attempt >= 2) {
-      published = await runInFrames(win, clickPublishScript())
+    if (attempt < 2) {
+      await runInFrames(win, `(() => {
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+        return 'ok'
+      })()`).catch(() => {})
     }
-    if (published !== 'published') await wait(600)
+    const ready = await runInFrames(win, uploadReadyScript())
+    if (ready === 'ready' || ready === 'wait' || ready === 'fail' || attempt >= 1) {
+      const hit = await runInFrames(win, clickPublishScript())
+      runtimeLog.info('publish.click', `第 ${attempt + 1} 次点发布 → ${hit || 'miss'}`)
+      if (hit === 'published') {
+        published = 'published'
+        await wait(900)
+        const again = await runInFrames(win, clickPublishScript())
+        if (again === 'confirm') runtimeLog.info('publish.click', '已点确认发布')
+        break
+      }
+      if (hit === 'confirm') {
+        published = 'published'
+        runtimeLog.info('publish.click', '已点确认发布')
+        break
+      }
+    }
+    await wait(700)
   }
   bringToFront(win)
   const tagText = (placed.length ? placed : topicTags).map((item) => `#${item}`).join(' ')
@@ -3842,43 +4095,99 @@ function scrapeBuyinTableScript(pid) {
   })()`
 }
 
+function scrapeCommerceTextScript() {
+  return `(() => {
+    const text = String(document.body?.innerText || '')
+    if (!text || text.length < 20) return null
+    if (/扫码登录|密码登录/.test(text) && !/佣金|到手价|售价/.test(text)) return null
+    const priceMatch = text.match(/(?:到手价|券后价|售价|价格)[^\\d¥￥]{0,12}[¥￥]\\s*([0-9]+(?:\\.[0-9]{1,2})?)/)
+      || text.match(/[¥￥]\\s*([0-9]+(?:\\.[0-9]{1,2})?)/)
+    const rateMatch = text.match(/(?:佣金率|佣金比例|佣金)[^\\d%]{0,8}([0-9]+(?:\\.[0-9]+)?)\\s*%/)
+      || text.match(/([0-9]+(?:\\.[0-9]+)?)\\s*%/)
+    const salesMatch = text.match(/(?:月销|近30天|30天销量|销量|已售)[^\\d]{0,8}([0-9]+(?:\\.[0-9]+)?)\\s*(万)?/)
+    let sales = 0
+    if (salesMatch) {
+      sales = Number(salesMatch[1]) || 0
+      if (salesMatch[2]) sales = Math.round(sales * 10000)
+    }
+    const titleLine = text.split(/\\n/).map((line) => line.trim()).find((line) => /[\\u4e00-\\u9fff]/.test(line) && line.length >= 6 && line.length <= 80 && !/登录|佣金|销量|类目|体验分|选品/.test(line))
+    const price = priceMatch ? Number(priceMatch[1]) || 0 : 0
+    const rate = rateMatch ? Number(rateMatch[1]) || 0 : 0
+    if (!(price > 0) && !(rate > 0) && !(sales > 0)) return null
+    return { title: titleLine || '', price, rate, monthlySales: sales, source: '百应详情页' }
+  })()`
+}
+
 async function scrapeBuyinDomProduct(win, pid) {
   if (!win || win.isDestroyed()) return null
   const pages = [
+    `https://buyin.jinritemai.com/dashboard/merch-picking-library/merch-promoting?id=${encodeURIComponent(pid)}`,
+    `https://buyin.jinritemai.com/dashboard/merch-picking-library/merch-promoting?product_id=${encodeURIComponent(pid)}`,
     `https://buyin.jinritemai.com/dashboard/merch-picking-cart`,
-    `https://buyin.jinritemai.com/dashboard/merch-picking-library`,
-    `https://buyin.jinritemai.com/dashboard/merch-picking-library?search_text=${encodeURIComponent(pid)}`
+    `https://buyin.jinritemai.com/dashboard/merch-picking-library`
   ]
+  let best = null
   for (const page of pages) {
     if (win.isDestroyed()) break
     await loadPage(win, page, { quiet: true })
     await wait(1600)
-    // 尝试在搜索框填入商品 ID
-    await win.webContents.executeJavaScript(`(() => {
-      const pid = ${JSON.stringify(String(pid))}
-      const inputs = Array.from(document.querySelectorAll('input'))
-      const box = inputs.find((el) => /搜索|商品|ID|编号/.test((el.placeholder || '') + (el.name || ''))) || inputs.find((el) => el.type === 'search' || el.type === 'text')
-      if (!box) return 'no'
-      const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')
-      proto.set.call(box, pid)
-      box.dispatchEvent(new Event('input', { bubbles: true }))
-      box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
-      box.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }))
-      return 'ok'
-    })()`, true).catch(() => 'no')
-    await wait(1800)
-    hardenSilentWindow(win)
-    let found = await evalInFrames(win, scrapeBuyinTableScript(pid)).catch(() => null)
-    if (found && typeof found === 'string') {
-      try { found = JSON.parse(found) } catch { found = null }
+    const onDetail = /merch-promoting/.test(page)
+    if (!onDetail) {
+      await win.webContents.executeJavaScript(`(() => {
+        const pid = ${JSON.stringify(String(pid))}
+        const inputs = Array.from(document.querySelectorAll('input'))
+        const box = inputs.find((el) => /搜索|商品|ID|编号/.test((el.placeholder || '') + (el.name || ''))) || inputs.find((el) => el.type === 'search' || el.type === 'text')
+        if (!box) return 'no'
+        const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')
+        proto.set.call(box, pid)
+        box.dispatchEvent(new Event('input', { bubbles: true }))
+        box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }))
+        const btn = Array.from(document.querySelectorAll('button, span, div')).find((el) => {
+          const text = String(el.innerText || '').replace(/\\s+/g, '')
+          return text === '搜索' || text === '查询'
+        })
+        if (btn) (btn.closest('button') || btn).click()
+        return 'ok'
+      })()`, true).catch(() => 'no')
+      await wait(1800)
+    } else {
+      await wait(900)
     }
-    if (found?.title || Number(found?.price) > 0 || Number(found?.rate) > 0) {
-      runtimeLog.info('product.dom', `表格命中 ${pid}`, {
-        price: found.price, rate: found.rate, sales: found.monthlySales, title: String(found.title || '').slice(0, 20)
-      })
-      return {
+    hardenSilentWindow(win)
+    let found = null
+    if (onDetail) {
+      found = await evalInFrames(win, scrapeCommerceTextScript()).catch(() => null)
+    }
+    if (!found || (!(Number(found.price) > 0) && !(Number(found.rate) > 0))) {
+      const table = await evalInFrames(win, scrapeBuyinTableScript(pid)).catch(() => null)
+      if (table && (table.title || Number(table.price) > 0 || Number(table.rate) > 0 || Number(table.monthlySales) > 0)) {
+        found = {
+          ...(found || {}),
+          ...table,
+          title: table.title || found?.title || '',
+          price: Number(table.price) > 0 ? Number(table.price) : Number(found?.price) || 0,
+          rate: Number(table.rate) > 0 ? Number(table.rate) : Number(found?.rate) || 0,
+          monthlySales: Number(table.monthlySales) > 0 ? Number(table.monthlySales) : Number(found?.monthlySales) || 0
+        }
+      }
+    }
+    if (!found || (!(Number(found.price) > 0) && !(Number(found.rate) > 0) && !(Number(found.monthlySales) > 0))) {
+      const loose = await evalInFrames(win, scrapeCommerceTextScript()).catch(() => null)
+      if (loose) {
+        found = {
+          ...(found || {}),
+          title: found?.title || loose.title || '',
+          price: Number(found?.price) > 0 ? Number(found.price) : Number(loose.price) || 0,
+          rate: Number(found?.rate) > 0 ? Number(found.rate) : Number(loose.rate) || 0,
+          monthlySales: Number(found?.monthlySales) > 0 ? Number(found.monthlySales) : Number(loose.monthlySales) || 0,
+          source: loose.source || found?.source
+        }
+      }
+    }
+    if (found?.title || Number(found?.price) > 0 || Number(found?.rate) > 0 || Number(found?.monthlySales) > 0) {
+      best = mergeLookedProduct(best, {
         id: pid,
-        title: found.title || `商品 ${pid}`,
+        title: found.title || '',
         price: Number(found.price) || 0,
         rate: Number(found.rate) || 0,
         monthlySales: Number(found.monthlySales) || 0,
@@ -3886,11 +4195,16 @@ async function scrapeBuyinDomProduct(win, pid) {
         shop: found.shop || '抖音',
         image: found.image || '',
         images: found.images || [],
-        source: '百应表格',
+        source: found.source || '百应页面',
         link: `https://haohuo.jinritemai.com/ecommerce/trade/detail/index.html?id=${pid}`
-      }
+      })
+      runtimeLog.info('product.dom', `页面命中 ${pid}`, {
+        price: best.price, rate: best.rate, sales: best.monthlySales, title: String(best.title || '').slice(0, 20)
+      })
+      if (Number(best.price) > 0 && Number(best.rate) > 0 && Number(best.monthlySales) > 0) return best
     }
   }
+  if (best) return best
   runtimeLog.warn('product.dom', `表格未找到 ${pid}`)
   return null
 }
@@ -4273,6 +4587,8 @@ module.exports = {
   submitCode,
   requestCode,
   bootstrapDoubaoLogin,
+  bootstrapPublishLogin,
+  silentPasswordLogin,
   ensurePublishLogin,
   accountStatus,
   loggedIn,

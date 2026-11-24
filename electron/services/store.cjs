@@ -49,6 +49,7 @@ function emptySnapshot() {
     publishAccounts: [],
     collectAccounts: [],
     schedules: [],
+    inbox: [],
     rpaFlows: [
       { id: 'rpa01', name: '抖音发布', platform: '抖音', enabled: true, lastRun: '', steps: ['打开环境', '检查登录', '上传视频', '填写文案', '挂购物车', '提交发布'] },
       { id: 'rpa03', name: '登录检测', platform: '抖音', enabled: true, lastRun: '', steps: ['打开环境', '打开创作者中心', '读取登录状态', '写回账号列表'] }

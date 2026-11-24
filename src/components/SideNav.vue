@@ -6,6 +6,7 @@
         <AppIcon :name="item.icon" />
         <span>{{ item.title }}</span>
         <span v-if="item.badge === 'works' && store.unpublishedCount" class="nav-badge">{{ store.unpublishedCount }}</span>
+        <span v-if="item.badge === 'inbox' && store.unreadInbox" class="nav-badge">{{ store.unreadInbox }}</span>
       </router-link>
     </section>
   </aside>

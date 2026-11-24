@@ -69,7 +69,7 @@
       </el-table>
     </div>
     <el-dialog v-model="visible" :title="form.id ? '编辑豆包账号' : '新建豆包账号'" width="460px">
-      <p class="muted">保存后会自动打开豆包：主动填入手机号并点击「获取验证码」。有密码则先尝试账密登录。验证弹窗会自动处理。</p>
+      <p class="muted">保存后自动打开豆包网页：点「登录」，填入手机号，点「下一步」，再点「获取验证码」。有密码会先尝试账密登录。</p>
       <el-form label-width="88px">
         <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>
         <el-form-item label="登录方式">

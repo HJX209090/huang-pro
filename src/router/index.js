@@ -4,6 +4,7 @@ import { useAppStore } from '@/stores/app'
 const routes = [
   { path: '/', redirect: '/dashboard' },
   { path: '/dashboard', component: () => import('@/views/Dashboard.vue') },
+  { path: '/messages', component: () => import('@/views/Messages.vue') },
   { path: '/works', component: () => import('@/views/Works.vue') },
   { path: '/workbench', component: () => import('@/views/Workbench.vue') },
   { path: '/plaza', component: () => import('@/views/Plaza.vue') },

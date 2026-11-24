@@ -27,6 +27,19 @@ export const BUILTIN_SCHEDULE_DEFS = [
     desc: '每隔一段时间检查已审核成片并送去抖音发布（默认关闭，可自行打开）'
   },
   {
+    id: 'SYS-login-patrol',
+    name: '登录状态巡检',
+    type: '登录巡检',
+    mode: '循环',
+    date: '',
+    time: '',
+    intervalMinutes: 20,
+    account: '',
+    enabled: true,
+    builtin: true,
+    desc: '检查豆包、达人工作台、创作者中心。账密过期自动登录；扫码过期写入消息，可点去登录'
+  },
+  {
     id: 'SYS-generate',
     name: '待生成作品自动开做',
     type: '生成队列',

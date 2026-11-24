@@ -3,6 +3,7 @@ export const navGroups = [
     label: '工作台',
     items: [
       { path: '/dashboard', title: '仪表盘', icon: 'dashboard' },
+      { path: '/messages', title: '消息', icon: 'bell', badge: 'inbox' },
       { path: '/works', title: '我的作品', icon: 'works', badge: 'works' },
       { path: '/workbench', title: '单片工作台', icon: 'bench' },
       { path: '/plaza', title: '选品广场', icon: 'plaza' }

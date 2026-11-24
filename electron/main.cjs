@@ -291,6 +291,22 @@ ipcMain.handle('doubao:bootstrap-login', async (_event, payload) => {
     return { ok: false, loginStatus: '待确认', message: String(error?.message || error || '打开豆包失败') }
   }
 })
+ipcMain.handle('publish:bootstrap-login', async (_event, payload) => {
+  try {
+    const result = await browserSession.bootstrapPublishLogin(payload || {})
+    return JSON.parse(JSON.stringify(result || { ok: false, message: '无结果' }))
+  } catch (error) {
+    return { ok: false, message: String(error?.message || error || '打开登录页失败') }
+  }
+})
+ipcMain.handle('account:silent-login', async (_event, payload) => {
+  try {
+    const result = await browserSession.silentPasswordLogin(payload || {})
+    return JSON.parse(JSON.stringify(result || { ok: false, loginStatus: '待登录' }))
+  } catch (error) {
+    return { ok: false, loginStatus: '待登录', message: String(error?.message || error || '自动登录失败') }
+  }
+})
 ipcMain.handle('account:ensure-login', (_event, payload) => browserSession.ensurePublishLogin(payload || {}))
 ipcMain.handle('dialog:images', async () => {
   const result = await dialog.showOpenDialog({

@@ -46,8 +46,11 @@
         <el-table-column label="视频购物车" width="110">
           <template #default="{ row }"><el-switch v-model="row.cart" @change="store.persist()" /></template>
         </el-table-column>
-        <el-table-column label="登录状态" width="100">
-          <template #default="{ row }"><el-tag size="small" :type="statusType(row.loginStatus)">{{ row.loginStatus }}</el-tag></template>
+        <el-table-column label="达人" width="90">
+          <template #default="{ row }"><el-tag size="small" :type="statusType(row.buyinLoginStatus || row.loginStatus)">{{ row.buyinLoginStatus || row.loginStatus || '待登录' }}</el-tag></template>
+        </el-table-column>
+        <el-table-column label="创作者" width="90">
+          <template #default="{ row }"><el-tag size="small" :type="statusType(row.creatorLoginStatus)">{{ row.creatorLoginStatus || '待登录' }}</el-tag></template>
         </el-table-column>
         <el-table-column prop="publishMode" label="发布状态" width="110" />
         <el-table-column prop="fetchMode" label="获取方式" width="100" />
@@ -74,7 +77,7 @@
       </el-table>
     </div>
     <el-dialog v-model="visible" :title="form.id ? '编辑抖音账号' : '添加抖音账号'" width="520px">
-      <p class="muted">保存后会打开达人工作台并<strong>自动填写账号密码</strong>（或验证码登录）。达人与创作者共用同一浏览器会话；每个账号独立存活，可添加多个。</p>
+      <p class="muted">填了账号密码：创作者页在后台自动填写，不显示；只打开达人工作台并点到扫码。没填密码：达人和创作者都会打开，各自出二维码。两边登录状态分开保存。</p>
       <el-form label-width="96px">
         <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>
         <el-form-item label="登录方式">
@@ -151,6 +154,8 @@ async function checkSelected() {
   for (const item of list) {
     const result = await window.tujian.accountStatus({ kind: 'publish', id: item.id })
     item.loginStatus = result.loginStatus
+    if (result.buyinLoginStatus) item.buyinLoginStatus = result.buyinLoginStatus
+    if (result.creatorLoginStatus) item.creatorLoginStatus = result.creatorLoginStatus
   }
   store.persist()
   ElMessage.success('已按各账号自己的登录态更新')
@@ -212,8 +217,30 @@ async function save() {
   visible.value = false
   const row = store.publishAccounts.find((item) => item.id === id)
   if (row) {
-    await openWorkbench(row)
+    await bootstrapLogin(row)
     if (!form.id) store.syncPlazaQuiet(id)
+  }
+}
+
+async function bootstrapLogin(row) {
+  if (!row) return
+  if (!window.tujian?.bootstrapPublishLogin) return openWorkbench(row)
+  ElMessage.info(row.loginMode === 'password' ? '正在后台填写创作者账密，并打开达人工作台扫码…' : '正在打开达人工作台和创作者中心…')
+  try {
+    const result = await window.tujian.bootstrapPublishLogin({
+      id: row.id,
+      name: row.name,
+      login: row.loginMode === 'qr' ? '' : row.login,
+      mode: row.loginMode || 'qr'
+    })
+    if (result?.buyinLoginStatus) row.buyinLoginStatus = result.buyinLoginStatus
+    if (result?.creatorLoginStatus) row.creatorLoginStatus = result.creatorLoginStatus
+    if (result?.loginStatus) row.loginStatus = result.buyinLoginStatus || result.loginStatus
+    store.persist()
+    ElMessage.success(result?.message || '登录页已打开')
+    if (row.buyinLoginStatus !== '已登录') watchScan(row)
+  } catch (error) {
+    ElMessage.warning(error?.message || '登录页没有打开')
   }
 }
 
@@ -272,6 +299,8 @@ async function watchScan(row) {
     await new Promise((resolve) => setTimeout(resolve, 3000))
     if (!window.tujian?.accountStatus) return
     const result = await window.tujian.accountStatus({ kind: 'publish', id: row.id })
+    if (result.buyinLoginStatus) row.buyinLoginStatus = result.buyinLoginStatus
+    if (result.creatorLoginStatus) row.creatorLoginStatus = result.creatorLoginStatus
     if (result.loginStatus !== '已登录') continue
     row.loginStatus = '已登录'
     store.persist()
