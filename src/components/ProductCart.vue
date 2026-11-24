@@ -14,7 +14,7 @@
       <span class="muted">每日采集限额</span>
       <el-input-number v-model="store.settings.dailyCollectLimit" :min="1" :max="500" @change="store.persist()" />
       <span class="muted">开始时间</span>
-      <el-time-select v-model="store.settings.collectStart" start="00:00" step="00:30" end="23:30" style="width: 120px" @change="store.persist()" />
+      <el-time-select v-model="store.settings.collectStart" start="00:00" step="00:30" end="23:30" style="width: 120px" @change="onCollectStartChange" />
     </div>
     <div class="panel">
       <div class="toolbar">
@@ -78,6 +78,15 @@ import { formatTime, statusType, uid } from '@/utils/format'
 import { sanitizeProductTitle } from '@/utils/banned'
 
 const store = useAppStore()
+
+function onCollectStartChange() {
+  const task = store.schedules.find((item) => item.id === 'SYS-collect')
+  if (task) {
+    task.time = store.settings.collectStart
+    task.mode = '定时'
+  }
+  store.persist()
+}
 const router = useRouter()
 const idText = ref('')
 const visible = ref(false)

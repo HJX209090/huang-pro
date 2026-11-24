@@ -3,6 +3,7 @@ import { createSeed, defaultPromptSettings, upgradePromptSettings } from '@/mock
 import { composePrompt, formatTime, uid, fillTemplate, publishTitleFromGoods, topicsFromGoods } from '@/utils/format'
 import { cleanTitle, defaultBannedWords, sanitizeProductTitle } from '@/utils/banned'
 import { ensureDoubaoRules } from '@/utils/doubaoRules'
+import { BUILTIN_SCHEDULE_DEFS, isBuiltinSchedule } from '@/utils/builtinSchedules'
 import { api, getToken, setToken } from '@/services/api'
 import { couponTags, goodsCategory, goodsTags, isFreeShipping } from '@/utils/goods'
 
@@ -113,6 +114,8 @@ export const useAppStore = defineStore('app', {
     queueWorks: (state) => state.works.filter((item) => ['生成中', '待生成', '发布中'].includes(item.status)),
     activeRuntimeTasks: (state) => state.runtimeTasks.filter((item) => item.status === 'running'),
     onlinePublishCount: (state) => state.publishAccounts.filter((item) => item.enabled).length,
+    mySchedules: (state) => (state.schedules || []).filter((item) => !isBuiltinSchedule(item)),
+    systemSchedules: (state) => (state.schedules || []).filter((item) => isBuiltinSchedule(item)),
     licenseActive: (state) => {
       const license = state.license
       if (!license || !state.systemNow) return false
@@ -190,6 +193,54 @@ export const useAppStore = defineStore('app', {
       })
       this.syncProxy()
       this.applyWindowSize()
+      this.ensureBuiltinSchedules()
+    },
+    ensureBuiltinSchedules() {
+      if (!Array.isArray(this.schedules)) this.schedules = []
+      if (!Array.isArray(this.settings.dismissedBuiltinIds)) this.settings.dismissedBuiltinIds = []
+      const dismissed = new Set(this.settings.dismissedBuiltinIds)
+      let changed = false
+      for (const def of BUILTIN_SCHEDULE_DEFS) {
+        if (dismissed.has(def.id)) continue
+        const existing = this.schedules.find((item) => item.id === def.id)
+        if (existing) {
+          if (!existing.builtin) {
+            existing.builtin = true
+            changed = true
+          }
+          if (!existing.desc && def.desc) {
+            existing.desc = def.desc
+            changed = true
+          }
+          continue
+        }
+        const row = {
+          ...def,
+          lastRun: '',
+          lastSuccessDay: '',
+          time: def.id === 'SYS-collect'
+            ? (String(this.settings.collectStart || def.time || '08:00'))
+            : def.time
+        }
+        this.schedules.push(row)
+        changed = true
+      }
+      // 选品车「开始时间」与内置采集任务双向对齐
+      const collect = this.schedules.find((item) => item.id === 'SYS-collect')
+      if (collect?.time && this.settings.collectStart !== collect.time) {
+        this.settings.collectStart = collect.time
+        changed = true
+      }
+      if (changed) this.persist()
+    },
+    dismissBuiltinSchedule(id) {
+      if (!id) return
+      if (!Array.isArray(this.settings.dismissedBuiltinIds)) this.settings.dismissedBuiltinIds = []
+      if (!this.settings.dismissedBuiltinIds.includes(id)) {
+        this.settings.dismissedBuiltinIds.push(id)
+      }
+      this.schedules = this.schedules.filter((item) => item.id !== id)
+      this.persist()
     },
     applyWindowSize() {
       if (!window.tujian?.resizeAppWindow) return
@@ -687,11 +738,6 @@ export const useAppStore = defineStore('app', {
       if (Number.isNaN(now.getTime())) return
       const clock = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
       const day = formatTime(now).slice(0, 10)
-      const collectKey = `${day} ${clock}`
-      if (this.settings.collectStart === clock && this.settings.lastCollectRun !== collectKey) {
-        this.settings.lastCollectRun = collectKey
-        this.syncCatalog('products').catch(() => {})
-      }
       this.schedules.forEach((task) => {
         if (!task.enabled) return
         if (task._running) return
@@ -752,45 +798,51 @@ export const useAppStore = defineStore('app', {
           this.addLog('warning', '定时', message)
           return message
         }
-        // 优先取采集/发布账号真实 cookie 状态，不要只看列表里的旧标签
+        // 失败/关窗后 30 分钟内不自动再开抖音（立即执行可跳过）
+        if (!immediate && task.lastLoginFailAt && Date.now() - Number(task.lastLoginFailAt) < 30 * 60 * 1000) {
+          const message = `${task.name}：距上次发布未成功不足 30 分钟，暂不拉起抖音。登录创作者后可点「立即执行」`
+          this.endTask(taskId, message)
+          this.addLog('info', '定时', message)
+          return message
+        }
+        // 只查 cookie，预检绝不拉起/刷新页面
         try {
-          if (window.tujian?.accountStatus) {
-            const st = await window.tujian.accountStatus({ kind: 'publish', id: account.id })
-            if (st?.loginStatus) account.loginStatus = st.loginStatus
-          }
-        } catch { /* ignore */ }
-        if (window.tujian?.ensurePublishLogin) {
-          try {
+          if (window.tujian?.ensurePublishLogin) {
             const ensured = await window.tujian.ensurePublishLogin({
               id: account.id,
               name: account.name,
               login: account.login,
               mode: account.loginMode || 'password',
-              url: 'https://creator.douyin.com/creator-micro/content/upload'
+              url: 'https://creator.douyin.com/creator-micro/content/upload',
+              cookieOnly: true
             })
             if (ensured?.loginStatus) account.loginStatus = ensured.loginStatus
             this.persist()
-            if (!ensured?.ok && ensured?.loginStatus !== '已登录') {
-              const message = `${task.name}：${ensured.message || '达人账号未登录，已尝试自动重登'}`
+            if (!ensured?.ok) {
+              task.lastLoginFailAt = Date.now()
+              const message = `${task.name}：${ensured.message || '创作者未登录'}。请先手动打开创作者中心登录一次；定时不会反复刷页`
               this.endTask(taskId, message, 'failed')
               this.addLog('warning', '定时', message)
               return message
             }
-            if (ensured?.reused) this.addLog('info', '定时', `${account.name}：沿用采集账号登录态，无需再扫码`)
-            else this.addLog('info', '定时', `${account.name}：${ensured.message || '登录态已就绪'}`)
-          } catch (error) {
-            this.addLog('warning', '定时', `${account.name}：检查登录态失败 ${error.message || ''}`)
+            this.addLog('info', '定时', `${account.name}：${ensured.message || '登录态有效，开始发布'}`)
           }
+        } catch (error) {
+          this.addLog('warning', '定时', `${account.name}：检查登录态失败 ${error.message || ''}`)
         }
         const posted = await this.publishWorksBatch(ready, account)
         if (posted > 0) {
           task.lastSuccessDay = stamp.slice(0, 10)
+          task.lastLoginFailAt = 0
           if (task.mode === '单次') task.enabled = false
+        } else {
+          // 未发出（关窗/登录墙等）：冷却，避免点掉又自己打开
+          task.lastLoginFailAt = Date.now()
         }
         this.persist()
         const message = posted
           ? `${task.name} 已把 ${posted} 条审核通过的成片送进抖音`
-          : `${task.name}：${when}，但成片没有放进上传页`
+          : `${task.name}：${when}，成片未发布成功。已暂停自动拉页 30 分钟；登录后可点「立即执行」`
         this.endTask(taskId, message, posted ? 'done' : 'failed')
         return message
       }
