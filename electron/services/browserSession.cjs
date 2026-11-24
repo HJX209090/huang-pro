@@ -140,7 +140,21 @@ async function accountStatus({ kind, id }) {
 async function ensurePublishLogin({ id, name, login, mode, url, captcha }) {
   const status = await accountStatus({ kind: 'publish', id })
   if (status.loginStatus === '已登录') {
-    // 采集账号已登录：直接复用，创作者页由 openAccount SSO 热身，不再扫码
+    // 采集/达人分区已登录：先热一下百应→创作者 SSO，再返回，避免定时时再弹扫码
+    if (String(url || '').includes('creator.douyin.com')) {
+      try {
+        await openAccount({
+          kind: 'publish',
+          id,
+          name,
+          login,
+          mode: mode || 'password',
+          url: url || 'https://creator.douyin.com/creator-micro/content/upload',
+          already: true,
+          captcha
+        })
+      } catch { /* 热身失败仍按已登录继续，后续 openAccount 会再试 */ }
+    }
     return { ok: true, loginStatus: '已登录', reused: true, message: '沿用采集/达人账号登录态' }
   }
   const secret = secrets.read(id)
@@ -486,22 +500,39 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
   const method = mode || 'password'
   const onBuyin = (url || URLS[kind] || '').includes('buyin.jinritemai.com')
   const onCreator = (url || '').includes('creator.douyin.com')
-  let sessionOk = loggedIn(cookies, kind) || buyinLoggedIn(cookies) || creatorLoggedIn(cookies) || Boolean(already)
+  let sessionOk = loggedIn(cookies, kind) || buyinLoggedIn(cookies) || creatorLoggedIn(cookies)
+  const preferReuse = sessionOk || Boolean(already)
   // 创作者中心：先热一下百应工作台，用同一分区 cookie 做 SSO，避免再扫码
-  if (onCreator && sessionOk) {
+  if (onCreator && preferReuse) {
     await loadPage(win, 'https://buyin.jinritemai.com/dashboard', { quiet })
     await wait(1200)
     await loadPage(win, url || 'https://creator.douyin.com/creator-micro/content/upload', { quiet })
     await wait(1800)
     cookies = await ses.cookies.get({})
-    sessionOk = loggedIn(cookies, kind) || buyinLoggedIn(cookies) || creatorLoggedIn(cookies) || Boolean(already)
+    sessionOk = loggedIn(cookies, kind) || buyinLoggedIn(cookies) || creatorLoggedIn(cookies)
   }
-  const direct = sessionOk
-  if (direct) {
+  if (sessionOk) {
     return { ok: true, loginStatus: '已登录', direct: true, scope: onCreator ? 'creator' : (onBuyin ? 'buyin' : ''), message: onCreator ? '已打开创作者中心（沿用采集登录态）' : (onBuyin ? '已进入达人工作台' : '') }
   }
+  // 调用方声称已登录但 cookie 实际没了：有密码就自动填，绝不先逼扫码
+  if (preferReuse && secret?.password && method !== 'code') {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await wait(900)
+      if (onBuyin || onCreator) await runInFrames(win, clickTextScript(['密码登录', '账号登录']))
+      await fillLogin(win, account, secret.password)
+      await wait(1200)
+      cookies = await ses.cookies.get({})
+      if (loggedIn(cookies, kind) || buyinLoggedIn(cookies) || creatorLoggedIn(cookies)) {
+        if (onCreator) {
+          await loadPage(win, url || 'https://creator.douyin.com/creator-micro/content/upload', { quiet })
+          await wait(1000)
+        }
+        return { ok: true, loginStatus: '已登录', direct: true, scope: onCreator ? 'creator' : (onBuyin ? 'buyin' : ''), message: '登录态已刷新，已进入页面' }
+      }
+    }
+  }
   // 仅在真正没有 cookie 时才扫码；分区已登录过绝不再逼扫
-  if (!sessionOk && method === 'qr') {
+  if (!sessionOk && !preferReuse && method === 'qr') {
     for (let attempt = 0; attempt < 6; attempt += 1) {
       await wait(800)
       const clicked = await runInFrames(win, clickTextScript(['扫码登录', '扫码']))
@@ -2086,7 +2117,7 @@ function pickCreatorTagScript(tag) {
 }
 
 function pickRecommendedTopicsScript(tags) {
-  const list = (Array.isArray(tags) ? tags : []).map((item) => String(item || '').replace(/^#/, '')).filter(Boolean).slice(0, 3)
+  const list = (Array.isArray(tags) ? tags : []).map((item) => String(item || '').replace(/^#/, '')).filter(Boolean).slice(0, 5)
   return `(() => {
     const tags = ${JSON.stringify(list)}
     if (!tags.length) return JSON.stringify([])
@@ -2210,17 +2241,23 @@ function dismissAssistPanelScript() {
   return `(() => {
     const compact = (value) => String(value || '').replace(/\\s+/g, '')
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
-    const nodes = Array.from(document.querySelectorAll('button, [role="button"], span, div, a'))
+    const nodes = Array.from(document.querySelectorAll('button, [role="button"], span, div, a, i, svg'))
     const closer = nodes.find((el) => {
-      const text = compact(el.innerText || el.getAttribute('aria-label') || '')
+      const label = compact(el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '')
+      const cls = String(el.className || '') + String(el.getAttribute('aria-label') || '')
       const rect = el.getBoundingClientRect()
-      if (!(rect.width > 10 && rect.height > 10)) return false
-      return text === '关闭' || text === '我知道了' || text === '完成' || text === '继续发布' || /close|关闭/.test((el.className || '') + (el.getAttribute('aria-label') || ''))
+      if (!(rect.width > 8 && rect.height > 8 && rect.width < 64 && rect.height < 64)) {
+        if (!(label === '关闭' || label === '我知道了' || label === '完成' || label === '继续发布' || label === '知道了')) return false
+      }
+      if (label === '关闭' || label === '我知道了' || label === '完成' || label === '继续发布' || label === '知道了') return true
+      return /close|关闭|icon-close|btn-close|semi-icons-close/i.test(cls)
     })
     if (closer) {
-      closer.click()
+      (closer.closest('button, [role="button"], a') || closer).click()
       return 'closed'
     }
+    // 点一下空白处，收起快速检测浮层
+    document.body?.click?.()
     return 'ok'
   })()`
 }
@@ -2758,7 +2795,8 @@ async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, 
   await wait(400)
   // 发布前先走发文助手检测；需要时点「重新检测」，有风险则不硬点发布
   const assist = await ensurePublishAssist(win, notify, workId)
-  if (assist.state === 'risk' || assist.state === 'timeout') {
+  // 仅明确风险时停；超时/未见异常也继续点发布，避免卡在快速检测面板
+  if (assist.state === 'risk') {
     bringToFront(win)
     return {
       ok: false,
@@ -2770,14 +2808,21 @@ async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, 
       message: `${assist.note}。标题等已填好，请在打开的窗口里确认检测结果后再点发布。`
     }
   }
+  if (assist.state === 'timeout') {
+    notify?.({ workId, progress: 94, status: '发布中', confirmNote: '检测超时，尝试继续点发布' })
+  }
   let published = 'miss'
-  for (let attempt = 0; attempt < 12 && published !== 'published'; attempt += 1) {
+  for (let attempt = 0; attempt < 16 && published !== 'published'; attempt += 1) {
     await runInFrames(win, dismissAssistPanelScript()).catch(() => {})
+    await runInFrames(win, `(() => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+      return 'ok'
+    })()`).catch(() => {})
     const ready = await runInFrames(win, uploadReadyScript())
-    if (ready === 'ready' || ready === 'wait' || ready === 'fail') {
+    if (ready === 'ready' || ready === 'wait' || ready === 'fail' || attempt >= 2) {
       published = await runInFrames(win, clickPublishScript())
     }
-    if (published !== 'published') await wait(700)
+    if (published !== 'published') await wait(600)
   }
   bringToFront(win)
   const tagText = (placed.length ? placed : topicTags).map((item) => `#${item}`).join(' ')
@@ -3136,6 +3181,9 @@ function collectImageUrls(node, list = [], seen = new Set(), depth = 0) {
 
 function coerceDeepNumber(raw) {
   if (typeof raw === 'number') return Number.isFinite(raw) && raw > 0 ? raw : 0
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    return coerceDeepNumber(raw.amount ?? raw.value ?? raw.num ?? raw.price ?? raw.ratio ?? raw.cos_ratio ?? raw.min ?? raw.max ?? 0)
+  }
   if (typeof raw !== 'string') return 0
   const text = raw.replace(/[^\d.]/g, '')
   const value = Number(text)
@@ -3230,9 +3278,24 @@ function productFromJsonBlob(json, pid) {
           id: /^\d{6,}$/.test(id) ? id : pid,
           title,
           node,
-          price: normalizeMoney(base.price || base.discount_price || base.min_price || node.price || 0),
-          rate: normalizeRate(biz.cos_ratio || biz.cos_ratio_str || node.cos_ratio || biz.commission_rate || 0),
-          monthlySales: Number(biz.monthly_sale || biz.sell_num || biz.sell_num_30d || biz.sales || 0),
+          price: normalizeMoney(
+            pickDeepNumber(base, [
+              'discount_price', 'min_price', 'price', 'market_price', 'coupon_price', 'actual_price',
+              'sku_min_price', 'good_price', 'model_price', 'activity_price', 'promotion_price', 'sale_price', 'amount'
+            ])
+            || pickDeepNumber(node, ['discount_price', 'min_price', 'price', 'market_price', 'good_price', 'amount'])
+            || base.price || base.discount_price || base.min_price || node.price || 0
+          ),
+          rate: normalizeRate(
+            pickDeepNumber(biz, [
+              'cos_ratio', 'cos_ratio_str', 'commission_rate', 'estimated_cos_ratio', 'cos_fee_rate', 'commission_rate_str'
+            ])
+            || pickDeepNumber(node, ['cos_ratio', 'cos_ratio_str', 'commission_rate'])
+            || biz.cos_ratio || biz.cos_ratio_str || node.cos_ratio || biz.commission_rate || 0
+          ),
+          monthlySales: pickDeepNumber(biz, [
+            'monthly_sale', 'sell_num', 'sell_num_30d', 'order_num', 'month_sell_num', 'sales', 'sale_num'
+          ]) || pickDeepNumber(node, ['monthly_sale', 'sell_num', 'sell_num_30d', 'sales']) || 0,
           category: pickDeepText(node, ['category_name', 'first_cname', 'cate_name', 'first_category_name', 'industry_name', 'leaf_cname']) || '链接导入',
           shop: shop.shop_name || pickDeepText(node, ['shop_name', 'shopName']) || '抖音',
           images: collectImageUrls(node).slice(0, 6)
@@ -3405,7 +3468,7 @@ async function scrapeProductById({ id, name, login, mode, productId }) {
       }
       if (productDetailScore(best) >= 12) break
     }
-    // 2) 决策详情接口
+    // 2) 决策详情接口（GET + 少量 POST）
     for (const api of apiTries) {
       if (win.isDestroyed() || productDetailScore(best) >= 12) break
       const json = await win.webContents.executeJavaScript(
@@ -3414,6 +3477,22 @@ async function scrapeProductById({ id, name, login, mode, productId }) {
       ).catch(() => null)
       const found = productFromJsonBlob(json, pid)
       if (found?.title) best = mergeLookedProduct(best, { ...found, source: '百应详情' })
+    }
+    if (productDetailScore(best) < 10 && !win.isDestroyed()) {
+      const postTries = [
+        { url: 'https://buyin.jinritemai.com/pc/selection/decision/pack_detail', body: { product_id: pid } },
+        { url: 'https://buyin.jinritemai.com/pc/selection/decision/pack_detail', body: { promotion_id: pid, product_id: pid } },
+        { url: 'https://buyin.jinritemai.com/pc/selection/decision/product_detail', body: { product_id: pid } }
+      ]
+      for (const item of postTries) {
+        if (win.isDestroyed() || productDetailScore(best) >= 12) break
+        const json = await win.webContents.executeJavaScript(
+          `fetch(${JSON.stringify(item.url)},{method:'POST',credentials:'include',headers:{'content-type':'application/json',accept:'application/json'},body:JSON.stringify(${JSON.stringify(item.body)})}).then((r)=>r.json()).catch(()=>null)`,
+          true
+        ).catch(() => null)
+        const found = productFromJsonBlob(json, pid)
+        if (found?.title) best = mergeLookedProduct(best, { ...found, source: '百应详情POST' })
+      }
     }
     // 3) 选品广场搜索编号
     if (productDetailScore(best) < 10 && !win.isDestroyed()) {

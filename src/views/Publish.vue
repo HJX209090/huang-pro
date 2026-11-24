@@ -281,8 +281,42 @@ async function watchScan(row) {
 
 async function openRow(row) {
   if (!window.tujian?.openAccount) return ElMessage.warning('请在桌面窗口里打开')
-  const result = await window.tujian.openAccount({ kind: 'publish', id: row.id, name: row.name, login: row.login, mode: row.loginMode || 'password', already: false, url: 'https://creator.douyin.com/' })
-  if (result.message) result.ok ? ElMessage.success(result.message) : ElMessage.warning(result.message)
+  try {
+    if (window.tujian.accountStatus) {
+      const st = await window.tujian.accountStatus({ kind: 'publish', id: row.id })
+      if (st?.loginStatus) row.loginStatus = st.loginStatus
+    }
+  } catch { /* ignore */ }
+  let already = row.loginStatus === '已登录'
+  if (window.tujian.ensurePublishLogin) {
+    try {
+      const ensured = await window.tujian.ensurePublishLogin({
+        id: row.id,
+        name: row.name,
+        login: row.login,
+        mode: row.loginMode || 'password',
+        url: 'https://creator.douyin.com/creator-micro/content/upload'
+      })
+      if (ensured?.loginStatus) row.loginStatus = ensured.loginStatus
+      already = ensured?.loginStatus === '已登录' || ensured?.ok
+      store.persist()
+      if (ensured?.reused) ElMessage.success('已沿用采集/达人登录态打开创作者中心')
+    } catch { /* 继续打开 */ }
+  }
+  const result = await window.tujian.openAccount({
+    kind: 'publish',
+    id: row.id,
+    name: row.name,
+    login: row.login,
+    mode: row.loginMode || 'password',
+    already,
+    url: 'https://creator.douyin.com/creator-micro/content/upload'
+  })
+  if (result?.loginStatus) {
+    row.loginStatus = result.loginStatus
+    store.persist()
+  }
+  if (result.message && !already) result.ok ? ElMessage.success(result.message) : ElMessage.warning(result.message)
   store.addLog('info', '发布', `${row.name} 打开自己的创作者中心`)
 }
 

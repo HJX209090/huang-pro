@@ -48,9 +48,15 @@
         <p class="muted">到点后打开这个账号的抖音上传页，写入作品标题和按标题生成的 5 个标签，并点击发布。</p>
         <el-button @click="router.push('/rpa')">管理本机流程</el-button>
         <h3>3. 选择发布账号</h3>
-        <el-select v-model="form.account" clearable placeholder="全部账号" style="width: 100%">
-          <el-option v-for="item in store.publishAccounts" :key="item.id" :label="item.name" :value="item.name" />
+        <el-select v-model="form.account" clearable placeholder="全部账号" style="width: 100%" @visible-change="(open) => open && syncAccountStatus()">
+          <el-option
+            v-for="item in store.publishAccounts"
+            :key="item.id"
+            :label="`${item.name}（${item.loginStatus || '未检测'}）`"
+            :value="item.name"
+          />
         </el-select>
+        <p class="muted">定时会直接复用该账号在百应/采集里的登录态打开创作者中心，已登录时不再扫码。</p>
         <h3>4. 触发节奏</h3>
         <el-radio-group v-model="form.mode">
           <el-radio-button value="单次">单次</el-radio-button>
@@ -121,11 +127,23 @@ function save() {
   ElMessage.success('任务组已保存')
 }
 
+async function syncAccountStatus() {
+  if (!window.tujian?.accountStatus) return
+  for (const account of store.publishAccounts) {
+    try {
+      const st = await window.tujian.accountStatus({ kind: 'publish', id: account.id })
+      if (st?.loginStatus) account.loginStatus = st.loginStatus
+    } catch { /* ignore */ }
+  }
+  store.persist()
+}
+
 async function run(row) {
   if (!row) return
   if (runningId.value) return ElMessage.info('有任务正在执行，稍等一下')
   runningId.value = row.id
   try {
+    await syncAccountStatus()
     const message = await store.executeSchedule(row, { immediate: true })
     const text = message || `${row.name} 已立即执行`
     if (/没有审核通过|待审核|领取过滤|可发成片/.test(text)) {

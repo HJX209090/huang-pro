@@ -56,6 +56,9 @@ function pickImage(strings) {
 
 function coerceNumber(raw) {
   if (typeof raw === 'number') return Number.isFinite(raw) && raw > 0 ? raw : 0
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    return coerceNumber(raw.amount ?? raw.value ?? raw.num ?? raw.price ?? raw.ratio ?? raw.cos_ratio ?? raw.min ?? raw.max ?? 0)
+  }
   if (typeof raw !== 'string') return 0
   const text = raw.replace(/[^\d.]/g, '')
   const value = Number(text)
