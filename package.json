@@ -1,6 +1,6 @@
 {
   "name": "huang-plusplus-pro",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "huang++pro 本地桌面框架",
   "main": "electron/main.cjs",
   "private": true,

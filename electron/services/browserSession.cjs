@@ -108,7 +108,8 @@ async function loadPage(win, url, { quiet = false } = {}) {
 }
 
 function isSessionCookie(name = '') {
-  return /sessionid|sid_guard|uid_tt|sid_tt|passport_auth|odin_tt|SASID|session|sid|uid|passport/i.test(name)
+  return /^(sessionid|sessionid_ss|sid_guard|uid_tt|uid_tt_ss|sid_tt|odin_tt|passport_auth_status|passport_auth_status_ss|SASID)$/i.test(String(name || ''))
+    || /sessionid|sid_guard|uid_tt|sid_tt|passport_auth|odin_tt/i.test(String(name || ''))
 }
 
 function loggedIn(cookies, kind) {
@@ -116,17 +117,119 @@ function loggedIn(cookies, kind) {
     const domain = item.domain || ''
     const name = item.name || ''
     if (kind === 'doubao') return /doubao|volces|bytedance|douyin/.test(domain) && isSessionCookie(name)
-    // 达人工作台 / 创作者中心 / 抖音通行证共用同一分区登录态
     return /douyin|jinritemai|bytedance|buyin/.test(domain) && isSessionCookie(name)
   })
 }
 
+/** 百应/精选联盟：jinritemai 域会话 */
 function buyinLoggedIn(cookies) {
-  return loggedIn(cookies, 'publish')
+  return cookies.some((item) => {
+    const domain = String(item.domain || '')
+    return /jinritemai|buyin|bytedance/.test(domain) && isSessionCookie(item.name)
+  }) || cookies.some((item) => /douyin/.test(String(item.domain || '')) && /^sessionid/i.test(String(item.name || '')))
 }
 
+/** 创作者中心：必须有 douyin 域通行证，不能拿百应 cookie 冒充 */
 function creatorLoggedIn(cookies) {
-  return loggedIn(cookies, 'publish')
+  return cookies.some((item) => {
+    const domain = String(item.domain || '')
+    const name = String(item.name || '')
+    return /douyin\.com/.test(domain) && /^(sessionid|sessionid_ss|sid_guard|uid_tt|sid_tt)$/i.test(name)
+  })
+}
+
+const PASSPORT_COOKIE_NAMES = [
+  'sessionid', 'sessionid_ss', 'sid_guard', 'sid_tt', 'uid_tt', 'uid_tt_ss',
+  'odin_tt', 'ttwid', 'passport_csrf_token', 'passport_csrf_token_default',
+  'passport_auth_status', 'passport_auth_status_ss', 'sid_ucp_v1', 'ssid_ucp_v1'
+]
+
+/** 把百应分区里的通行证 cookie 镜像到 .douyin.com，创作者中心才能免扫码 */
+async function mirrorPassportCookies(ses) {
+  if (!ses) return 0
+  const cookies = await ses.cookies.get({}).catch(() => [])
+  const auth = (cookies || []).filter((item) => {
+    const name = String(item.name || '')
+    if (PASSPORT_COOKIE_NAMES.includes(name)) return Boolean(item.value)
+    return /^(sessionid|sid_guard|uid_tt|sid_tt|odin_tt|ttwid|passport_)/i.test(name) && Boolean(item.value)
+  })
+  if (!auth.length) return 0
+  const targets = [
+    { domain: '.douyin.com', url: 'https://www.douyin.com/' },
+    { domain: '.jinritemai.com', url: 'https://www.jinritemai.com/' },
+    { domain: 'creator.douyin.com', url: 'https://creator.douyin.com/' },
+    { domain: '.bytedance.com', url: 'https://www.bytedance.com/' }
+  ]
+  let written = 0
+  for (const cookie of auth) {
+    for (const target of targets) {
+      try {
+        await ses.cookies.set({
+          url: target.url,
+          name: cookie.name,
+          value: cookie.value,
+          domain: target.domain,
+          path: cookie.path || '/',
+          secure: true,
+          httpOnly: Boolean(cookie.httpOnly),
+          expirationDate: cookie.expirationDate || (Math.floor(Date.now() / 1000) + 86400 * 30),
+          sameSite: 'no_restriction'
+        })
+        written += 1
+      } catch { /* 个别 cookie 域策略拒绝时跳过 */ }
+    }
+  }
+  try { await ses.cookies.flushStore() } catch { /* ignore */ }
+  return written
+}
+
+function creatorLoginWallScript() {
+  return `(() => {
+    const body = String(document.body?.innerText || '').replace(/\\s+/g, '')
+    const href = String(location.href || '')
+    if (/\\/pc\\/login|\\/login|passport\\/web\\/login|scan_login/i.test(href)) return 'wall'
+    if (/我是创作者|我是MCN|打开抖音App|扫码登录/.test(body) && /获取验证码|密码登录|创作者中心/.test(body)) return 'wall'
+    if (/上传视频|发布视频|作品管理|内容管理|发布作品|选择视频|填写作品标题|投稿/.test(body)) return 'ok'
+    if (/creator-micro|content\\/upload|content\\/manage/i.test(href) && !/login/i.test(href)) return 'ok'
+    return 'unknown'
+  })()`
+}
+
+/** 百应已登录 → 镜像 cookie + 通行证热身 → 打开创作者，尽量免扫码 */
+async function bridgeBuyinToCreator(win, targetUrl, { quiet = false } = {}) {
+  if (!win || win.isDestroyed()) return { ok: false, bridged: false }
+  const ses = win.webContents.session
+  await mirrorPassportCookies(ses)
+  // 先走抖音主站/通行证，让服务端把会话落到 .douyin.com
+  const warmUrls = [
+    'https://www.douyin.com/',
+    'https://www.douyin.com/user/self',
+    'https://creator.douyin.com/',
+    targetUrl || 'https://creator.douyin.com/creator-micro/content/upload'
+  ]
+  for (const page of warmUrls) {
+    if (win.isDestroyed()) break
+    await loadPage(win, page, { quiet })
+    await wait(900)
+    await mirrorPassportCookies(ses)
+  }
+  if (win.isDestroyed()) return { ok: false, bridged: false }
+  await loadPage(win, targetUrl || 'https://creator.douyin.com/creator-micro/content/upload', { quiet })
+  await wait(1600)
+  let wall = await runInFrames(win, creatorLoginWallScript()).catch(() => 'unknown')
+  if (wall === 'wall') {
+    // 再镜像一次并重开上传页
+    await mirrorPassportCookies(ses)
+    await loadPage(win, 'https://buyin.jinritemai.com/dashboard', { quiet })
+    await wait(1000)
+    await mirrorPassportCookies(ses)
+    await loadPage(win, targetUrl || 'https://creator.douyin.com/creator-micro/content/upload', { quiet })
+    await wait(1800)
+    wall = await runInFrames(win, creatorLoginWallScript()).catch(() => 'unknown')
+  }
+  const cookies = await ses.cookies.get({}).catch(() => [])
+  const ok = wall === 'ok' || (wall !== 'wall' && creatorLoggedIn(cookies))
+  return { ok, bridged: true, wall, loginStatus: ok ? '已登录' : '待确认' }
 }
 
 async function accountStatus({ kind, id }) {
@@ -140,10 +243,10 @@ async function accountStatus({ kind, id }) {
 async function ensurePublishLogin({ id, name, login, mode, url, captcha }) {
   const status = await accountStatus({ kind: 'publish', id })
   if (status.loginStatus === '已登录') {
-    // 采集/达人分区已登录：先热一下百应→创作者 SSO，再返回，避免定时时再弹扫码
+    // 采集/达人分区已登录：镜像通行证并热创作者，避免再扫码
     if (String(url || '').includes('creator.douyin.com')) {
       try {
-        await openAccount({
+        const opened = await openAccount({
           kind: 'publish',
           id,
           name,
@@ -153,6 +256,15 @@ async function ensurePublishLogin({ id, name, login, mode, url, captcha }) {
           already: true,
           captcha
         })
+        if (opened?.loginStatus === '已登录') {
+          return { ok: true, loginStatus: '已登录', reused: true, message: '已用采集/百应登录态进入创作者中心' }
+        }
+        return {
+          ok: Boolean(opened?.ok),
+          loginStatus: opened?.loginStatus || '待确认',
+          reused: true,
+          message: opened?.message || '百应已登录，但创作者中心仍需一次授权'
+        }
       } catch { /* 热身失败仍按已登录继续，后续 openAccount 会再试 */ }
     }
     return { ok: true, loginStatus: '已登录', reused: true, message: '沿用采集/达人账号登录态' }
@@ -415,21 +527,36 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
   const existing = windows.get(key)
   if (existing && !existing.isDestroyed() && !force) {
     if (!quiet) bringToFront(existing)
-    const cookies = await existing.webContents.session.cookies.get({})
+    let cookies = await existing.webContents.session.cookies.get({})
     const target = url || URLS[kind] || ''
     const onBuyin = target.includes('buyin.jinritemai.com')
     const onCreator = target.includes('creator.douyin.com')
-    // 采集/达人分区 cookie 通用；already 也算已登录，避免创作者中心再逼扫码
-    const sessionOk = loggedIn(cookies, kind) || buyinLoggedIn(cookies) || creatorLoggedIn(cookies)
-    const direct = sessionOk || Boolean(already)
-    if (url && !samePage(existing.webContents.getURL(), target)) {
-      if (onCreator && sessionOk) {
-        await loadPage(existing, 'https://buyin.jinritemai.com/dashboard', { quiet })
-        await wait(1200)
+    const hasBuyin = buyinLoggedIn(cookies)
+    let hasCreator = creatorLoggedIn(cookies)
+    const sessionOk = kind === 'doubao'
+      ? loggedIn(cookies, kind)
+      : (onCreator ? (hasCreator || hasBuyin) : (hasBuyin || loggedIn(cookies, kind)))
+    let direct = sessionOk || Boolean(already)
+    if (onCreator && (hasBuyin || hasCreator || already)) {
+      const bridged = await bridgeBuyinToCreator(existing, target, { quiet })
+      cookies = await existing.webContents.session.cookies.get({})
+      hasCreator = creatorLoggedIn(cookies) || bridged.ok
+      direct = bridged.ok || hasCreator
+      await applyProxy(existing.webContents.session)
+      if (prompt) await fillPrompt(existing, prompt)
+      return {
+        ok: true,
+        loginStatus: direct ? '已登录' : '待确认',
+        direct,
+        scope: 'creator',
+        message: direct
+          ? '已用采集/百应登录态打开创作者中心（免扫码）'
+          : '百应会话未能自动转到创作者中心，请在窗口里扫一次；扫完后会记住'
       }
+    }
+    if (url && !samePage(existing.webContents.getURL(), target)) {
       const opened = await loadPage(existing, url, { quiet })
       if (!opened) return { ok: false, loginStatus: direct ? '已登录' : '待确认', message: '页面没有打开，请再点一次' }
-      if (onCreator && sessionOk) await wait(1500)
     }
     await applyProxy(existing.webContents.session)
     if (prompt) await fillPrompt(existing, prompt)
@@ -443,7 +570,7 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
     if (kind === 'doubao' && !direct) await watchCaptcha(existing, captcha)
     const openedMessage = prompt
       ? '提示词已填进豆包，请生成 10 秒视频后把成片选回作品'
-      : (onCreator ? (direct ? '已打开这个账号的创作者中心（沿用采集登录态）' : '创作者中心已打开，登录一次后留在这个账号里') : (direct ? '已进入达人工作台' : ''))
+      : (direct ? '已进入达人工作台' : '')
     return { ok: true, loginStatus: direct ? '已登录' : '待确认', direct, scope: onCreator ? 'creator' : (onBuyin ? 'buyin' : ''), message: openedMessage }
   }
   if (existing && !existing.isDestroyed()) existing.close()
@@ -500,19 +627,30 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
   const method = mode || 'password'
   const onBuyin = (url || URLS[kind] || '').includes('buyin.jinritemai.com')
   const onCreator = (url || '').includes('creator.douyin.com')
-  let sessionOk = loggedIn(cookies, kind) || buyinLoggedIn(cookies) || creatorLoggedIn(cookies)
+  let hasBuyin = buyinLoggedIn(cookies)
+  let hasCreator = creatorLoggedIn(cookies)
+  let sessionOk = kind === 'doubao'
+    ? loggedIn(cookies, kind)
+    : (onCreator ? (hasCreator || hasBuyin) : (hasBuyin || loggedIn(cookies, kind)))
   const preferReuse = sessionOk || Boolean(already)
-  // 创作者中心：先热一下百应工作台，用同一分区 cookie 做 SSO，避免再扫码
+  // 创作者中心：镜像百应通行证 cookie + 抖音主站热身，真正复用采集登录态
   if (onCreator && preferReuse) {
-    await loadPage(win, 'https://buyin.jinritemai.com/dashboard', { quiet })
-    await wait(1200)
-    await loadPage(win, url || 'https://creator.douyin.com/creator-micro/content/upload', { quiet })
-    await wait(1800)
+    const bridged = await bridgeBuyinToCreator(win, url || 'https://creator.douyin.com/creator-micro/content/upload', { quiet })
     cookies = await ses.cookies.get({})
-    sessionOk = loggedIn(cookies, kind) || buyinLoggedIn(cookies) || creatorLoggedIn(cookies)
-  }
-  if (sessionOk) {
-    return { ok: true, loginStatus: '已登录', direct: true, scope: onCreator ? 'creator' : (onBuyin ? 'buyin' : ''), message: onCreator ? '已打开创作者中心（沿用采集登录态）' : (onBuyin ? '已进入达人工作台' : '') }
+    hasCreator = creatorLoggedIn(cookies) || bridged.ok
+    hasBuyin = buyinLoggedIn(cookies)
+    sessionOk = hasCreator
+    if (sessionOk) {
+      return {
+        ok: true,
+        loginStatus: '已登录',
+        direct: true,
+        scope: 'creator',
+        message: '已用采集/百应登录态打开创作者中心（免扫码）'
+      }
+    }
+  } else if (sessionOk && !onCreator) {
+    return { ok: true, loginStatus: '已登录', direct: true, scope: onBuyin ? 'buyin' : '', message: onBuyin ? '已进入达人工作台' : '' }
   }
   // 调用方声称已登录但 cookie 实际没了：有密码就自动填，绝不先逼扫码
   if (preferReuse && secret?.password && method !== 'code') {
@@ -522,12 +660,15 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
       await fillLogin(win, account, secret.password)
       await wait(1200)
       cookies = await ses.cookies.get({})
-      if (loggedIn(cookies, kind) || buyinLoggedIn(cookies) || creatorLoggedIn(cookies)) {
+      if (buyinLoggedIn(cookies) || creatorLoggedIn(cookies) || loggedIn(cookies, kind)) {
         if (onCreator) {
-          await loadPage(win, url || 'https://creator.douyin.com/creator-micro/content/upload', { quiet })
-          await wait(1000)
+          const bridged = await bridgeBuyinToCreator(win, url || 'https://creator.douyin.com/creator-micro/content/upload', { quiet })
+          if (bridged.ok || creatorLoggedIn(await ses.cookies.get({}))) {
+            return { ok: true, loginStatus: '已登录', direct: true, scope: 'creator', message: '登录态已刷新，已进入创作者中心' }
+          }
+        } else {
+          return { ok: true, loginStatus: '已登录', direct: true, scope: onBuyin ? 'buyin' : '', message: '登录态已刷新，已进入页面' }
         }
-        return { ok: true, loginStatus: '已登录', direct: true, scope: onCreator ? 'creator' : (onBuyin ? 'buyin' : ''), message: '登录态已刷新，已进入页面' }
       }
     }
   }
@@ -554,8 +695,23 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
     }
   }
   cookies = await ses.cookies.get({})
-  const signed = onBuyin ? buyinLoggedIn(cookies) : onCreator ? creatorLoggedIn(cookies) : loggedIn(cookies, kind)
-  return { ok: true, loginStatus: signed ? '已登录' : '待确认', scope: onCreator ? 'creator' : (onBuyin ? 'buyin' : ''), message: onCreator ? '创作者中心已打开，登录一次后留在这个账号里' : (signed && onBuyin ? '已进入达人工作台' : '') }
+  if (onBuyin && buyinLoggedIn(cookies)) {
+    await mirrorPassportCookies(ses)
+  }
+  if (onCreator) {
+    const wall = await runInFrames(win, creatorLoginWallScript()).catch(() => 'unknown')
+    const signedCreator = wall === 'ok' || (wall !== 'wall' && creatorLoggedIn(cookies))
+    return {
+      ok: true,
+      loginStatus: signedCreator ? '已登录' : '待确认',
+      scope: 'creator',
+      message: signedCreator
+        ? '已打开创作者中心'
+        : '创作者中心需要一次抖音授权。请扫码；同分区下次会记住，并尽量从百应自动带过去'
+    }
+  }
+  const signed = onBuyin ? buyinLoggedIn(cookies) : loggedIn(cookies, kind)
+  return { ok: true, loginStatus: signed ? '已登录' : '待确认', scope: onBuyin ? 'buyin' : '', message: signed && onBuyin ? '已进入达人工作台' : '' }
 }
 
 async function requestCode({ kind, id, name, login, captcha }) {
