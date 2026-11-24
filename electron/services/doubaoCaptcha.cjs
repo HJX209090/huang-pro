@@ -409,17 +409,192 @@ function normalizeConfig(raw) {
   const cfg = raw && typeof raw === 'object' ? raw : {}
   const types = { ...DEFAULT_TYPES, ...(cfg.types || {}) }
   if (cfg.type) types.click = String(cfg.type).trim() || types.click
+  // 默认开启自动过验证：无 token 时走本地识别，有 token 再走第三方
+  const enabled = cfg.enabled !== false
   return {
-    enabled: Boolean(cfg.enabled && String(cfg.token || '').trim()),
-    token: String(cfg.token || '').trim(),
+    enabled,
+    token: String(cfg.token || process.env.HUANG_CAPTCHA_TOKEN || '').trim(),
     type: String(cfg.type || types.click).trim() || types.click,
     types,
     url: String(cfg.url || 'https://api.jfbym.com/api/YmServer/customApi').trim(),
-    maxRetries: Math.max(1, Math.min(5, Number(cfg.maxRetries) || 3)),
+    maxRetries: Math.max(1, Math.min(6, Number(cfg.maxRetries) || 4)),
     fallbackHuman: cfg.fallbackHuman !== false,
     humanTimeoutSec: Math.max(30, Math.min(600, Number(cfg.humanTimeoutSec) || 180)),
-    watchSec: Math.max(2, Math.min(30, Number(cfg.watchSec) || 8))
+    watchSec: Math.max(2, Math.min(30, Number(cfg.watchSec) || 10))
   }
+}
+
+function tilesScript() {
+  return `(() => {
+    const body = String(document.body?.innerText || '').slice(0, 16000)
+    const promptLine = (body.split(/\\n+/).map((line) => line.trim()).find((line) =>
+      line.length >= 2 && line.length <= 48 && /(请选择|符合上文|拖拽到这里|露营|厨房|浴室|办公室|物品|可以用到)/.test(line) && !/刷新|反馈|提交/.test(line)
+    ) || '')
+    const drop = Array.from(document.querySelectorAll('div,section,span')).find((el) => {
+      const text = String(el.innerText || '').replace(/\\s+/g, '')
+      const rect = el.getBoundingClientRect()
+      return text.includes('拖拽到这里') && rect.width >= 80 && rect.height >= 40
+    })
+    const dropRect = drop ? drop.getBoundingClientRect() : null
+    const imgs = Array.from(document.querySelectorAll('img, canvas'))
+      .map((el) => {
+        const rect = el.getBoundingClientRect()
+        return {
+          el,
+          left: rect.left,
+          top: rect.top,
+          width: rect.width,
+          height: rect.height,
+          cx: rect.left + rect.width / 2,
+          cy: rect.top + rect.height / 2
+        }
+      })
+      .filter((item) => item.width >= 48 && item.height >= 48 && item.width <= 220 && item.height <= 220)
+      .sort((a, b) => (a.top - b.top) || (a.left - b.left))
+    // 取最整齐的 3x3 / 2xN 网格
+    let tiles = imgs.slice(0, 12)
+    if (tiles.length >= 9) {
+      const firstNine = tiles.slice(0, 9)
+      const tops = [...new Set(firstNine.map((item) => Math.round(item.top / 8) * 8))]
+      if (tops.length >= 2) tiles = firstNine
+    }
+    return {
+      prompt: promptLine,
+      drop: dropRect ? {
+        left: Math.round(dropRect.left),
+        top: Math.round(dropRect.top),
+        width: Math.round(dropRect.width),
+        height: Math.round(dropRect.height),
+        cx: Math.round(dropRect.left + dropRect.width / 2),
+        cy: Math.round(dropRect.top + dropRect.height / 2)
+      } : null,
+      tiles: tiles.map((item, index) => ({
+        index,
+        left: Math.round(item.left),
+        top: Math.round(item.top),
+        width: Math.round(item.width),
+        height: Math.round(item.height),
+        cx: Math.round(item.cx),
+        cy: Math.round(item.cy)
+      }))
+    }
+  })()`
+}
+
+function promptCategory(prompt) {
+  const text = String(prompt || '')
+  if (/露营|野营|帐篷|户外|登山|烧烤架|折叠椅/.test(text)) return 'camping'
+  if (/厨房|灶台|锅|碗|菜刀|餐具/.test(text)) return 'kitchen'
+  if (/浴室|卫生间|马桶|淋浴|洗漱/.test(text)) return 'bathroom'
+  if (/办公室|电脑|键盘|工位|文件/.test(text)) return 'office'
+  if (/交通|汽车|公交|地铁|自行车/.test(text)) return 'transport'
+  return 'general'
+}
+
+function scoreBitmapForCategory(bitmap, width, height, category) {
+  if (!bitmap || !width || !height) return 0
+  const step = Math.max(1, Math.floor(Math.min(width, height) / 28))
+  let green = 0
+  let warm = 0
+  let cool = 0
+  let dark = 0
+  let bright = 0
+  let edge = 0
+  let samples = 0
+  let prev = null
+  for (let y = 0; y < height; y += step) {
+    for (let x = 0; x < width; x += step) {
+      const i = (y * width + x) * 4
+      const r = bitmap[i]
+      const g = bitmap[i + 1]
+      const b = bitmap[i + 2]
+      const lum = (r + g + b) / 3
+      samples += 1
+      if (g > r + 12 && g > b + 8) green += 1
+      if (r > g + 18 && r > b + 10) warm += 1
+      if (b > r + 10 && b > g + 8) cool += 1
+      if (lum < 55) dark += 1
+      if (lum > 200) bright += 1
+      if (prev != null) edge += Math.min(60, Math.abs(lum - prev)) / 60
+      prev = lum
+    }
+  }
+  if (!samples) return 0
+  const gRatio = green / samples
+  const wRatio = warm / samples
+  const cRatio = cool / samples
+  const dRatio = dark / samples
+  const bRatio = bright / samples
+  const eRatio = edge / samples
+  if (category === 'camping') {
+    // 户外绿 + 人造边缘（椅/炉），压低大片白墙/蝴蝶柔边/动物毛绒
+    return gRatio * 2.4 + eRatio * 1.6 + wRatio * 0.8 - bRatio * 1.2 - (gRatio > 0.45 && eRatio < 0.15 ? 1.2 : 0) - (dRatio > 0.55 ? 0.4 : 0)
+  }
+  if (category === 'kitchen') return wRatio * 1.6 + eRatio * 1.4 + dRatio * 0.4 - gRatio * 0.8
+  if (category === 'bathroom') return bRatio * 1.2 + cRatio * 1.1 + eRatio * 0.8 - gRatio * 1.1
+  if (category === 'office') return cRatio * 0.8 + eRatio * 1.5 + bRatio * 0.5 - gRatio * 1.3
+  return eRatio * 1.2 + gRatio * 0.4
+}
+
+async function scoreTile(win, tile, category) {
+  try {
+    const crop = await captureCrop(win, {
+      left: tile.left,
+      top: tile.top,
+      width: tile.width,
+      height: tile.height
+    })
+    const image = nativeImage.createFromBuffer(Buffer.from(crop.imageB64, 'base64'))
+    const size = image.getSize()
+    const bitmap = image.getBitmap()
+    return scoreBitmapForCategory(bitmap, size.width, size.height, category)
+  } catch {
+    return 0
+  }
+}
+
+async function localSemanticSolve(win, notify) {
+  const layout = await win.webContents.executeJavaScript(tilesScript(), true).catch(() => null)
+  if (!layout?.tiles?.length || layout.tiles.length < 3) {
+    return { ok: false, error: '没有找到可拖拽图片' }
+  }
+  const category = promptCategory(layout.prompt)
+  notify?.({ confirmNote: `本地识别验证图（${category}），准备拖拽` })
+  const scored = []
+  for (const tile of layout.tiles) {
+    const score = await scoreTile(win, tile, category)
+    scored.push({ tile, score })
+  }
+  scored.sort((a, b) => b.score - a.score)
+  const positive = scored.filter((item) => item.score > 0.35).slice(0, category === 'camping' ? 5 : 4)
+  const picks = (positive.length >= 2 ? positive : scored.slice(0, Math.min(3, scored.length)))
+    .map((item) => item.tile)
+  if (!picks.length) return { ok: false, error: '本地识别没有选出图片' }
+  const drop = layout.drop || {
+    cx: picks[0].cx,
+    cy: picks[0].top + picks[0].height * 2.2
+  }
+  await withDebugger(win, async (dbg) => {
+    for (let index = 0; index < picks.length; index += 1) {
+      const tile = picks[index]
+      const dx = drop.cx + (index % 3) * 12 - 12
+      const dy = drop.cy + Math.floor(index / 3) * 10
+      await drag(dbg, tile.cx, tile.cy, dx, dy, {
+        steps: index === 0 ? 34 : 24,
+        holdSec: index === 0 ? 0.3 : 0.2,
+        settleSec: 0.22
+      })
+      await wait(index === 0 ? 650 : 380)
+    }
+    const box = {
+      left: Math.min(...layout.tiles.map((item) => item.left)),
+      top: Math.min(...layout.tiles.map((item) => item.top)),
+      width: Math.max(...layout.tiles.map((item) => item.left + item.width)) - Math.min(...layout.tiles.map((item) => item.left)),
+      height: (layout.drop ? layout.drop.top + layout.drop.height : Math.max(...layout.tiles.map((item) => item.top + item.height))) - Math.min(...layout.tiles.map((item) => item.top))
+    }
+    await clickSubmit(win, dbg, box)
+  })
+  return { ok: true, picks: picks.length, category, prompt: layout.prompt }
 }
 
 async function clickSubmit(win, dbg, box) {
@@ -525,7 +700,25 @@ async function tryAutoSolve(win, config, notify) {
       break
     }
     const typeId = cfg.types[kind] || cfg.type
-    notify?.({ confirmNote: `检测到${kindLabel(kind)}验证码，自动打码第 ${attempt}/${cfg.maxRetries} 次` })
+    notify?.({ confirmNote: `检测到${kindLabel(kind)}验证码，自动处理第 ${attempt}/${cfg.maxRetries} 次` })
+
+    // 点选/拖拽：优先本地语义拖拽，不依赖云码 token
+    if (kind === 'click') {
+      const local = await localSemanticSolve(win, notify)
+      if (local.ok) {
+        out.pointsRaw = `local:${local.category}:${local.picks}`
+        if (await waitCleared(win)) {
+          out.ok = true
+          out.cleared = true
+          out.error = ''
+          notify?.({ confirmNote: '验证码已自动通过（本地识别）' })
+          return out
+        }
+      } else if (!cfg.token) {
+        out.error = local.error || '本地识别未通过'
+      }
+    }
+
     let crop
     try {
       crop = await captureCrop(win, box)
@@ -540,7 +733,7 @@ async function tryAutoSolve(win, config, notify) {
         recog = { ok: true, points: [], pointsRaw: local, text: local }
       }
     }
-    if (!recog) {
+    if (!recog && cfg.token) {
       recog = await recognizeImage({
         imageB64: crop.imageB64,
         token: cfg.token,
@@ -549,8 +742,18 @@ async function tryAutoSolve(win, config, notify) {
         extra: String(info.prompt || '').trim()
       })
     }
+    if (!recog) {
+      if (kind === 'click') {
+        out.error = out.error || '本地拖拽后验证仍在'
+        await wait(700)
+        continue
+      }
+      out.error = cfg.token ? '识别失败' : '当前题型需联网识别，正在重试本地策略'
+      await wait(700)
+      continue
+    }
     if (!recog.ok) {
-      out.error = recog.error || '打码识别失败'
+      out.error = recog.error || '识别失败'
       await wait(800)
       continue
     }
@@ -607,16 +810,18 @@ function kindLabel(kind) {
 
 async function resolveHit(win, config, notify) {
   const cfg = normalizeConfig(config)
-  notify?.({ confirmNote: '检测到验证码，正在处理' })
+  notify?.({ confirmNote: '检测到验证码，正在自动处理' })
   if (cfg.enabled) {
     const auto = await tryAutoSolve(win, cfg, notify)
     if (auto.cleared) return { hit: true, cleared: true, timedOut: false, auto: true, pointsRaw: auto.pointsRaw, kind: auto.kind }
     if (!cfg.fallbackHuman) {
-      return { hit: true, cleared: false, timedOut: true, auto: true, error: auto.error || '自动打码失败', kind: auto.kind }
+      return { hit: true, cleared: false, timedOut: true, auto: true, error: auto.error || '自动验证失败', kind: auto.kind }
     }
-    notify?.({ confirmNote: `自动打码未过：${auto.error || '请在窗口里完成验证'}。等待人工操作` })
+    notify?.({ confirmNote: `自动处理未过：${auto.error || '请在窗口里拖一下'}。等待你完成后继续` })
+    try { if (!win.isDestroyed()) { win.show(); win.focus() } } catch { /* ignore */ }
   } else {
     notify?.({ confirmNote: '检测到验证码。请在打开的窗口里完成验证，完成后会自动继续' })
+    try { if (!win.isDestroyed()) { win.show(); win.focus() } } catch { /* ignore */ }
   }
   const humanDeadline = Date.now() + cfg.humanTimeoutSec * 1000
   while (Date.now() < humanDeadline) {

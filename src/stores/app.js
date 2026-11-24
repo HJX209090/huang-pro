@@ -37,7 +37,7 @@ function plainGeneratePayload({ account, prompt, shots, slot, saveDir, workId, c
     saveDir: String(saveDir || ''),
     workId: String(workId || ''),
     captcha: {
-      enabled: Boolean(captcha?.enabled && String(captcha?.token || '').trim()),
+      enabled: captcha?.enabled !== false,
       token: String(captcha?.token || ''),
       type: String(captcha?.type || types.click || '88888'),
       types: {
@@ -47,10 +47,10 @@ function plainGeneratePayload({ account, prompt, shots, slot, saveDir, workId, c
         math: String(types.math || '50100')
       },
       url: String(captcha?.url || 'https://api.jfbym.com/api/YmServer/customApi'),
-      maxRetries: Math.max(1, Math.min(5, Number(captcha?.maxRetries) || 3)),
+      maxRetries: Math.max(1, Math.min(6, Number(captcha?.maxRetries) || 4)),
       fallbackHuman: captcha?.fallbackHuman !== false,
       humanTimeoutSec: Math.max(30, Number(captcha?.humanTimeoutSec) || 180),
-      watchSec: Math.max(2, Number(captcha?.watchSec) || 8)
+      watchSec: Math.max(2, Number(captcha?.watchSec) || 10)
     },
     failMarkers: (failMarkers || []).map((item) => String(item || '')).filter(Boolean),
     retryMarkers: {
@@ -130,17 +130,20 @@ export const useAppStore = defineStore('app', {
       ensureDoubaoRules(this.settings)
       if (!this.settings.captchaSolver) {
         this.settings.captchaSolver = {
-          enabled: false,
+          enabled: true,
           token: '',
           type: '88888',
           types: { click: '88888', slider: '20111', text: '10110', math: '50100' },
           url: 'https://api.jfbym.com/api/YmServer/customApi',
-          maxRetries: 3,
+          maxRetries: 4,
           fallbackHuman: true,
           humanTimeoutSec: 180,
-          watchSec: 8
+          watchSec: 10
         }
-      } else if (!this.settings.captchaSolver.types) {
+      } else {
+        if (this.settings.captchaSolver.enabled == null) this.settings.captchaSolver.enabled = true
+      }
+      if (!this.settings.captchaSolver.types) {
         this.settings.captchaSolver.types = {
           click: this.settings.captchaSolver.type || '88888',
           slider: '20111',

@@ -69,11 +69,12 @@
       </el-table>
     </div>
     <el-dialog v-model="visible" :title="form.id ? '编辑豆包账号' : '新建豆包账号'" width="460px">
-      <p class="muted">密码或验证码登录。验证码请先点「获取验证码」，短信到达后再点「填写验证码」。登录成功一次后会记住。</p>
+      <p class="muted">保存后会自动打开豆包：填入手机号、点发送验证码，并切到扫码登录。遇到验证弹窗会自动处理，你只需用抖音扫码。</p>
       <el-form label-width="88px">
         <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>
         <el-form-item label="登录方式">
           <el-radio-group v-model="form.loginMode">
+            <el-radio value="qr">扫码（推荐）</el-radio>
             <el-radio value="password">密码</el-radio>
             <el-radio value="code">验证码</el-radio>
           </el-radio-group>
@@ -91,7 +92,7 @@
       </el-form>
       <template #footer>
         <el-button @click="visible = false">取消</el-button>
-        <el-button type="primary" @click="save">保存</el-button>
+        <el-button type="primary" :loading="saving" @click="save">保存并登录</el-button>
       </template>
     </el-dialog>
     <el-dialog v-model="batchVisible" title="批量添加豆包账号" width="560px">
@@ -145,7 +146,8 @@ const group = ref('')
 const visible = ref(false)
 const batchVisible = ref(false)
 const batchText = ref('')
-const form = reactive({ id: '', name: '', login: '', password: '', loginMode: 'password', group: '默认分组', quota: '0/5' })
+const form = reactive({ id: '', name: '', login: '', password: '', loginMode: 'qr', group: '默认分组', quota: '0/5' })
+const saving = ref(false)
 const rows = computed(() => store.doubaoAccounts.filter((item) => {
   if (keyword.value && !item.name.includes(keyword.value.trim())) return false
   if (group.value && item.group !== group.value) return false
@@ -305,8 +307,8 @@ function limitOf(row) {
 }
 
 function edit(row) {
-  if (row) Object.assign(form, { id: row.id, name: row.name, login: row.login || '', password: '', loginMode: row.loginMode === 'code' ? 'code' : 'password', group: row.group, quota: limitOf(row) })
-  else Object.assign(form, { id: '', name: '', login: '', password: '', loginMode: 'password', group: store.groups[0] || '默认分组', quota: '5' })
+  if (row) Object.assign(form, { id: row.id, name: row.name, login: row.login || '', password: '', loginMode: row.loginMode || 'qr', group: row.group, quota: limitOf(row) })
+  else Object.assign(form, { id: '', name: '', login: '', password: '', loginMode: 'qr', group: store.groups[0] || '默认分组', quota: '5' })
   visible.value = true
 }
 
@@ -315,29 +317,78 @@ async function save() {
   if (!form.login.trim()) return ElMessage.warning('填写豆包账号')
   if (form.loginMode === 'password' && !form.id && !form.password) return ElMessage.warning('填写密码')
   const id = form.id || uid('DB')
+  const isNew = !form.id
+  saving.value = true
   try {
     if (form.password) await store.saveAccountSecret(id, form.login.trim(), form.password)
   } catch (error) {
+    saving.value = false
     return ElMessage.error(error.message || '密码保存失败')
   }
+  let row = null
   if (form.id) {
-    const target = store.doubaoAccounts.find((item) => item.id === form.id)
-    if (target) Object.assign(target, { name: form.name.trim(), login: form.login.trim(), loginMode: form.loginMode, group: form.group, quotaLimit: Number(String(form.quota).match(/\d+/)?.[0]) || target.quotaLimit || 5, hasPassword: target.hasPassword || Boolean(form.password) })
+    row = store.doubaoAccounts.find((item) => item.id === form.id)
+    if (row) Object.assign(row, { name: form.name.trim(), login: form.login.trim(), loginMode: form.loginMode, group: form.group, quotaLimit: Number(String(form.quota).match(/\d+/)?.[0]) || row.quotaLimit || 5, hasPassword: row.hasPassword || Boolean(form.password) })
   } else {
-    store.doubaoAccounts.unshift({
+    row = {
       id, name: form.name.trim(), login: form.login.trim(), loginMode: form.loginMode, hasPassword: form.loginMode === 'password',
       group: form.group, quota: '0/5', quotaLimit: Number(String(form.quota).match(/\d+/)?.[0]) || 5,
       enabled: true, loginStatus: '待登录', worker: '空闲', recent: '成功 0 · 失败 0', createdAt: formatTime(new Date())
-    })
+    }
+    store.doubaoAccounts.unshift(row)
   }
   store.syncDoubaoStats()
   store.persist()
   visible.value = false
+  if (window.tujian?.bootstrapDoubaoLogin) {
+    ElMessage.info('正在打开豆包并自动登录…')
+    try {
+      if (!store.settings.captchaSolver) store.settings.captchaSolver = {}
+      store.settings.captchaSolver.enabled = true
+      const result = await window.tujian.bootstrapDoubaoLogin({
+        id: row.id,
+        name: row.name,
+        login: row.login,
+        captcha: store.settings.captchaSolver
+      })
+      if (result?.loginStatus) row.loginStatus = result.loginStatus
+      store.persist()
+      if (result?.ok) ElMessage.success(result.message || (isNew ? '已添加并打开豆包' : '已打开豆包登录'))
+      else ElMessage.warning(result?.message || '豆包已打开，请在窗口里扫码')
+      store.addLog('info', '豆包', `${row.name} ${result?.message || '自动登录'}`)
+    } catch (error) {
+      ElMessage.warning(error.message || '自动登录未完成，可再点打开')
+    }
+  }
+  saving.value = false
 }
 
 async function openRow(row) {
   if (!window.tujian?.openAccount) return ElMessage.warning('请在桌面窗口里打开')
-  const result = await window.tujian.openAccount({ kind: 'doubao', id: row.id, name: row.name, login: row.login, mode: row.loginMode || 'password', already: row.loginStatus === '已登录' })
+  if (row.loginStatus !== '已登录' && window.tujian?.bootstrapDoubaoLogin) {
+    if (!store.settings.captchaSolver) store.settings.captchaSolver = {}
+    store.settings.captchaSolver.enabled = true
+    const result = await window.tujian.bootstrapDoubaoLogin({
+      id: row.id,
+      name: row.name,
+      login: row.login,
+      captcha: store.settings.captchaSolver
+    })
+    row.loginStatus = result.loginStatus || row.loginStatus
+    store.persist()
+    if (result.message) result.ok ? ElMessage.success(result.message) : ElMessage.warning(result.message)
+    store.addLog('info', '豆包', `${row.name} ${result.message || '自动登录'}`)
+    return
+  }
+  const result = await window.tujian.openAccount({
+    kind: 'doubao',
+    id: row.id,
+    name: row.name,
+    login: row.login,
+    mode: row.loginMode || 'qr',
+    already: row.loginStatus === '已登录',
+    captcha: store.settings.captchaSolver
+  })
   row.loginStatus = result.loginStatus
   store.persist()
   if (result.message) result.ok ? ElMessage.success(result.message) : ElMessage.warning(result.message)

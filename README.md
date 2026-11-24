@@ -22,7 +22,7 @@ npm run build:win
 
 ## 发布更新（给用户自动升级）
 
-1. 修改 `package.json` 里的 `version`（例如 `0.1.0` → `0.1.1`）
+1. 修改 `package.json` 里的 `version`（例如 `0.1.1` → `0.1.2`）
 2. 本机登录 GitHub，并准备好有 `repo` 权限的 Token：
    ```bash
    set GH_TOKEN=你的github_token

@@ -340,7 +340,16 @@ async function openAccount(payload) {
   }
 }
 
-async function openAccountNow({ kind, id, name, mode, login, force, skipSend, already, url, prompt, slot, hidden }) {
+async function watchCaptcha(win, captcha, notify) {
+  if (!win || win.isDestroyed()) return { hit: false, cleared: true }
+  try {
+    return await doubaoCaptcha.waitGate(win, captcha || { enabled: true }, notify || (() => {}), { alreadyHit: false })
+  } catch {
+    return { hit: false, cleared: true }
+  }
+}
+
+async function openAccountNow({ kind, id, name, mode, login, force, skipSend, already, url, prompt, slot, hidden, captcha }) {
   const quiet = Boolean(hidden)
   const key = sessionKey(kind, id, url, slot)
   const existing = windows.get(key)
@@ -363,6 +372,7 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
       const secret = secrets.read(id)
       if (secret?.password && mode !== 'code') await fillLogin(existing, login || secret.login, secret.password)
     }
+    if (kind === 'doubao' && !direct) await watchCaptcha(existing, captcha)
     const openedMessage = prompt
       ? '提示词已填进豆包，请生成 10 秒视频后把成片选回作品'
       : (onCreator ? (direct ? '已打开这个账号的创作者中心' : '创作者中心已打开，登录一次后留在这个账号里') : (direct ? '已进入达人工作台' : ''))
@@ -432,16 +442,18 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
       const clicked = await runInFrames(win, clickTextScript(['扫码登录', '扫码']))
       if (clicked === 'clicked') break
     }
+    if (kind === 'doubao') await watchCaptcha(win, captcha)
     return { ok: true, loginStatus: '待确认', message: '请用抖音 App 扫描窗口里的二维码。扫完后这个账号会记住登录。' }
   }
   if (!loggedIn(cookies, kind) && method === 'code' && !skipSend) {
-    return requestCode({ kind, id, name, login: account })
-  } else if (secret?.password && method !== 'code') {
+    return requestCode({ kind, id, name, login: account, captcha })
+  } else if (secret?.password && method !== 'code' && method !== 'qr') {
     for (let attempt = 0; attempt < 4 && !(onBuyin ? buyinLoggedIn(cookies) : loggedIn(cookies, kind)); attempt += 1) {
       await wait(1200)
       if (onBuyin) await runInFrames(win, clickTextScript(['密码登录']))
       await fillLogin(win, account, secret.password)
       await wait(800)
+      if (kind === 'doubao') await watchCaptcha(win, captcha)
       cookies = await ses.cookies.get({})
     }
   }
@@ -450,12 +462,12 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
   return { ok: true, loginStatus: signed ? '已登录' : '待确认', scope: onCreator ? 'creator' : (onBuyin ? 'buyin' : ''), message: onCreator ? '创作者中心已打开，登录一次后留在这个账号里' : (signed && onBuyin ? '已进入达人工作台' : '') }
 }
 
-async function requestCode({ kind, id, name, login }) {
+async function requestCode({ kind, id, name, login, captcha }) {
   const current = await accountStatus({ kind, id })
   if (current.loginStatus === '已登录') {
     return { ok: true, direct: true, message: '这个账号已经登录，直接进入，不用再登录一次', loginStatus: '已登录' }
   }
-  await openAccount({ kind, id, name, login, mode: 'code', skipSend: true })
+  await openAccount({ kind, id, name, login, mode: 'code', skipSend: true, captcha })
   const win = windows.get(`${kind}:${id}`)
   if (!win || win.isDestroyed()) return { ok: false, message: '登录窗口没有打开', loginStatus: '待确认' }
   const account = String(login || secrets.read(id)?.login || '')
@@ -465,6 +477,7 @@ async function requestCode({ kind, id, name, login }) {
     await runInFrames(win, clickTextScript(['验证码登录', '短信登录', '手机号登录']))
     status = await runInFrames(win, phoneScript(account))
     if (status === 'no-input') await runInFrames(win, clickTextScript(['登录', '立即登录']))
+    if (status === 'sent' || status === 'wait') await watchCaptcha(win, captcha)
     if (status !== 'sent') await wait(900)
   }
   const messages = {
@@ -479,6 +492,56 @@ async function requestCode({ kind, id, name, login }) {
     ok: status === 'sent',
     message: messages[status] || messages.miss,
     loginStatus: loggedIn(cookies, kind) ? '已登录' : '待确认'
+  }
+}
+
+/** 新建账号后：自动打开豆包 → 填手机号并发码 → 切到扫码登录，验证弹窗自动处理 */
+async function bootstrapDoubaoLogin({ id, name, login, captcha }) {
+  const phone = String(login || secrets.read(id)?.login || '').trim()
+  const page = 'https://www.doubao.com/chat/'
+  const opened = await openAccount({
+    kind: 'doubao',
+    id,
+    name,
+    login: phone,
+    mode: 'qr',
+    url: page,
+    force: true,
+    captcha: captcha || { enabled: true }
+  })
+  const win = windows.get(sessionKey('doubao', id, page))
+  if (!win || win.isDestroyed()) {
+    return { ok: false, loginStatus: '待确认', message: opened?.message || '豆包窗口没有打开' }
+  }
+  bringToFront(win)
+  let sendStatus = 'miss'
+  if (phone) {
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      await runInFrames(win, clickTextScript(['验证码登录', '短信登录', '手机号登录', '登录']))
+      sendStatus = await runInFrames(win, phoneScript(phone))
+      await watchCaptcha(win, captcha || { enabled: true })
+      if (sendStatus === 'sent' || sendStatus === 'wait') break
+      await wait(900)
+    }
+  }
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const clicked = await runInFrames(win, clickTextScript(['扫码登录', '扫码']))
+    if (clicked === 'clicked') break
+    await wait(700)
+  }
+  await watchCaptcha(win, captcha || { enabled: true })
+  const cookies = await win.webContents.session.cookies.get({})
+  const signed = loggedIn(cookies, 'doubao')
+  const parts = []
+  if (phone && sendStatus === 'sent') parts.push('已填手机号并点了获取验证码')
+  else if (phone && sendStatus === 'wait') parts.push('手机号已填入，获取验证码按钮待点')
+  else if (phone) parts.push('已填手机号')
+  parts.push(signed ? '已登录' : '请用抖音 App 扫窗口里的码')
+  return {
+    ok: true,
+    loginStatus: signed ? '已登录' : '待确认',
+    sendStatus,
+    message: parts.join('；')
   }
 }
 
@@ -3449,6 +3512,7 @@ module.exports = {
   openAccount,
   submitCode,
   requestCode,
+  bootstrapDoubaoLogin,
   accountStatus,
   loggedIn,
   warmWorkbench,

@@ -172,31 +172,12 @@
           <el-input-number v-model="store.settings.doubaoGap" :min="0" :max="60" />
           <span class="num-hint">例如 5，单位是秒</span>
         </el-form-item>
-        <el-form-item v-show="tab === 'doubao'" label="验证码自动打码">
+        <el-form-item v-show="tab === 'doubao'" label="自动过验证">
           <el-switch v-model="captcha.enabled" />
-          <span class="muted">覆盖普通字符、滑块缺口、算术题、图标/文字点选；失败再等人拖完</span>
-        </el-form-item>
-        <el-form-item v-show="tab === 'doubao'" label="打码平台 Token">
-          <el-input v-model="captcha.token" placeholder="第三方打码平台 token，不填则只等人拖完" style="width: 360px" />
-        </el-form-item>
-        <el-form-item v-show="tab === 'doubao'" label="点选题型号">
-          <el-input v-model="captcha.types.click" placeholder="88888" style="width: 120px" />
-          <span class="num-hint">图标/文字点选或拖拽投放，兼容旧字段「打码题型号」</span>
-        </el-form-item>
-        <el-form-item v-show="tab === 'doubao'" label="滑块题型号">
-          <el-input v-model="captcha.types.slider" placeholder="20111" style="width: 120px" />
-          <span class="num-hint">缺口滑块拖动距离</span>
-        </el-form-item>
-        <el-form-item v-show="tab === 'doubao'" label="字符题型号">
-          <el-input v-model="captcha.types.text" placeholder="10110" style="width: 120px" />
-          <span class="num-hint">普通字符验证码</span>
-        </el-form-item>
-        <el-form-item v-show="tab === 'doubao'" label="算术题型号">
-          <el-input v-model="captcha.types.math" placeholder="50100" style="width: 120px" />
-          <span class="num-hint">计算结果类；简单加减乘也会先本地算</span>
+          <span class="muted">遇到拖拽/点选/滑块/算术验证弹窗时自动处理，不用填云码</span>
         </el-form-item>
         <p v-show="tab === 'doubao'" class="muted" style="margin: 0 0 12px">
-          「云码」不是豆包官方功能，是付费第三方打码服务（例如云码/JFBYM）：软件截图后按题型调对应题号，返回坐标/答案后自动点、拖或填。不填 Token 时，遇到验证码会停在豆包窗口等人做完。
+          默认本地识别拖拽图并自动提交。失败时会把豆包窗口置前，你拖一下后软件继续跑。
         </p>
         <el-form-item v-show="tab === 'publish'" label="每日采集限额">
           <el-input-number v-model="store.settings.dailyCollectLimit" :min="1" :max="500" />
@@ -267,18 +248,19 @@ if (store.settings.windowHeight == null) store.settings.windowHeight = 860
 if (store.settings.webhookUrl == null) store.settings.webhookUrl = ''
 if (!store.settings.captchaSolver) {
   store.settings.captchaSolver = {
-    enabled: false,
+    enabled: true,
     token: '',
     type: '88888',
     types: { click: '88888', slider: '20111', text: '10110', math: '50100' },
     url: 'https://api.jfbym.com/api/YmServer/customApi',
-    maxRetries: 3,
+    maxRetries: 4,
     fallbackHuman: true,
     humanTimeoutSec: 180,
-    watchSec: 8
+    watchSec: 10
   }
 }
 const captcha = store.settings.captchaSolver
+if (captcha.enabled == null) captcha.enabled = true
 if (!captcha.types) {
   captcha.types = { click: captcha.type || '88888', slider: '20111', text: '10110', math: '50100' }
 }
