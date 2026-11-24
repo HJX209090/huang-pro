@@ -104,7 +104,7 @@ async function checkForUpdates({ manual = false } = {}) {
     if (/404|releases\.atom|ERR_CONNECTION|ENOTFOUND|net::/i.test(raw)) {
       const payload = {
         status: 'not-available',
-        message: manual ? '没有检测到新版本（请确认 GitHub Releases 已发布安装包）' : '已是最新版本',
+        message: manual ? '没有检测到新版本' : '已是最新版本',
         version: app.getVersion(),
         manual: Boolean(manual),
         softError: raw

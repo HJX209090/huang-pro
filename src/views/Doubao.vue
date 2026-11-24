@@ -142,6 +142,17 @@ import { formatTime, statusType, uid } from '@/utils/format'
 
 const store = useAppStore()
 const keyword = ref('')
+
+/** IPC 不能传 Vue 响应式 Proxy，否则会报 An object could not be cloned */
+function plainCaptcha() {
+  if (!store.settings.captchaSolver) store.settings.captchaSolver = { enabled: true }
+  store.settings.captchaSolver.enabled = true
+  try {
+    return JSON.parse(JSON.stringify(store.settings.captchaSolver))
+  } catch {
+    return { enabled: true }
+  }
+}
 const group = ref('')
 const visible = ref(false)
 const batchVisible = ref(false)
@@ -343,13 +354,11 @@ async function save() {
   if (window.tujian?.bootstrapDoubaoLogin) {
     ElMessage.info('正在打开豆包并自动登录…')
     try {
-      if (!store.settings.captchaSolver) store.settings.captchaSolver = {}
-      store.settings.captchaSolver.enabled = true
       const result = await window.tujian.bootstrapDoubaoLogin({
         id: row.id,
         name: row.name,
         login: row.login,
-        captcha: store.settings.captchaSolver
+        captcha: plainCaptcha()
       })
       if (result?.loginStatus) row.loginStatus = result.loginStatus
       store.persist()
@@ -357,7 +366,11 @@ async function save() {
       else ElMessage.warning(result?.message || '豆包已打开，请在窗口里扫码')
       store.addLog('info', '豆包', `${row.name} ${result?.message || '自动登录'}`)
     } catch (error) {
-      ElMessage.warning(error.message || '自动登录未完成，可再点打开')
+      const tip = /could not be cloned/i.test(String(error?.message || error))
+        ? '登录参数序列化失败，请再点一次打开'
+        : (error.message || '自动登录未完成，可再点打开')
+      ElMessage.warning(tip)
+      store.addLog('warning', '豆包', `${row.name}：${tip}`)
     }
   }
   saving.value = false
@@ -366,18 +379,20 @@ async function save() {
 async function openRow(row) {
   if (!window.tujian?.openAccount) return ElMessage.warning('请在桌面窗口里打开')
   if (row.loginStatus !== '已登录' && window.tujian?.bootstrapDoubaoLogin) {
-    if (!store.settings.captchaSolver) store.settings.captchaSolver = {}
-    store.settings.captchaSolver.enabled = true
-    const result = await window.tujian.bootstrapDoubaoLogin({
-      id: row.id,
-      name: row.name,
-      login: row.login,
-      captcha: store.settings.captchaSolver
-    })
-    row.loginStatus = result.loginStatus || row.loginStatus
-    store.persist()
-    if (result.message) result.ok ? ElMessage.success(result.message) : ElMessage.warning(result.message)
-    store.addLog('info', '豆包', `${row.name} ${result.message || '自动登录'}`)
+    try {
+      const result = await window.tujian.bootstrapDoubaoLogin({
+        id: row.id,
+        name: row.name,
+        login: row.login,
+        captcha: plainCaptcha()
+      })
+      row.loginStatus = result.loginStatus || row.loginStatus
+      store.persist()
+      if (result.message) result.ok ? ElMessage.success(result.message) : ElMessage.warning(result.message)
+      store.addLog('info', '豆包', `${row.name} ${result.message || '自动登录'}`)
+    } catch (error) {
+      ElMessage.warning(error?.message || '打开豆包失败')
+    }
     return
   }
   const result = await window.tujian.openAccount({
@@ -387,7 +402,7 @@ async function openRow(row) {
     login: row.login,
     mode: row.loginMode || 'qr',
     already: row.loginStatus === '已登录',
-    captcha: store.settings.captchaSolver
+    captcha: plainCaptcha()
   })
   row.loginStatus = result.loginStatus
   store.persist()

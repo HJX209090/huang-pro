@@ -261,7 +261,14 @@ ipcMain.handle('doubao:generate', async (event, payload) => {
 ipcMain.handle('account:status', (_event, payload) => browserSession.accountStatus(payload || {}))
 ipcMain.handle('account:code', (_event, payload) => browserSession.submitCode(payload || {}))
 ipcMain.handle('account:send-code', (_event, payload) => browserSession.requestCode(payload || {}))
-ipcMain.handle('doubao:bootstrap-login', (_event, payload) => browserSession.bootstrapDoubaoLogin(payload || {}))
+ipcMain.handle('doubao:bootstrap-login', async (_event, payload) => {
+  try {
+    const result = await browserSession.bootstrapDoubaoLogin(payload || {})
+    return JSON.parse(JSON.stringify(result || { ok: false, message: '无结果' }))
+  } catch (error) {
+    return { ok: false, loginStatus: '待确认', message: String(error?.message || error || '打开豆包失败') }
+  }
+})
 ipcMain.handle('account:ensure-login', (_event, payload) => browserSession.ensurePublishLogin(payload || {}))
 ipcMain.handle('dialog:images', async () => {
   const result = await dialog.showOpenDialog({

@@ -6,7 +6,7 @@ contextBridge.exposeInMainWorld('tujian', {
   moveDataDir: (dir) => ipcRenderer.invoke('data:move', dir),
   pickVideo: () => ipcRenderer.invoke('dialog:video'),
   pickImages: () => ipcRenderer.invoke('dialog:images'),
-  openAccount: (payload) => ipcRenderer.invoke('account:open', payload),
+  openAccount: (payload) => ipcRenderer.invoke('account:open', JSON.parse(JSON.stringify(payload || {}))),
   useProxy: (payload) => ipcRenderer.invoke('proxy:use', payload),
   checkProxy: (payload) => ipcRenderer.invoke('proxy:check', payload),
   appendLog: (line) => ipcRenderer.invoke('log:append', line),
