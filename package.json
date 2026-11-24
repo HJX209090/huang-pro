@@ -1,0 +1,91 @@
+{
+  "name": "huang-plusplus-pro",
+  "version": "0.1.0",
+  "description": "huang++pro 本地桌面框架",
+  "main": "electron/main.cjs",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1 --port 5173\" \"wait-on http://127.0.0.1:5173 && electron .\"",
+    "dev:web": "vite --host 127.0.0.1 --port 5173",
+    "build": "vite build",
+    "start": "electron .",
+    "build:win": "vite build && electron-builder --win",
+    "release:win": "vite build && electron-builder --win --publish always"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HJX209090/huang-pro.git"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.2",
+    "electron-updater": "^6.8.11",
+    "element-plus": "^2.9.4",
+    "pinia": "^2.3.1",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "concurrently": "^9.1.2",
+    "electron": "^33.4.0",
+    "electron-builder": "^25.1.8",
+    "png-to-ico": "^3.0.2",
+    "vite": "^5.4.14",
+    "wait-on": "^8.0.2"
+  },
+  "build": {
+    "appId": "com.huang.plusplus.pro",
+    "productName": "huang++pro",
+    "icon": "build/icon.png",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "signAndEditExecutable": false
+    },
+    "portable": {
+      "artifactName": "huang++pro-${version}-portable.exe"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "huang++pro",
+      "uninstallDisplayName": "huang++pro",
+      "artifactName": "huang++pro-${version}-setup.exe"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "HJX209090",
+        "repo": "huang-pro",
+        "releaseType": "release"
+      }
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+node_modules
+dist
+release
+*.log
+.DS_Store
+shots
+.env
+.env.*
+*.local
+.vscode/
+.idea/
+build/icon.ico.bak
+*.blockmap
