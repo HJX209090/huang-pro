@@ -73,7 +73,7 @@
       </el-table>
     </div>
     <el-dialog v-model="visible" :title="form.id ? '编辑抖音账号' : '添加抖音账号'" width="520px">
-      <p class="muted">推荐保存账号密码：登录一次后分区会记住；过期时定时任务会自动填密重登，不用每次再扫码。</p>
+      <p class="muted">达人工作台与创作者中心共用同一浏览器会话。请先在本软件窗口登录百应，再打开创作者；若创作者仍要授权，在同一窗口扫一次抖音即可，之后免二次扫码（换设备/无痕除外）。巨量百应登录态不能直接当成创作者已登录。</p>
       <el-form label-width="96px">
         <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>
         <el-form-item label="登录方式">
@@ -300,7 +300,8 @@ async function openRow(row) {
       if (ensured?.loginStatus) row.loginStatus = ensured.loginStatus
       already = ensured?.loginStatus === '已登录' || ensured?.ok
       store.persist()
-      if (ensured?.reused) ElMessage.success('已沿用采集/达人登录态打开创作者中心')
+      if (ensured?.loginStatus === '已登录') ElMessage.success(ensured.message || '已在同一浏览器会话打开创作者中心')
+      else if (ensured?.message) ElMessage.warning(ensured.message)
     } catch { /* 继续打开 */ }
   }
   const result = await window.tujian.openAccount({

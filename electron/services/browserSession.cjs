@@ -196,44 +196,59 @@ function creatorLoginWallScript() {
   })()`
 }
 
-/** 百应已登录 → 镜像 cookie + 通行证热身 → 打开创作者，尽量免扫码 */
+/**
+ * 同浏览器会话进入创作者中心。
+ * 规则（官方实际行为）：
+ * - 达人号=抖音号；同一 Chromium 会话里，抖音登录态可进 creator.douyin.com
+ * - 巨量百应会话与抖音网页端不完全互通，不能指望「只登百应」就免扫创作者
+ * - 做法：百应与创作者共用同一窗口/partition；先热百应，再同窗打开创作者；
+ *   若已有 .douyin.com 会话则免扫，否则在本窗扫一次抖音，之后同会话免二次扫码
+ */
 async function bridgeBuyinToCreator(win, targetUrl, { quiet = false } = {}) {
   if (!win || win.isDestroyed()) return { ok: false, bridged: false }
-  runtimeLog.info('sso.bridge', `开始桥接 → ${String(targetUrl || '').slice(0, 80)}`)
+  const dest = targetUrl || 'https://creator.douyin.com/creator-micro/content/upload'
+  runtimeLog.info('sso.bridge', `同窗进入创作者 → ${String(dest).slice(0, 80)}`)
   const ses = win.webContents.session
-  const mirrored = await mirrorPassportCookies(ses)
-  runtimeLog.info('sso.bridge', `已镜像通行证 cookie ${mirrored} 条`)
-  // 先走抖音主站/通行证，让服务端把会话落到 .douyin.com
-  const warmUrls = [
-    'https://www.douyin.com/',
-    'https://www.douyin.com/user/self',
-    'https://creator.douyin.com/',
-    targetUrl || 'https://creator.douyin.com/creator-micro/content/upload'
-  ]
-  for (const page of warmUrls) {
-    if (win.isDestroyed()) break
-    await loadPage(win, page, { quiet })
-    await wait(900)
-    await mirrorPassportCookies(ses)
-  }
-  if (win.isDestroyed()) return { ok: false, bridged: false }
-  await loadPage(win, targetUrl || 'https://creator.douyin.com/creator-micro/content/upload', { quiet })
-  await wait(1600)
-  let wall = await runInFrames(win, creatorLoginWallScript()).catch(() => 'unknown')
-  if (wall === 'wall') {
-    // 再镜像一次并重开上传页
-    await mirrorPassportCookies(ses)
+  let cookies = await ses.cookies.get({}).catch(() => [])
+  const hadCreator = creatorLoggedIn(cookies)
+  const hadBuyin = buyinLoggedIn(cookies)
+  runtimeLog.info('sso.bridge', `会话探测 buyin=${hadBuyin} creator(douyin)=${hadCreator}`)
+
+  // 1) 同窗先打开/保持百应，确保「达人+创作者」在同一浏览器里
+  if (hadBuyin || !hadCreator) {
     await loadPage(win, 'https://buyin.jinritemai.com/dashboard', { quiet })
     await wait(1000)
-    await mirrorPassportCookies(ses)
-    await loadPage(win, targetUrl || 'https://creator.douyin.com/creator-micro/content/upload', { quiet })
-    await wait(1800)
-    wall = await runInFrames(win, creatorLoginWallScript()).catch(() => 'unknown')
   }
-  const cookies = await ses.cookies.get({}).catch(() => [])
-  const ok = wall === 'ok' || (wall !== 'wall' && creatorLoggedIn(cookies))
+  // 2) 若分区里已有抖音通行证，轻量镜像加固（不能把巨量 cookie 硬塞成抖音登录）
+  if (creatorLoggedIn(await ses.cookies.get({}).catch(() => []))) {
+    await mirrorPassportCookies(ses)
+  }
+  // 3) 同窗直达创作者（不要新开窗口）
+  await loadPage(win, 'https://www.douyin.com/', { quiet })
+  await wait(800)
+  await loadPage(win, dest, { quiet })
+  await wait(1600)
+
+  let wall = await runInFrames(win, creatorLoginWallScript()).catch(() => 'unknown')
+  cookies = await ses.cookies.get({}).catch(() => [])
+  let ok = wall === 'ok' || (wall !== 'wall' && creatorLoggedIn(cookies))
+
+  // 4) 仍是登录墙：停留在本窗，让用户扫「抖音」码（同会话扫一次即可）
+  if (!ok) {
+    runtimeLog.warn('sso.bridge', `创作者仍需抖音授权 wall=${wall}（百应已登≠创作者已登）`)
+    bringToFront(win)
+  }
   runtimeLog.info('sso.bridge', `结束 wall=${wall || ''} ok=${ok} creatorCookie=${creatorLoggedIn(cookies)}`)
-  return { ok, bridged: true, wall, loginStatus: ok ? '已登录' : '待确认' }
+  return {
+    ok,
+    bridged: true,
+    wall,
+    loginStatus: ok ? '已登录' : '待确认',
+    sameBrowser: true,
+    message: ok
+      ? '已在同一浏览器会话打开创作者中心（免二次扫码）'
+      : '请在本窗口用抖音 App 扫一次。达人与创作者必须同一浏览器会话；扫完后本账号会记住，换无痕/换设备才要重扫'
+  }
 }
 
 async function accountStatus({ kind, id }) {
@@ -261,13 +276,13 @@ async function ensurePublishLogin({ id, name, login, mode, url, captcha }) {
           captcha
         })
         if (opened?.loginStatus === '已登录') {
-          return { ok: true, loginStatus: '已登录', reused: true, message: '已用采集/百应登录态进入创作者中心' }
+          return { ok: true, loginStatus: '已登录', reused: true, message: '已在同一浏览器会话进入创作者中心' }
         }
         return {
           ok: Boolean(opened?.ok),
           loginStatus: opened?.loginStatus || '待确认',
           reused: true,
-          message: opened?.message || '百应已登录，但创作者中心仍需一次授权'
+          message: opened?.message || '请在本窗口扫一次抖音（与达人同会话）。百应已登不等于创作者已登'
         }
       } catch { /* 热身失败仍按已登录继续，后续 openAccount 会再试 */ }
     }
@@ -494,9 +509,22 @@ async function fillPrompt(win, prompt) {
 }
 
 function sessionKey(kind, id, url, slot) {
-  const creator = String(url || '').includes('creator.douyin.com') ? ':creator' : ''
+  // 达人百应 + 创作者中心必须同窗口同会话：publish 不再用 :creator 拆窗
+  // （巨量会话≠抖音会话，但同一 Chromium partition/窗口才能单点互通）
   const extra = slot ? `:${String(slot).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24)}` : ''
-  return `${kind}:${id}${creator}${extra}`
+  return `${kind}:${id}${extra}`
+}
+
+/** 找这个发布账号已打开的主窗口（百应/创作者共用） */
+function findPublishMainWindow(id) {
+  const primary = windows.get(`publish:${id}`)
+  if (primary && !primary.isDestroyed()) return primary
+  for (const [key, win] of windows) {
+    if (!key.startsWith(`publish:${id}`) || !win || win.isDestroyed()) continue
+    if (/silent-lookup|lookup-|follow/i.test(key)) continue
+    return win
+  }
+  return null
 }
 
 async function openAccount(payload) {
@@ -528,20 +556,28 @@ async function watchCaptcha(win, captcha, notify) {
 async function openAccountNow({ kind, id, name, mode, login, force, skipSend, already, url, prompt, slot, hidden, captcha }) {
   const quiet = Boolean(hidden)
   const key = sessionKey(kind, id, url, slot)
-  const existing = windows.get(key)
+  const target = url || URLS[kind] || ''
+  const onCreator = kind === 'publish' && target.includes('creator.douyin.com')
+  // 发布账号：创作者必须复用达人主窗口，禁止另开一套浏览器会话
+  let existing = windows.get(key)
+  if ((!existing || existing.isDestroyed()) && kind === 'publish' && !slot && !quiet) {
+    existing = findPublishMainWindow(id)
+    if (existing && !existing.isDestroyed()) {
+      windows.set(key, existing)
+      runtimeLog.info('account.open', `复用同账号达人窗口进入 ${onCreator ? '创作者' : '页面'}`)
+    }
+  }
   if (existing && !existing.isDestroyed() && !force) {
     if (!quiet) bringToFront(existing)
     let cookies = await existing.webContents.session.cookies.get({})
-    const target = url || URLS[kind] || ''
     const onBuyin = target.includes('buyin.jinritemai.com')
-    const onCreator = target.includes('creator.douyin.com')
     const hasBuyin = buyinLoggedIn(cookies)
     let hasCreator = creatorLoggedIn(cookies)
     const sessionOk = kind === 'doubao'
       ? loggedIn(cookies, kind)
-      : (onCreator ? (hasCreator || hasBuyin) : (hasBuyin || loggedIn(cookies, kind)))
-    let direct = sessionOk || Boolean(already)
-    if (onCreator && (hasBuyin || hasCreator || already)) {
+      : (onCreator ? hasCreator : (hasBuyin || loggedIn(cookies, kind)))
+    let direct = sessionOk || (Boolean(already) && !onCreator)
+    if (onCreator) {
       const bridged = await bridgeBuyinToCreator(existing, target, { quiet })
       cookies = await existing.webContents.session.cookies.get({})
       hasCreator = creatorLoggedIn(cookies) || bridged.ok
@@ -553,9 +589,10 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
         loginStatus: direct ? '已登录' : '待确认',
         direct,
         scope: 'creator',
-        message: direct
-          ? '已用采集/百应登录态打开创作者中心（免扫码）'
-          : '百应会话未能自动转到创作者中心，请在窗口里扫一次；扫完后会记住'
+        sameBrowser: true,
+        message: bridged.message || (direct
+          ? '已在同一浏览器会话打开创作者中心'
+          : '请在本窗口扫抖音码（与达人同会话）；扫完后免二次扫码')
       }
     }
     if (url && !samePage(existing.webContents.getURL(), target)) {
@@ -574,10 +611,10 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
     if (kind === 'doubao' && !direct) await watchCaptcha(existing, captcha)
     const openedMessage = prompt
       ? '提示词已填进豆包，请生成 10 秒视频后把成片选回作品'
-      : (direct ? '已进入达人工作台' : '')
-    return { ok: true, loginStatus: direct ? '已登录' : '待确认', direct, scope: onCreator ? 'creator' : (onBuyin ? 'buyin' : ''), message: openedMessage }
+      : (direct ? '已进入达人工作台（与创作者共用同一浏览器会话）' : '')
+    return { ok: true, loginStatus: direct ? '已登录' : '待确认', direct, scope: onBuyin ? 'buyin' : '', message: openedMessage }
   }
-  if (existing && !existing.isDestroyed()) existing.close()
+  if (existing && !existing.isDestroyed() && force) existing.close()
   const partition = `persist:huang-${kind}-${id}`
   const win = new BrowserWindow({
     width: quiet ? 1100 : 1200,
@@ -586,7 +623,7 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
     skipTaskbar: quiet,
     paintWhenInitiallyHidden: true,
     focusable: !quiet,
-    title: quiet ? 'huang-lookup' : `${name || '账号'} · ${TITLES[kind] || TITLES.publish}`,
+    title: quiet ? 'huang-lookup' : `${name || '账号'} · ${onCreator ? '达人/创作者' : (TITLES[kind] || TITLES.publish)}`,
     autoHideMenuBar: true,
     webPreferences: {
       partition,
@@ -630,49 +667,51 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
   const account = login || secret?.login || ''
   const method = mode || 'password'
   const onBuyin = (url || URLS[kind] || '').includes('buyin.jinritemai.com')
-  const onCreator = (url || '').includes('creator.douyin.com')
   let hasBuyin = buyinLoggedIn(cookies)
   let hasCreator = creatorLoggedIn(cookies)
+  // 创作者只认 .douyin.com 会话；百应已登不能算创作者已登
   let sessionOk = kind === 'doubao'
     ? loggedIn(cookies, kind)
-    : (onCreator ? (hasCreator || hasBuyin) : (hasBuyin || loggedIn(cookies, kind)))
+    : (onCreator ? hasCreator : (hasBuyin || loggedIn(cookies, kind)))
   const preferReuse = sessionOk || Boolean(already)
-  // 创作者中心：镜像百应通行证 cookie + 抖音主站热身，真正复用采集登录态
-  if (onCreator && preferReuse) {
+
+  if (onCreator) {
     const bridged = await bridgeBuyinToCreator(win, url || 'https://creator.douyin.com/creator-micro/content/upload', { quiet })
     cookies = await ses.cookies.get({})
     hasCreator = creatorLoggedIn(cookies) || bridged.ok
-    hasBuyin = buyinLoggedIn(cookies)
-    sessionOk = hasCreator
-    if (sessionOk) {
+    if (hasCreator) {
       return {
         ok: true,
         loginStatus: '已登录',
         direct: true,
         scope: 'creator',
-        message: '已用采集/百应登录态打开创作者中心（免扫码）'
+        sameBrowser: true,
+        message: bridged.message || '已在同一浏览器会话打开创作者中心'
       }
     }
-  } else if (sessionOk && !onCreator) {
-    return { ok: true, loginStatus: '已登录', direct: true, scope: onBuyin ? 'buyin' : '', message: onBuyin ? '已进入达人工作台' : '' }
+    return {
+      ok: true,
+      loginStatus: '待确认',
+      direct: false,
+      scope: 'creator',
+      sameBrowser: true,
+      message: bridged.message || '请在本窗口扫抖音码。达人与创作者必须同一浏览器；扫完后免二次扫码'
+    }
+  }
+
+  if (sessionOk) {
+    return { ok: true, loginStatus: '已登录', direct: true, scope: onBuyin ? 'buyin' : '', message: onBuyin ? '已进入达人工作台（与创作者共用同一浏览器会话）' : '' }
   }
   // 调用方声称已登录但 cookie 实际没了：有密码就自动填，绝不先逼扫码
   if (preferReuse && secret?.password && method !== 'code') {
     for (let attempt = 0; attempt < 4; attempt += 1) {
       await wait(900)
-      if (onBuyin || onCreator) await runInFrames(win, clickTextScript(['密码登录', '账号登录']))
+      if (onBuyin) await runInFrames(win, clickTextScript(['密码登录', '账号登录']))
       await fillLogin(win, account, secret.password)
       await wait(1200)
       cookies = await ses.cookies.get({})
-      if (buyinLoggedIn(cookies) || creatorLoggedIn(cookies) || loggedIn(cookies, kind)) {
-        if (onCreator) {
-          const bridged = await bridgeBuyinToCreator(win, url || 'https://creator.douyin.com/creator-micro/content/upload', { quiet })
-          if (bridged.ok || creatorLoggedIn(await ses.cookies.get({}))) {
-            return { ok: true, loginStatus: '已登录', direct: true, scope: 'creator', message: '登录态已刷新，已进入创作者中心' }
-          }
-        } else {
-          return { ok: true, loginStatus: '已登录', direct: true, scope: onBuyin ? 'buyin' : '', message: '登录态已刷新，已进入页面' }
-        }
+      if (buyinLoggedIn(cookies) || loggedIn(cookies, kind)) {
+        return { ok: true, loginStatus: '已登录', direct: true, scope: onBuyin ? 'buyin' : '', message: '登录态已刷新，已进入页面' }
       }
     }
   }
@@ -699,23 +738,8 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
     }
   }
   cookies = await ses.cookies.get({})
-  if (onBuyin && buyinLoggedIn(cookies)) {
-    await mirrorPassportCookies(ses)
-  }
-  if (onCreator) {
-    const wall = await runInFrames(win, creatorLoginWallScript()).catch(() => 'unknown')
-    const signedCreator = wall === 'ok' || (wall !== 'wall' && creatorLoggedIn(cookies))
-    return {
-      ok: true,
-      loginStatus: signedCreator ? '已登录' : '待确认',
-      scope: 'creator',
-      message: signedCreator
-        ? '已打开创作者中心'
-        : '创作者中心需要一次抖音授权。请扫码；同分区下次会记住，并尽量从百应自动带过去'
-    }
-  }
   const signed = onBuyin ? buyinLoggedIn(cookies) : loggedIn(cookies, kind)
-  return { ok: true, loginStatus: signed ? '已登录' : '待确认', scope: onBuyin ? 'buyin' : '', message: signed && onBuyin ? '已进入达人工作台' : '' }
+  return { ok: true, loginStatus: signed ? '已登录' : '待确认', scope: onBuyin ? 'buyin' : '', message: signed && onBuyin ? '已进入达人工作台（与创作者共用同一浏览器会话）' : '' }
 }
 
 async function requestCode({ kind, id, name, login, captcha }) {
@@ -2852,17 +2876,27 @@ async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, 
     already: ensured.loginStatus === '已登录'
   })
   const loginStatus = ensured.loginStatus === '已登录' ? '已登录' : (opened?.loginStatus || '待确认')
-  const win = windows.get(sessionKey('publish', id, page))
-  if (!win || win.isDestroyed()) return { ok: false, attached: false, loginStatus, message: '发布页没有打开' }
-  try { win.setTitle(`${name || '发布账号'} · 上传成片`) } catch { /* 窗口已关 */ }
+  const win = windows.get(sessionKey('publish', id, page)) || findPublishMainWindow(id)
+  if (!win || win.isDestroyed()) return { ok: false, attached: false, loginStatus, message: '发布页没有打开（达人/创作者需同一浏览器窗口）' }
+  windows.set(sessionKey('publish', id, page), win)
+  try { win.setTitle(`${name || '发布账号'} · 达人/创作者 · 上传成片`) } catch { /* 窗口已关 */ }
   bringToFront(win)
-  // 再次确认分区 cookie，避免 UI 误报未登录
+  // 创作者页只认抖音会话；百应 cookie 不算已登录创作者
   try {
     const cookies = await win.webContents.session.cookies.get({})
-    if (loggedIn(cookies, 'publish')) {
-      opened.loginStatus = '已登录'
-    }
+    if (creatorLoggedIn(cookies)) opened.loginStatus = '已登录'
   } catch { /* ignore */ }
+  if (opened?.loginStatus !== '已登录') {
+    const wall = await runInFrames(win, creatorLoginWallScript()).catch(() => 'unknown')
+    if (wall === 'wall') {
+      return {
+        ok: false,
+        attached: false,
+        loginStatus: '待确认',
+        message: '创作者中心未登录。请在本窗口扫一次抖音（必须与达人同一浏览器会话），扫完再点发布'
+      }
+    }
+  }
   if (!videoPath || !fs.existsSync(videoPath)) {
     return { ok: false, attached: false, loginStatus: opened.loginStatus || loginStatus, message: '成片文件不在电脑上' }
   }

@@ -56,7 +56,7 @@
             :value="item.name"
           />
         </el-select>
-        <p class="muted">定时会直接复用该账号在百应/采集里的登录态打开创作者中心，已登录时不再扫码。</p>
+        <p class="muted">定时与发布共用同一浏览器会话。请先在「发布账号」里同窗口登录百应+创作者（创作者需抖音会话）；之后到点免二次扫码。仅登百应、从未在同窗口进过创作者时，仍可能要扫一次抖音。</p>
         <h3>4. 触发节奏</h3>
         <el-radio-group v-model="form.mode">
           <el-radio-button value="单次">单次</el-radio-button>
