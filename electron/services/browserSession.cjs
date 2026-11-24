@@ -7,6 +7,7 @@ const secrets = require('./secrets.cjs')
 const unwatermark = require('./doubaoUnwatermark.cjs')
 const doubaoCaptcha = require('./doubaoCaptcha.cjs')
 const media = require('./media.cjs')
+const runtimeLog = require('./runtimeLog.cjs')
 
 const URLS = {
   doubao: 'https://www.doubao.com/chat/',
@@ -198,8 +199,10 @@ function creatorLoginWallScript() {
 /** 百应已登录 → 镜像 cookie + 通行证热身 → 打开创作者，尽量免扫码 */
 async function bridgeBuyinToCreator(win, targetUrl, { quiet = false } = {}) {
   if (!win || win.isDestroyed()) return { ok: false, bridged: false }
+  runtimeLog.info('sso.bridge', `开始桥接 → ${String(targetUrl || '').slice(0, 80)}`)
   const ses = win.webContents.session
-  await mirrorPassportCookies(ses)
+  const mirrored = await mirrorPassportCookies(ses)
+  runtimeLog.info('sso.bridge', `已镜像通行证 cookie ${mirrored} 条`)
   // 先走抖音主站/通行证，让服务端把会话落到 .douyin.com
   const warmUrls = [
     'https://www.douyin.com/',
@@ -229,6 +232,7 @@ async function bridgeBuyinToCreator(win, targetUrl, { quiet = false } = {}) {
   }
   const cookies = await ses.cookies.get({}).catch(() => [])
   const ok = wall === 'ok' || (wall !== 'wall' && creatorLoggedIn(cookies))
+  runtimeLog.info('sso.bridge', `结束 wall=${wall || ''} ok=${ok} creatorCookie=${creatorLoggedIn(cookies)}`)
   return { ok, bridged: true, wall, loginStatus: ok ? '已登录' : '待确认' }
 }
 
@@ -3917,6 +3921,8 @@ module.exports = {
   closeWindowsByPrefix,
   scrapeBuyinCart,
   scrapeProductById,
+  productFromJsonBlob,
+  mergeLookedProduct,
   closeHiddenLookups() {
     for (const [key, win] of windows) {
       if (!/silent-lookup|lookup-/i.test(key)) continue

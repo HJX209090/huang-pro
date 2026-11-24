@@ -11,6 +11,11 @@ contextBridge.exposeInMainWorld('tujian', {
   checkProxy: (payload) => ipcRenderer.invoke('proxy:check', payload),
   appendLog: (line) => ipcRenderer.invoke('log:append', line),
   openLogFile: () => ipcRenderer.invoke('log:open'),
+  onRuntimeLog: (callback) => {
+    const listener = (_event, payload) => callback(payload)
+    ipcRenderer.on('runtime:log', listener)
+    return () => ipcRenderer.removeListener('runtime:log', listener)
+  },
   publishWork: (payload) => ipcRenderer.invoke('work:publish', JSON.parse(JSON.stringify(payload || {}))),
   generateDoubao: (payload) => ipcRenderer.invoke('doubao:generate', JSON.parse(JSON.stringify(payload || {}))),
   chatDoubao: (payload) => ipcRenderer.invoke('doubao:chat', JSON.parse(JSON.stringify(payload || {}))),

@@ -169,16 +169,28 @@ ipcMain.handle('proxy:check', (_event, payload) => new Promise((resolve) => {
 }))
 ipcMain.handle('log:append', (_event, line) => {
   const file = path.join(app.getPath('userData'), 'huang.log')
-  fs.appendFileSync(file, `${String(line || '')}\n`)
+  try { fs.appendFileSync(file, `${String(line || '')}\n`) } catch { /* ignore */ }
   return { ok: true, file }
 })
 ipcMain.handle('log:open', () => {
-  const file = path.join(app.getPath('userData'), 'huang.log')
+  const runtimeLog = require('./services/runtimeLog.cjs')
+  const file = runtimeLog.logFile()
   if (!fs.existsSync(file)) fs.writeFileSync(file, '')
   shell.showItemInFolder(file)
   return { ok: true, file }
 })
-ipcMain.handle('account:open', (_event, payload) => browserSession.openAccount(payload || {}))
+ipcMain.handle('account:open', async (_event, payload) => {
+  const runtimeLog = require('./services/runtimeLog.cjs')
+  runtimeLog.info('account.open', `打开账号 kind=${payload?.kind || ''} id=${payload?.id || ''} url=${String(payload?.url || '').slice(0, 80)}`)
+  try {
+    const result = await browserSession.openAccount(payload || {})
+    runtimeLog.info('account.open', `完成 loginStatus=${result?.loginStatus || ''} ${result?.message || ''}`)
+    return JSON.parse(JSON.stringify(result || { ok: false }))
+  } catch (error) {
+    runtimeLog.error('account.open', error?.message || error)
+    return { ok: false, message: String(error?.message || error || '打开失败') }
+  }
+})
 ipcMain.handle('work:publish', async (event, payload) => {
   try {
     return await browserSession.publishOnCreator({
@@ -232,7 +244,17 @@ ipcMain.handle('session:list', () => browserSession.listWindows())
 ipcMain.handle('session:close', (_event, key) => browserSession.closeWindow(key))
 ipcMain.handle('session:close-prefix', (_event, prefix) => browserSession.closeWindowsByPrefix(prefix))
 ipcMain.handle('account:follow', (_event, payload) => browserSession.followLinks(payload || {}))
-ipcMain.handle('product:lookup', (_event, payload) => shopAuth.lookup(payload || {}))
+ipcMain.handle('product:lookup', async (_event, payload) => {
+  const runtimeLog = require('./services/runtimeLog.cjs')
+  runtimeLog.info('product.lookup', `IPC 收到查询 ${String(payload?.link || payload?.productId || '').slice(0, 80)}`)
+  try {
+    const result = await shopAuth.lookup(payload || {})
+    return JSON.parse(JSON.stringify(result || { ok: false }))
+  } catch (error) {
+    runtimeLog.error('product.lookup', error?.message || error)
+    return { ok: false, message: String(error?.message || error || '查询失败') }
+  }
+})
 ipcMain.handle('media:info', () => media.info())
 ipcMain.handle('media:probe', (_event, file) => media.probe(file))
 ipcMain.handle('media:watermark', (_event, payload) => media.stripWatermark(payload || {}))

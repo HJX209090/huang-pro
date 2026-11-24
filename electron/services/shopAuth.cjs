@@ -1,5 +1,6 @@
 const { net, session } = require('electron')
 const browserSession = require('./browserSession.cjs')
+const runtimeLog = require('./runtimeLog.cjs')
 
 function partitionOf(accountId) {
   return `persist:huang-publish-${accountId}`
@@ -21,7 +22,9 @@ function pickList(json) {
 
 function ownProductId(node) {
   if (!node || typeof node !== 'object' || Array.isArray(node)) return ''
+  const base = node.base_product_info || {}
   const id = node.product_id_str || node.product_id || node.promotion_id
+    || base.product_id_str || base.product_id || node.id
   return id && /^\d{6,}$/.test(String(id)) ? String(id) : ''
 }
 
@@ -732,9 +735,44 @@ function isCompleteProduct(product) {
   return Boolean(isRealTitle(product) && (product.image || product.images?.length))
 }
 
+function digestProduct(product) {
+  if (!product) return 'empty'
+  return `title=${String(product.title || '').slice(0, 24)} price=${Number(product.price) || 0} rate=${Number(product.rate) || 0} sales=${Number(product.monthlySales) || 0} imgs=${(product.images || []).length}`
+}
+
+function takeFromJson(json, id, detailLink, source, take) {
+  if (!json) {
+    runtimeLog.warn('shopAuth.lookup', `${source} 无响应`, { id })
+    return
+  }
+  const blob = typeof browserSession.productFromJsonBlob === 'function'
+    ? browserSession.productFromJsonBlob(json, id)
+    : null
+  if (blob?.title) {
+    take(normalizeLooked(blob, id, detailLink), source)
+    runtimeLog.info('shopAuth.lookup', `${source} blob命中`, digestProduct(blob))
+  }
+  const rows = readProducts(json)
+  const found = rows.find((row) => String(row.id) === String(id)) || rows[0]
+  if (found) {
+    take(normalizeLooked(found, id, detailLink), source)
+    runtimeLog.info('shopAuth.lookup', `${source} rows命中`, digestProduct(found))
+  } else if (!blob?.title) {
+    runtimeLog.warn('shopAuth.lookup', `${source} 未解析到商品`, {
+      id,
+      code: json?.code,
+      keys: json?.data ? Object.keys(json.data).slice(0, 12) : Object.keys(json || {}).slice(0, 12)
+    })
+  }
+}
+
 async function lookup({ accountId, link, name, login, mode }) {
   const id = productIdFrom(link)
-  if (!id) return { ok: false, message: '链接里没有商品编号' }
+  runtimeLog.info('shopAuth.lookup', '开始拉取商品', { id, accountId: accountId || '', link: String(link || '').slice(0, 80) })
+  if (!id) {
+    runtimeLog.error('shopAuth.lookup', '链接里没有商品编号')
+    return { ok: false, message: '链接里没有商品编号' }
+  }
   const partition = accountId ? partitionOf(accountId) : 'persist:huang-publish-guest'
   const detailLink = String(link || '').startsWith('http')
     ? String(link)
@@ -744,14 +782,18 @@ async function lookup({ accountId, link, name, login, mode }) {
     if (!normalized || !isRealTitle(normalized)) return
     const withSource = { ...normalized, source: normalized.source || source }
     partial = mergeNormalized(partial, withSource)
+    runtimeLog.info('shopAuth.lookup', `合并来源=${source}`, digestProduct(partial))
   }
 
   // 1) 已登录账号的选品车接口里按编号找（主路径：不弹窗）
   try {
     const cart = await listSelected(partition)
+    runtimeLog.info('shopAuth.lookup', `选品车列表 ${cart.length} 件`)
     const hit = cart.find((row) => String(row.id) === String(id))
     take(normalizeLooked(hit, id, detailLink), '选品车')
-  } catch { /* 未登录或接口改版 */ }
+  } catch (error) {
+    runtimeLog.warn('shopAuth.lookup', `选品车列表失败 ${error?.message || error}`)
+  }
 
   // 1b) 带 search_text / product_id 再问一遍选品车
   try {
@@ -767,14 +809,14 @@ async function lookup({ accountId, link, name, login, mode }) {
         { page: 1, page_no: 1, page_size: 50, size: 50, keyword: id }
       ]) {
         const json = await requestJson(partition, url, { method: 'POST', referer: WORKBENCH.products, body })
-        const rows = json ? readProducts(json) : []
-        const found = rows.find((row) => String(row.id) === String(id)) || rows[0]
-        take(normalizeLooked(found, id, detailLink), '选品车')
+        takeFromJson(json, id, detailLink, '选品车搜索', take)
       }
     }
-  } catch { /* ignore */ }
+  } catch (error) {
+    runtimeLog.warn('shopAuth.lookup', `选品车搜索失败 ${error?.message || error}`)
+  }
 
-  // 2) 百应详情接口（仍用账号 cookie，不开窗）
+  // 2) 百应详情接口（GET + POST）
   const tries = [
     {
       url: `https://buyin.jinritemai.com/pc/selection/decision/pack_detail?product_id=${id}`,
@@ -802,10 +844,22 @@ async function lookup({ accountId, link, name, login, mode }) {
     }
   ]
   for (const item of tries) {
+    runtimeLog.info('shopAuth.lookup', `请求详情 ${item.url.split('?')[0]}`)
     const json = await requestJson(partition, item.url, { referer: item.referer })
-    const rows = json ? readProducts(json) : []
-    const found = rows.find((row) => String(row.id) === String(id)) || rows[0]
-    take(normalizeLooked(found, id, detailLink), '百应详情')
+    takeFromJson(json, id, detailLink, '百应详情', take)
+  }
+  const postTries = [
+    { url: 'https://buyin.jinritemai.com/pc/selection/decision/pack_detail', body: { product_id: id } },
+    { url: 'https://buyin.jinritemai.com/pc/selection/decision/pack_detail', body: { promotion_id: id, product_id: id } },
+    { url: 'https://buyin.jinritemai.com/pc/selection/decision/product_detail', body: { product_id: id } }
+  ]
+  for (const item of postTries) {
+    const json = await requestJson(partition, item.url, {
+      method: 'POST',
+      referer: WORKBENCH.products,
+      body: item.body
+    })
+    takeFromJson(json, id, detailLink, '百应详情POST', take)
   }
 
   // 3) 广场搜索这个编号
@@ -820,19 +874,21 @@ async function lookup({ accountId, link, name, login, mode }) {
         referer: WORKBENCH.plaza,
         body: { cursor: 0, size: 20, scene: 'PCSquareSearch', search_text: id, extra: {}, page: 1, page_size: 20 }
       })
-      const rows = json ? readProducts(json) : []
-      const found = rows.find((row) => String(row.id) === String(id)) || rows[0]
-      take(normalizeLooked(found, id, detailLink), '选品广场')
+      takeFromJson(json, id, detailLink, '选品广场', take)
     }
-  } catch { /* 搜索失败继续 */ }
+  } catch (error) {
+    runtimeLog.warn('shopAuth.lookup', `广场搜索失败 ${error?.message || error}`)
+  }
 
-  // 4) 仍缺字段：后台静默窗只打百应选品车会话（不打开 haohuo 消费者页、不显示窗口）
+  // 4) 仍缺字段：后台静默窗只打百应选品车会话
   const needSilent = !partial
     || !isRealTitle(partial)
     || !(Number(partial.price) > 0)
     || !(Number(partial.rate) > 0)
+    || !(Number(partial.monthlySales) > 0)
     || !(partial.images || []).length
   if (accountId && needSilent) {
+    runtimeLog.info('shopAuth.lookup', '进入静默窗补价佣销量', digestProduct(partial))
     try {
       const scraped = await browserSession.scrapeProductById({
         id: accountId,
@@ -842,7 +898,10 @@ async function lookup({ accountId, link, name, login, mode }) {
         productId: id
       })
       take(normalizeLooked(scraped, id, detailLink), scraped?.source || '选品车静默')
-    } catch { /* 抓取失败继续 */ }
+      runtimeLog.info('shopAuth.lookup', '静默窗结果', digestProduct(scraped))
+    } catch (error) {
+      runtimeLog.error('shopAuth.lookup', `静默窗失败 ${error?.message || error}`)
+    }
   }
 
   if (partial && isRealTitle(partial)) {
@@ -852,12 +911,14 @@ async function lookup({ accountId, link, name, login, mode }) {
     if (!(Number(partial.rate) > 0)) missing.push('佣金')
     if (!partial.category || ['链接导入', '未分类'].includes(partial.category)) missing.push('类目')
     if (!(Number(partial.monthlySales) > 0)) missing.push('销量')
+    runtimeLog.success('shopAuth.lookup', missing.length ? `部分成功 缺${missing.join('/')}` : '字段齐全', digestProduct(partial))
     return {
       ok: true,
       product: partial,
       message: missing.length ? `已入库，但仍缺：${missing.join('、')}。请先登录百应并同步选品车补全` : ''
     }
   }
+  runtimeLog.error('shopAuth.lookup', '未拉到真实商品', { id })
   return {
     ok: false,
     product: { id, title: `商品 ${id}`, link: detailLink, price: 0, rate: 0, category: '链接导入', shop: '抖音', image: '', images: [] },
