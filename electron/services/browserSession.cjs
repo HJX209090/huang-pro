@@ -3705,6 +3705,144 @@ function productDetailScore(product) {
   return score
 }
 
+/** 从百应选品车/广场表格 DOM 抠价佣销量（页面上有 ¥59.90 / 20% / 9808） */
+function scrapeBuyinTableScript(pid) {
+  return `(() => {
+    const pid = ${JSON.stringify(String(pid))}
+    const compact = (value) => String(value || '').replace(/\\s+/g, ' ').trim()
+    const rows = Array.from(document.querySelectorAll('tr[data-row-key], tr'))
+    let hit = rows.find((row) => String(row.getAttribute('data-row-key') || '') === pid)
+    if (!hit) hit = rows.find((row) => compact(row.innerText || '').includes(pid))
+    if (!hit) {
+      const blocks = Array.from(document.querySelectorAll('[class*="infoCell"], [class*="product"], [class*="card"], li, div'))
+        .filter((el) => {
+          const text = compact(el.innerText || '')
+          return text.includes(pid) && /¥|￥/.test(text) && /%/.test(text) && text.length < 1200
+        })
+        .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length)
+      hit = blocks[0]
+    }
+    if (!hit) return null
+    const text = compact(hit.innerText || hit.textContent || '')
+    const cells = Array.from(hit.querySelectorAll('td')).map((td) => compact(td.innerText || ''))
+    const titleEl = hit.querySelector('[class*="titleText"], [class*="titleWrap"] [class*="ellipsis"], [class*="title"]')
+    let title = compact(titleEl?.innerText || '')
+    if (!title || title.length < 4) {
+      const lines = text.split(/\\n/).map((item) => item.trim()).filter(Boolean)
+      title = lines.find((line) => /[\\u4e00-\\u9fff]/.test(line) && line.length >= 6 && line.length <= 80 && !/ID|商品类目|体验分|预计赚|去带货|添加分组/.test(line) && !/^[¥￥0-9.%\\s]+$/.test(line)) || ''
+    }
+    // 列顺序常见：勾选 | 商品 | 店铺 | 佣金 | 价格 | 销量 | …
+    let price = 0
+    let rate = 0
+    let sales = 0
+    let earn = 0
+    for (const cell of cells) {
+      if (!price && /[¥￥]\\s*[0-9]/.test(cell) && !/预计赚/.test(cell)) {
+        const m = cell.match(/[¥￥]\\s*([0-9]+(?:\\.[0-9]+)?)/)
+        if (m) price = Number(m[1]) || 0
+      }
+      if (!rate && /%/.test(cell) && (/预计赚/.test(cell) || /^[0-9.]+%$/.test(cell.replace(/\\s/g, '')) || /[0-9]+\\s*%/.test(cell))) {
+        const m = cell.match(/([0-9]+(?:\\.[0-9]+)?)\\s*%/)
+        if (m) rate = Number(m[1]) || 0
+        const e = cell.match(/预计赚\\s*[¥￥]?\\s*([0-9]+(?:\\.[0-9]+)?)/)
+        if (e) earn = Number(e[1]) || 0
+      }
+      if (!sales && /^[0-9]{2,8}$/.test(cell.replace(/,/g, ''))) {
+        const n = Number(cell.replace(/,/g, ''))
+        // 跳过体验分常见 0-100；销量通常更大，或至少不是佣金整数
+        if (n >= 0 && n !== Math.round(rate) && !(n >= 80 && n <= 100 && cells.some((c) => /体验分/.test(c)))) {
+          // 优先更大的销量候选
+          if (n > sales) sales = n
+        }
+      }
+    }
+    if (!price) {
+      const m = text.match(/[¥￥]\\s*([0-9]+(?:\\.[0-9]+)?)/)
+      if (m) price = Number(m[1]) || 0
+    }
+    if (!rate) {
+      const m = text.match(/([0-9]+(?:\\.[0-9]+)?)\\s*%/)
+      if (m) rate = Number(m[1]) || 0
+    }
+    if (!sales) {
+      // 去掉价格/佣金后再找较大整数
+      const cleaned = text.replace(/[¥￥]\\s*[0-9.]+/g, ' ').replace(/[0-9.]+\\s*%/g, ' ').replace(/体验分[:：]?\\s*[0-9.]+/g, ' ')
+      const nums = [...cleaned.matchAll(/\\b([1-9][0-9]{1,7})\\b/g)].map((m) => Number(m[1])).filter((n) => n >= 20)
+      sales = nums.sort((a, b) => b - a)[0] || 0
+    }
+    const categoryMatch = text.match(/商品类目[:：]\\s*([^\\n]+)/)
+    const shopMatch = text.match(/([^\\n]{2,24})\\s*体验分/)
+    const img = hit.querySelector('img')
+    const image = img ? (img.currentSrc || img.src || '') : ''
+    return {
+      id: pid,
+      title: title || '',
+      price,
+      rate,
+      monthlySales: sales,
+      category: categoryMatch ? categoryMatch[1].trim() : '',
+      shop: shopMatch ? shopMatch[1].trim() : '',
+      image,
+      images: image ? [image] : [],
+      earn,
+      source: '百应表格'
+    }
+  })()`
+}
+
+async function scrapeBuyinDomProduct(win, pid) {
+  if (!win || win.isDestroyed()) return null
+  const pages = [
+    `https://buyin.jinritemai.com/dashboard/merch-picking-cart`,
+    `https://buyin.jinritemai.com/dashboard/merch-picking-library`,
+    `https://buyin.jinritemai.com/dashboard/merch-picking-library?search_text=${encodeURIComponent(pid)}`
+  ]
+  for (const page of pages) {
+    if (win.isDestroyed()) break
+    await loadPage(win, page, { quiet: true })
+    await wait(1600)
+    // 尝试在搜索框填入商品 ID
+    await win.webContents.executeJavaScript(`(() => {
+      const pid = ${JSON.stringify(String(pid))}
+      const inputs = Array.from(document.querySelectorAll('input'))
+      const box = inputs.find((el) => /搜索|商品|ID|编号/.test((el.placeholder || '') + (el.name || ''))) || inputs.find((el) => el.type === 'search' || el.type === 'text')
+      if (!box) return 'no'
+      const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')
+      proto.set.call(box, pid)
+      box.dispatchEvent(new Event('input', { bubbles: true }))
+      box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+      box.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }))
+      return 'ok'
+    })()`, true).catch(() => 'no')
+    await wait(1800)
+    hardenSilentWindow(win)
+    let found = await evalInFrames(win, scrapeBuyinTableScript(pid)).catch(() => null)
+    if (found && typeof found === 'string') {
+      try { found = JSON.parse(found) } catch { found = null }
+    }
+    if (found?.title || Number(found?.price) > 0 || Number(found?.rate) > 0) {
+      runtimeLog.info('product.dom', `表格命中 ${pid}`, {
+        price: found.price, rate: found.rate, sales: found.monthlySales, title: String(found.title || '').slice(0, 20)
+      })
+      return {
+        id: pid,
+        title: found.title || `商品 ${pid}`,
+        price: Number(found.price) || 0,
+        rate: Number(found.rate) || 0,
+        monthlySales: Number(found.monthlySales) || 0,
+        category: found.category || '选品车',
+        shop: found.shop || '抖音',
+        image: found.image || '',
+        images: found.images || [],
+        source: '百应表格',
+        link: `https://haohuo.jinritemai.com/ecommerce/trade/detail/index.html?id=${pid}`
+      }
+    }
+  }
+  runtimeLog.warn('product.dom', `表格未找到 ${pid}`)
+  return null
+}
+
 function hardenSilentWindow(win) {
   if (!win || win.isDestroyed()) return
   try {
@@ -3822,15 +3960,29 @@ async function scrapeProductById({ id, name, login, mode, productId }) {
     }
     // 3) 选品广场搜索编号
     if (productDetailScore(best) < 10 && !win.isDestroyed()) {
-      const json = await win.webContents.executeJavaScript(
-        `fetch('https://buyin.jinritemai.com/pc/selection/common/material_list',{method:'POST',credentials:'include',headers:{'content-type':'application/json',accept:'application/json'},body:JSON.stringify({cursor:0,size:20,scene:'PCSquareSearch',search_text:${JSON.stringify(pid)},extra:{},page:1,page_size:20})}).then((r)=>r.json()).catch(()=>null)`,
-        true
-      ).catch(() => null)
-      const found = productFromJsonBlob(json, pid)
-      if (found?.title) best = mergeLookedProduct(best, { ...found, source: '选品广场搜索' })
+      const plazaBodies = [
+        { cursor: 0, size: 20, scene: 'PCSquareSearch', search_text: pid, extra: {}, page: 1, page_size: 20 },
+        { cursor: 0, size: 20, scene: 'PCSquareSearch', keyword: pid, search_text: pid, page: 1, page_size: 20 }
+      ]
+      for (const body of plazaBodies) {
+        if (win.isDestroyed()) break
+        const json = await win.webContents.executeJavaScript(
+          `fetch('https://buyin.jinritemai.com/pc/selection/common/material_list',{method:'POST',credentials:'include',headers:{'content-type':'application/json',accept:'application/json'},body:JSON.stringify(${JSON.stringify(body)})}).then((r)=>r.json()).catch(()=>null)`,
+          true
+        ).catch(() => null)
+        const found = productFromJsonBlob(json, pid)
+        if (found?.title) best = mergeLookedProduct(best, { ...found, source: '选品广场搜索' })
+      }
     }
-    // 不再打开 haohuo 商品 H5：那个页没佣金/价格，还容易弹「打开抖音 APP」
-  } catch { /* 静默抓取失败 */ }
+    // 4) 接口仍缺价/佣/销：直接读百应表格 DOM（页面上就是 ¥xx / xx% / 销量）
+    if ((!best || !(Number(best.price) > 0) || !(Number(best.rate) > 0) || !(Number(best.monthlySales) > 0)) && !win.isDestroyed()) {
+      runtimeLog.info('product.scrape', `接口字段不全，改读表格 DOM ${pid}`)
+      const dom = await scrapeBuyinDomProduct(win, pid)
+      if (dom) best = mergeLookedProduct(best, dom)
+    }
+  } catch (error) {
+    runtimeLog.warn('product.scrape', `静默抓取异常 ${error?.message || error}`)
+  }
   finally {
     try {
       if (win && !win.isDestroyed()) win.close()

@@ -337,11 +337,14 @@ function mapCartCard(card, index) {
   const shop = card.base_shop_info || {}
   const priceRaw = coerceNumber(
     base.price ?? base.discount_price ?? base.min_price ?? base.model_price ?? base.activity_price
-    ?? card.price ?? card.discount_price ?? card.min_price ?? 0
+    ?? base.sale_price ?? base.sku_min_price ?? base.good_price
+    ?? card.price ?? card.discount_price ?? card.min_price ?? card.sale_price
+    ?? card.price_text ?? base.price_text ?? 0
   )
   const rateRaw = coerceNumber(
     biz.cos_ratio ?? biz.cos_ratio_str ?? biz.commission_rate ?? biz.estimated_cos_ratio
-    ?? card.cos_ratio ?? card.cos_ratio_str ?? card.commission_rate ?? 0
+    ?? biz.cos_fee_rate ?? biz.commission_rate_str
+    ?? card.cos_ratio ?? card.cos_ratio_str ?? card.commission_rate ?? card.cos_ratio_text ?? 0
   )
   const cover = imageUrl(typeof base.cover === 'string' ? base.cover : '')
     || imageUrl(typeof card.cover === 'string' ? card.cover : '')
