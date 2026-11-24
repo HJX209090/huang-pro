@@ -752,6 +752,13 @@ export const useAppStore = defineStore('app', {
           this.addLog('warning', '定时', message)
           return message
         }
+        // 优先取采集/发布账号真实 cookie 状态，不要只看列表里的旧标签
+        try {
+          if (window.tujian?.accountStatus) {
+            const st = await window.tujian.accountStatus({ kind: 'publish', id: account.id })
+            if (st?.loginStatus) account.loginStatus = st.loginStatus
+          }
+        } catch { /* ignore */ }
         if (window.tujian?.ensurePublishLogin) {
           try {
             const ensured = await window.tujian.ensurePublishLogin({
@@ -769,7 +776,7 @@ export const useAppStore = defineStore('app', {
               this.addLog('warning', '定时', message)
               return message
             }
-            if (ensured?.reused) this.addLog('info', '定时', `${account.name}：沿用已保存登录态`)
+            if (ensured?.reused) this.addLog('info', '定时', `${account.name}：沿用采集账号登录态，无需再扫码`)
             else this.addLog('info', '定时', `${account.name}：${ensured.message || '登录态已就绪'}`)
           } catch (error) {
             this.addLog('warning', '定时', `${account.name}：检查登录态失败 ${error.message || ''}`)

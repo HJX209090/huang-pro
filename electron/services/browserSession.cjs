@@ -140,7 +140,8 @@ async function accountStatus({ kind, id }) {
 async function ensurePublishLogin({ id, name, login, mode, url, captcha }) {
   const status = await accountStatus({ kind: 'publish', id })
   if (status.loginStatus === '已登录') {
-    return { ok: true, loginStatus: '已登录', reused: true, message: '沿用已保存的达人登录态' }
+    // 采集账号已登录：直接复用，创作者页由 openAccount SSO 热身，不再扫码
+    return { ok: true, loginStatus: '已登录', reused: true, message: '沿用采集/达人账号登录态' }
   }
   const secret = secrets.read(id)
   const account = String(login || secret?.login || '').trim()
@@ -404,13 +405,21 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
     const target = url || URLS[kind] || ''
     const onBuyin = target.includes('buyin.jinritemai.com')
     const onCreator = target.includes('creator.douyin.com')
-    const direct = onBuyin ? buyinLoggedIn(cookies) : onCreator ? creatorLoggedIn(cookies) : (Boolean(already) || loggedIn(cookies, kind))
+    // 采集/达人分区 cookie 通用；already 也算已登录，避免创作者中心再逼扫码
+    const sessionOk = loggedIn(cookies, kind) || buyinLoggedIn(cookies) || creatorLoggedIn(cookies)
+    const direct = sessionOk || Boolean(already)
     if (url && !samePage(existing.webContents.getURL(), target)) {
+      if (onCreator && sessionOk) {
+        await loadPage(existing, 'https://buyin.jinritemai.com/dashboard', { quiet })
+        await wait(1200)
+      }
       const opened = await loadPage(existing, url, { quiet })
       if (!opened) return { ok: false, loginStatus: direct ? '已登录' : '待确认', message: '页面没有打开，请再点一次' }
+      if (onCreator && sessionOk) await wait(1500)
     }
     await applyProxy(existing.webContents.session)
     if (prompt) await fillPrompt(existing, prompt)
+    // 分区已有登录态时绝不再点扫码
     if (!direct && mode === 'qr' && !onBuyin) await runInFrames(existing, clickTextScript(['扫码登录', '扫码']))
     if (!direct && onBuyin && mode !== 'qr') {
       await runInFrames(existing, clickTextScript(['密码登录']))
@@ -420,7 +429,7 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
     if (kind === 'doubao' && !direct) await watchCaptcha(existing, captcha)
     const openedMessage = prompt
       ? '提示词已填进豆包，请生成 10 秒视频后把成片选回作品'
-      : (onCreator ? (direct ? '已打开这个账号的创作者中心' : '创作者中心已打开，登录一次后留在这个账号里') : (direct ? '已进入达人工作台' : ''))
+      : (onCreator ? (direct ? '已打开这个账号的创作者中心（沿用采集登录态）' : '创作者中心已打开，登录一次后留在这个账号里') : (direct ? '已进入达人工作台' : ''))
     return { ok: true, loginStatus: direct ? '已登录' : '待确认', direct, scope: onCreator ? 'creator' : (onBuyin ? 'buyin' : ''), message: openedMessage }
   }
   if (existing && !existing.isDestroyed()) existing.close()
@@ -477,11 +486,22 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
   const method = mode || 'password'
   const onBuyin = (url || URLS[kind] || '').includes('buyin.jinritemai.com')
   const onCreator = (url || '').includes('creator.douyin.com')
-  const direct = onBuyin ? buyinLoggedIn(cookies) : onCreator ? creatorLoggedIn(cookies) : (Boolean(already) || loggedIn(cookies, kind))
-  if (direct) {
-    return { ok: true, loginStatus: '已登录', direct: true, scope: onCreator ? 'creator' : (onBuyin ? 'buyin' : ''), message: onCreator ? '已打开这个账号的创作者中心' : (onBuyin ? '已进入达人工作台' : '') }
+  let sessionOk = loggedIn(cookies, kind) || buyinLoggedIn(cookies) || creatorLoggedIn(cookies) || Boolean(already)
+  // 创作者中心：先热一下百应工作台，用同一分区 cookie 做 SSO，避免再扫码
+  if (onCreator && sessionOk) {
+    await loadPage(win, 'https://buyin.jinritemai.com/dashboard', { quiet })
+    await wait(1200)
+    await loadPage(win, url || 'https://creator.douyin.com/creator-micro/content/upload', { quiet })
+    await wait(1800)
+    cookies = await ses.cookies.get({})
+    sessionOk = loggedIn(cookies, kind) || buyinLoggedIn(cookies) || creatorLoggedIn(cookies) || Boolean(already)
   }
-  if (!loggedIn(cookies, kind) && method === 'qr') {
+  const direct = sessionOk
+  if (direct) {
+    return { ok: true, loginStatus: '已登录', direct: true, scope: onCreator ? 'creator' : (onBuyin ? 'buyin' : ''), message: onCreator ? '已打开创作者中心（沿用采集登录态）' : (onBuyin ? '已进入达人工作台' : '') }
+  }
+  // 仅在真正没有 cookie 时才扫码；分区已登录过绝不再逼扫
+  if (!sessionOk && method === 'qr') {
     for (let attempt = 0; attempt < 6; attempt += 1) {
       await wait(800)
       const clicked = await runInFrames(win, clickTextScript(['扫码登录', '扫码']))
@@ -2108,16 +2128,25 @@ function clickPublishScript() {
     const buttons = []
     const walk = (root) => {
       if (!root || !root.querySelectorAll) return
-      root.querySelectorAll('button, [role="button"]').forEach((el) => buttons.push(el))
+      root.querySelectorAll('button, [role="button"], span, div').forEach((el) => buttons.push(el))
       root.querySelectorAll('*').forEach((el) => { if (el.shadowRoot) walk(el.shadowRoot) })
     }
     walk(document)
-    const publish = buttons.find((el) => {
-      const text = compact(el.innerText)
-      return (text === '发布' || text === '定时发布') && !el.disabled && el.getAttribute('aria-disabled') !== 'true'
-    })
+    const prefer = ['发布', '定时发布', '立即发布', '确认发布', '发布作品']
+    let publish = null
+    for (const label of prefer) {
+      publish = buttons.find((el) => {
+        const text = compact(el.innerText || el.textContent)
+        const rect = el.getBoundingClientRect()
+        if (!(rect.width > 40 && rect.height > 18)) return false
+        if (el.disabled || el.getAttribute('aria-disabled') === 'true') return false
+        return text === label || (label.length >= 4 && text.includes(label) && text.length <= 8)
+      })
+      if (publish) break
+    }
     if (!publish) return 'miss'
-    publish.click()
+    const target = publish.closest('button, [role="button"]') || publish
+    target.click()
     return 'published'
   })()`
 }
@@ -2149,15 +2178,17 @@ function uploadReadyScript() {
   })()`
 }
 
-/** 发文助手 / 发布助手检测状态 */
+/** 发文助手 / 发布助手 / 快速检测 状态 */
 function publishAssistScript() {
   return `(() => {
     const compact = (value) => String(value || '').replace(/\\s+/g, '')
     const body = compact(document.body?.innerText || '')
-    const hasAssist = /发文助手|发布助手|内容检测|风险检测/.test(body)
+    const hasAssist = /发文助手|发布助手|内容检测|风险检测|快速检测/.test(body)
     const checking = /检测中|正在检测|分析中|识别中/.test(body)
-    const pass = /暂未发现|未发现问题|未发现风险|检测通过|可正常发布|暂无风险|未检出风险/.test(body)
-    const risk = /存在风险|建议修改|不合规|可能违规|不适合展示|检测到风险/.test(body)
+    // 「作品未见异常」是当前快速检测通过文案；封面缺失提示不算风险
+    const pass = /作品未见异常|未见异常|暂未发现|未发现问题|未发现风险|检测通过|可正常发布|暂无风险|未检出风险|没有发现异常/.test(body)
+    const risk = /存在风险|建议修改文案|不合规|可能违规|不适合展示|检测到风险|禁止发布|无法发布/.test(body)
+      && !/双封面缺失|建议同时设置横版|建议同时设置竖版|为增加作品的流量/.test(body)
     const nodes = Array.from(document.querySelectorAll('button, [role="button"], a, span, div'))
     const recheck = nodes.find((el) => {
       const text = compact(el.innerText || el.textContent)
@@ -2167,11 +2198,30 @@ function publishAssistScript() {
       return text === '重新检测' || text === '再次检测' || text === '重新识别' || text === '再检测一次'
     })
     if (checking) return 'checking'
-    if (recheck && (risk || !pass)) return 'recheck'
     if (pass) return 'pass'
+    if (recheck && risk) return 'recheck'
     if (risk) return 'risk'
     if (hasAssist) return 'wait'
     return 'miss'
+  })()`
+}
+
+function dismissAssistPanelScript() {
+  return `(() => {
+    const compact = (value) => String(value || '').replace(/\\s+/g, '')
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    const nodes = Array.from(document.querySelectorAll('button, [role="button"], span, div, a'))
+    const closer = nodes.find((el) => {
+      const text = compact(el.innerText || el.getAttribute('aria-label') || '')
+      const rect = el.getBoundingClientRect()
+      if (!(rect.width > 10 && rect.height > 10)) return false
+      return text === '关闭' || text === '我知道了' || text === '完成' || text === '继续发布' || /close|关闭/.test((el.className || '') + (el.getAttribute('aria-label') || ''))
+    })
+    if (closer) {
+      closer.click()
+      return 'closed'
+    }
+    return 'ok'
   })()`
 }
 
@@ -2527,7 +2577,7 @@ async function recoverCreatorUpload(win, videoPath, notify, workId) {
   return waitUploadReady(win, notify, workId)
 }
 
-/** 发布前：等发文助手检测；需要时点「重新检测」，通过后再发 */
+/** 发布前：等发文助手/快速检测；通过后收起面板继续点发布 */
 async function ensurePublishAssist(win, notify, workId) {
   let rechecked = false
   let last = 'miss'
@@ -2535,11 +2585,13 @@ async function ensurePublishAssist(win, notify, workId) {
     if (win.isDestroyed()) return { state: 'fail', note: '窗口已关' }
     last = await runInFrames(win, publishAssistScript())
     if (last === 'pass') {
-      notify?.({ workId, progress: 94, status: '发布中', confirmNote: '发文助手检测通过' })
+      notify?.({ workId, progress: 94, status: '发布中', confirmNote: '快速检测通过（作品未见异常），继续发布' })
+      await runInFrames(win, dismissAssistPanelScript()).catch(() => {})
+      await wait(400)
       return { state: 'pass', note: '发文助手检测通过' }
     }
     if (last === 'checking' || last === 'wait') {
-      if (tick % 4 === 0) notify?.({ workId, progress: 93, status: '发布中', confirmNote: '等待发文助手/发布助手检测完成' })
+      if (tick % 4 === 0) notify?.({ workId, progress: 93, status: '发布中', confirmNote: '等待发文助手/快速检测完成' })
       await wait(1200)
       continue
     }
@@ -2551,19 +2603,26 @@ async function ensurePublishAssist(win, notify, workId) {
       continue
     }
     if (last === 'risk' && rechecked) {
-      // 重检后仍有风险：停住不硬发，留给人工看
       return { state: 'risk', note: '发文助手仍提示风险，请在窗口里按提示修改后再发' }
     }
     if (last === 'miss') {
-      // 有的账号没有助手面板，短等后放行
       if (tick >= 6) return { state: 'skip', note: '未看到发文助手，继续发布' }
       await wait(800)
       continue
     }
     await wait(1000)
   }
-  if (last === 'pass') return { state: 'pass', note: '发文助手检测通过' }
+  if (last === 'pass') {
+    await runInFrames(win, dismissAssistPanelScript()).catch(() => {})
+    return { state: 'pass', note: '发文助手检测通过' }
+  }
   if (last === 'risk') return { state: 'risk', note: '发文助手仍提示风险，未自动发布' }
+  // 超时但页面已出现「未见异常」类结果时，按通过继续，避免卡死
+  const body = await win.webContents.executeJavaScript(`String(document.body?.innerText||'')`, true).catch(() => '')
+  if (/作品未见异常|未见异常|检测通过|可正常发布/.test(String(body || ''))) {
+    await runInFrames(win, dismissAssistPanelScript()).catch(() => {})
+    return { state: 'pass', note: '快速检测已通过，继续发布' }
+  }
   return { state: 'timeout', note: '发文助手检测超时，请在窗口里确认后再发' }
 }
 
@@ -2649,7 +2708,7 @@ async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, 
     ? []
     : (Array.isArray(tags) ? tags.map((item) => String(item || '').replace(/^#/, '').trim())
       .filter((item) => item && item.length >= 2 && item.length <= 12 && !/^https?:/i.test(item) && !/haohuo|jinritemai|douyin\.com/i.test(item))
-      .slice(0, 3) : [])
+      .slice(0, 5) : [])
   const shortTitle = String(title || '').replace(/https?:\/\/\S+/gi, '').trim().slice(0, 30)
   // 等发布编辑页「填写作品标题」输入框（上传/转码完成后才有）
   const editorReady = await waitCreatorEditor(win, notify, workId)
@@ -2676,7 +2735,7 @@ async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, 
       if (Array.isArray(list)) list.forEach((tag) => { if (tag && !placed.includes(tag)) placed.push(tag) })
     } catch { /* ignore */ }
     for (const tag of topicTags) {
-      if (placed.length >= 3) break
+      if (placed.length >= 5) break
       if (placed.includes(tag)) continue
       const typed = await runInFrames(win, insertCreatorTagScript(tag))
       if (typed === 'miss') continue
@@ -2712,12 +2771,13 @@ async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, 
     }
   }
   let published = 'miss'
-  for (let attempt = 0; attempt < 8 && published !== 'published'; attempt += 1) {
+  for (let attempt = 0; attempt < 12 && published !== 'published'; attempt += 1) {
+    await runInFrames(win, dismissAssistPanelScript()).catch(() => {})
     const ready = await runInFrames(win, uploadReadyScript())
-    if (ready === 'ready' || ready === 'wait') {
+    if (ready === 'ready' || ready === 'wait' || ready === 'fail') {
       published = await runInFrames(win, clickPublishScript())
     }
-    if (published !== 'published') await wait(800)
+    if (published !== 'published') await wait(700)
   }
   bringToFront(win)
   const tagText = (placed.length ? placed : topicTags).map((item) => `#${item}`).join(' ')
@@ -3189,14 +3249,24 @@ function productFromJsonBlob(json, pid) {
         title,
         node,
         price: normalizeMoney(
-          pickDeepNumber(node, ['discount_price', 'min_price', 'price', 'market_price', 'coupon_price', 'actual_price', 'sku_min_price', 'good_price', 'origin_amount'])
-          || priceInfo.price || priceInfo.min_price || 0
+          pickDeepNumber(node, [
+            'discount_price', 'min_price', 'price', 'market_price', 'coupon_price', 'actual_price',
+            'sku_min_price', 'good_price', 'origin_amount', 'model_price', 'activity_price',
+            'promotion_price', 'final_price', 'sale_price', 'price_value', 'min_sku_price', 'amount'
+          ])
+          || priceInfo.price || priceInfo.min_price || priceInfo.discount_price || priceInfo.amount || 0
         ),
         rate: normalizeRate(
-          pickDeepNumber(node, ['cos_ratio', 'cos_ratio_str', 'commission_rate', 'commission', 'estimated_cos_ratio', 'cos_fee_rate'])
+          pickDeepNumber(node, [
+            'cos_ratio', 'cos_ratio_str', 'commission_rate', 'commission', 'estimated_cos_ratio',
+            'cos_fee_rate', 'cos_fee', 'estimated_commission', 'commission_rate_str', 'cosRatio'
+          ])
           || cosInfo.cos_ratio || cosInfo.cos_ratio_str || cosInfo.commission_rate || node.cos_ratio_str || 0
         ),
-        monthlySales: pickDeepNumber(node, ['sell_num', 'sales', 'monthly_sale', 'sell_num_30d', 'order_num', 'month_sale_num', 'sale_count', 'volume', 'sold_count']),
+        monthlySales: pickDeepNumber(node, [
+          'sell_num', 'sales', 'monthly_sale', 'sell_num_30d', 'order_num', 'month_sale_num',
+          'sale_count', 'volume', 'sold_count', 'sales_volume', 'month_sell_num', 'sale_num'
+        ]),
         category: pickDeepText(node, ['category_name', 'first_cname', 'second_cname', 'leaf_cname', 'cate_name', 'first_category_name', 'industry_name', 'cid_name']) || '',
         shop: pickDeepText(node, ['shop_name', 'shopName']) || '',
         images: collectImageUrls(node).slice(0, 6)
@@ -3286,6 +3356,10 @@ async function openHiddenLookupWindow(accountId, name, login, mode) {
 async function scrapeProductById({ id, name, login, mode, productId }) {
   const pid = String(productId || '').trim()
   if (!pid || !id) return null
+  // 先确保采集账号登录态还在，静默窗才能读到价/佣
+  try {
+    await ensurePublishLogin({ id, name, login, mode: mode || 'password', url: 'https://buyin.jinritemai.com/dashboard/merch-picking-cart' })
+  } catch { /* 继续尝试抓取 */ }
   let best = null
   // 只走百应选品车/广场接口，绝不打开 haohuo 消费者 H5（没价没佣还爱弹窗）
   const apiTries = [
@@ -3294,7 +3368,11 @@ async function scrapeProductById({ id, name, login, mode, productId }) {
     `https://buyin.jinritemai.com/pc/selection/decision/product_detail?product_id=${pid}`,
     `https://buyin.jinritemai.com/pc/selection/decision/product_detail?promotion_id=${pid}`,
     `https://buyin.jinritemai.com/pc/selection/decision/pack_detail?product_id=${pid}&enter_from=selection_cart`,
-    `https://buyin.jinritemai.com/pc/selection/decision/pack_detail?product_id=${pid}&origin_type=604`
+    `https://buyin.jinritemai.com/pc/selection/decision/pack_detail?product_id=${pid}&origin_type=604`,
+    `https://buyin.jinritemai.com/pc/selection/decision/pack_detail?id=${pid}`,
+    `https://buyin.jinritemai.com/square_pc_api/selection/decision/pack_detail?product_id=${pid}`,
+    `https://buyin.jinritemai.com/pc/selection/common/material_detail?product_id=${pid}`,
+    `https://buyin.jinritemai.com/pc/selection/common/product_detail?product_id=${pid}`
   ]
   const cartBodies = [
     { page: 1, page_no: 1, page_size: 50, size: 50, search_text: pid, product_id: pid },

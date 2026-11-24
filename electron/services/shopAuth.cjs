@@ -282,9 +282,19 @@ function mapNode(node, index) {
   const trend = pickTrend(node)
   const tags = collectTags(node)
   const namedCategory = namedText(node, ['category_name', 'first_cname', 'second_cname', 'leaf_cname', 'cate_name', 'first_category_name', 'industry_name', 'cid_name'])
-  const priceRaw = pickNumber(node, ['discount_price', 'min_price', 'price', 'market_price', 'coupon_price', 'actual_price', 'sku_min_price', 'good_price', 'origin_amount'])
-  const rateRaw = pickNumber(node, ['cos_ratio', 'cos_ratio_str', 'commission_rate', 'commission', 'estimated_cos_ratio', 'cos_fee_rate'])
-  const sales = pickNumber(node, ['sell_num', 'sales', 'monthly_sale', 'sell_num_30d', 'order_num', 'month_sale_num', 'sale_count', 'volume', 'sold_count'])
+  const priceRaw = pickNumber(node, [
+    'discount_price', 'min_price', 'price', 'market_price', 'coupon_price', 'actual_price',
+    'sku_min_price', 'good_price', 'origin_amount', 'model_price', 'activity_price',
+    'promotion_price', 'final_price', 'sale_price', 'price_value', 'amount'
+  ])
+  const rateRaw = pickNumber(node, [
+    'cos_ratio', 'cos_ratio_str', 'commission_rate', 'commission', 'estimated_cos_ratio',
+    'cos_fee_rate', 'cos_fee', 'estimated_commission', 'commission_rate_str', 'cosRatio'
+  ])
+  const sales = pickNumber(node, [
+    'sell_num', 'sales', 'monthly_sale', 'sell_num_30d', 'order_num', 'month_sale_num',
+    'sale_count', 'volume', 'sold_count', 'sales_volume', 'month_sell_num', 'sale_num'
+  ])
   // 分→元：仅当数值像「分」（≥1000）才除；100~999 按元保留，避免 150 元被当成 1.5
   const price = priceRaw >= 1000 ? Math.round(priceRaw) / 100 : priceRaw
   const rate = rateRaw >= 1000 ? Math.round(rateRaw) / 100
@@ -319,8 +329,14 @@ function mapCartCard(card, index) {
   const base = card.base_product_info || {}
   const biz = card.business_operation_info || {}
   const shop = card.base_shop_info || {}
-  const priceRaw = coerceNumber(base.price ?? base.discount_price ?? base.min_price ?? card.price ?? 0)
-  const rateRaw = coerceNumber(biz.cos_ratio ?? biz.cos_ratio_str ?? card.cos_ratio ?? card.cos_ratio_str ?? 0)
+  const priceRaw = coerceNumber(
+    base.price ?? base.discount_price ?? base.min_price ?? base.model_price ?? base.activity_price
+    ?? card.price ?? card.discount_price ?? card.min_price ?? 0
+  )
+  const rateRaw = coerceNumber(
+    biz.cos_ratio ?? biz.cos_ratio_str ?? biz.commission_rate ?? biz.estimated_cos_ratio
+    ?? card.cos_ratio ?? card.cos_ratio_str ?? card.commission_rate ?? 0
+  )
   const cover = imageUrl(typeof base.cover === 'string' ? base.cover : '')
     || imageUrl(typeof card.cover === 'string' ? card.cover : '')
     || namedImage(base)
@@ -333,7 +349,10 @@ function mapCartCard(card, index) {
   const category = namedText(card, ['category_name', 'first_cname', 'second_cname', 'leaf_cname', 'cate_name', 'first_category_name'])
     || namedText(base, ['category_name', 'first_cname', 'second_cname', 'leaf_cname', 'cate_name'])
     || '选品车'
-  const salesRaw = coerceNumber(biz.monthly_sale ?? biz.sell_num ?? biz.sell_num_30d ?? biz.order_num ?? card.sell_num ?? 0)
+  const salesRaw = coerceNumber(
+    biz.monthly_sale ?? biz.sell_num ?? biz.sell_num_30d ?? biz.order_num ?? biz.month_sell_num
+    ?? card.sell_num ?? card.monthly_sale ?? card.sales ?? 0
+  )
   return {
     id: String(card.product_id || base.product_id || card.product_id_str || base.product_id_str || ''),
     title,
@@ -765,6 +784,18 @@ async function lookup({ accountId, link, name, login, mode }) {
     {
       url: `https://buyin.jinritemai.com/pc/selection/decision/product_detail?product_id=${id}`,
       referer: 'https://buyin.jinritemai.com/dashboard/merch-picking-library'
+    },
+    {
+      url: `https://buyin.jinritemai.com/pc/selection/decision/pack_detail?id=${id}&enter_from=selection_cart`,
+      referer: 'https://buyin.jinritemai.com/dashboard/merch-picking-cart'
+    },
+    {
+      url: `https://buyin.jinritemai.com/pc/selection/common/material_detail?product_id=${id}`,
+      referer: 'https://buyin.jinritemai.com/dashboard/merch-picking-library'
+    },
+    {
+      url: `https://buyin.jinritemai.com/square_pc_api/selection/decision/pack_detail?product_id=${id}`,
+      referer: 'https://buyin.jinritemai.com/dashboard/merch-picking-cart'
     }
   ]
   for (const item of tries) {
