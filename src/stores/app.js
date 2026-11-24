@@ -90,6 +90,14 @@ function quotaLimit(account) {
   return 5
 }
 
+/** 成功成片才占额度；正在发给豆包的算暂扣，失败后释放 */
+function doubaoQuotaUsed(works, account, today) {
+  const mine = (works || []).filter((work) => work.doubaoAccountId === account.id || work.doubaoAccount === account.name)
+  const success = mine.filter((work) => work.videoPath && String(work.finishedAt || '').slice(0, 10) === today)
+  const holding = mine.filter((work) => work.quotaPending && work.status === '生成中')
+  return success.length + holding.length
+}
+
 export const useAppStore = defineStore('app', {
   state: () => ({
     ready: false,
@@ -413,6 +421,7 @@ export const useAppStore = defineStore('app', {
         const payload = this.buildPublishPayload(item, account)
         item.publishTitle = payload.title
         item.publishTags = payload.tags
+        const statusBefore = item.status
         item.status = '发布中'
         item.publishAccount = account.name
         item.publishAccountId = account.id
@@ -436,12 +445,13 @@ export const useAppStore = defineStore('app', {
           }
           if (result?.loginStatus) account.loginStatus = result.loginStatus
           if (!result?.ok || !result.attached) {
-            item.status = '审核通过'
+            item.status = statusBefore === '已发布' ? '已发布' : '审核通过'
             this.endTask(taskId, result?.message || '没有放进上传页', 'failed')
             this.addLog('warning', '发布', `${item.title}：${result?.message || '没有放进上传页'}`)
             continue
           }
-          posted += 1
+          item.lastPublishClicked = Boolean(result.published)
+          if (result.published) posted += 1
           if (result.published) {
             item.status = '已发布'
             item.finishedAt = formatTime(new Date())
@@ -449,13 +459,13 @@ export const useAppStore = defineStore('app', {
             if (result.deleted) item.sourceDeleted = true
             this.notifyWebhook(`【huang++pro】已发布：${item.title}`)
           } else {
-            // 只打开了上传页、未点到「发布」→ 仍算已审核，方便定时再发
-            item.status = '审核通过'
+            // 没点到抖音「发布」：原先已发布的保持已发布，方便再点一次；其余回到已审核给定时任务
+            item.status = statusBefore === '已发布' ? '已发布' : '审核通过'
           }
           this.endTask(taskId, result.message || '发布流程已走完')
           this.addLog(result.published ? 'success' : 'warning', '发布', result.message || `${item.title} 已打开上传页`)
         } catch (error) {
-          item.status = '审核通过'
+          item.status = statusBefore === '已发布' ? '已发布' : '审核通过'
           const message = /could not be cloned|An object could not be cloned/i.test(String(error?.message || error))
             ? '发布参数序列化失败，已重试修复；请再点一次立即执行'
             : (error.message || '发布中断')
@@ -480,6 +490,19 @@ export const useAppStore = defineStore('app', {
         total += await this.publishWorksBatch(ready, account)
       }
       return total ? `已用 ${list.length} 个账号发出 ${total} 条` : this.explainNoPublishReady()
+    },
+    async republishWork(workId) {
+      const work = this.works.find((item) => item.id === workId)
+      if (!work) return '没有找到这条作品'
+      if (!work.videoPath) return '这条没有成片，不能再发布'
+      if (!window.tujian?.publishWork) return '请在桌面窗口里发布'
+      const account = this.publishAccounts.find((item) => item.id === work.publishAccountId)
+        || this.publishAccounts.find((item) => item.enabled)
+        || this.publishAccounts[0]
+      if (!account) return '先添加一个发布账号'
+      this.addLog('info', '发布', `再发布「${work.title}」，上次状态是 ${work.status}`)
+      await this.publishWorksBatch([work], account)
+      return work.lastPublishClicked ? '' : '已再次打开上传页，但没有确认点到「发布」。作品仍可再点一次'
     },
     mergePlazaPage(payload) {
       const accountId = payload?.accountId || ''
@@ -1102,8 +1125,7 @@ export const useAppStore = defineStore('app', {
         const mine = this.works.filter((work) => work.doubaoAccountId === account.id || work.doubaoAccount === account.name)
         const done = mine.filter((work) => work.videoPath || ['已生成', '审核通过', '发布中', '已发布'].includes(work.status))
         const failed = mine.filter((work) => work.failReason && !work.videoPath && work.status !== '生成中')
-        const todayDone = done.filter((work) => String(work.finishedAt || '').slice(0, 10) === today)
-        const used = account.quotaDate === today ? limit : todayDone.length
+        const used = doubaoQuotaUsed(this.works, account, today)
         account.quota = `${used}/${limit}`
         const latest = done.slice().sort((a, b) => String(b.finishedAt || '').localeCompare(String(a.finishedAt || '')))[0]
         account.recent = latest ? `${latest.title} · ${latest.finishedAt}` : `成功 ${done.length} · 失败 ${failed.length}`
@@ -1262,13 +1284,18 @@ export const useAppStore = defineStore('app', {
       for (let i = generatePending.length - 1; i >= 0; i -= 1) {
         if (generatePending[i] === workId) generatePending.splice(i, 1)
       }
-      const account = this.doubaoAccounts.find((item) => item.id === work.doubaoAccountId)
-        || this.doubaoAccount()
+      const today = String(this.systemNow || formatTime(new Date())).slice(0, 10)
+      const account = (this.doubaoAccounts || []).find((item) => {
+        if (!item.enabled || item.quotaDate === today) return false
+        return doubaoQuotaUsed(this.works, item, today) < quotaLimit(item)
+      })
       if (!account) {
         work.status = '待生成'
-        this.addLog('error', '豆包', '没有可用的豆包账号')
-        return '先添加一个豆包账号'
+        this.addLog('error', '豆包', '没有还有额度的豆包账号')
+        return '豆包账号今日额度都用完了，或还没有添加账号'
       }
+      work.doubaoAccountId = account.id
+      work.doubaoAccount = account.name
       // 同账号卡死时放行，重新生成要马上开窗
       busyDoubao.delete(account.id)
       this.persist()
@@ -1322,8 +1349,11 @@ export const useAppStore = defineStore('app', {
         this.persist()
         return
       }
-      const today = new Date().toISOString().slice(0, 10)
-      const accounts = this.doubaoAccounts.filter((item) => item.enabled && item.quotaDate !== today && !skipped.includes(item.id) && !busyDoubao.has(item.id))
+      const today = String(this.systemNow || formatTime(new Date())).slice(0, 10)
+      const accounts = this.doubaoAccounts.filter((item) => {
+        if (!item.enabled || item.quotaDate === today || skipped.includes(item.id) || busyDoubao.has(item.id)) return false
+        return doubaoQuotaUsed(this.works, item, today) < quotaLimit(item)
+      })
       const account = accounts.find((item) => item.loginStatus === '已登录') || accounts[0]
       if (!account) {
         const waiting = this.doubaoAccounts.some((item) => item.enabled && busyDoubao.has(item.id))
@@ -1411,7 +1441,9 @@ export const useAppStore = defineStore('app', {
       work.image = shots[0]
       const slot = work.doubaoSlot || `gen-${work.id}`
       work.doubaoSlot = slot
-      this.addLog('info', '豆包', `${account.name} 正在打开豆包，发送提示词和 ${shots.length} 张商品图`)
+      work.quotaPending = true
+      this.syncDoubaoStats()
+      this.addLog('info', '豆包', `${account.name} 正在打开豆包，发送提示词和 ${shots.length} 张商品图（额度先占 1，失败会退回）`)
       ensureDoubaoRules(this.settings)
       const payload = plainGeneratePayload({
         account,
@@ -1443,15 +1475,18 @@ export const useAppStore = defineStore('app', {
       }
       if (this.isWorkCancelled(workId)) {
         cancelledWorks.delete(String(workId))
+        work.quotaPending = false
         work.status = '待生成'
         work.failReason = '已在任务中心手动结束'
         this.endTask(taskId, work.failReason, 'cancelled')
+        this.syncDoubaoStats()
         this.persist()
         return
       }
       if (result?.loginStatus) account.loginStatus = result.loginStatus
       markConfirm(result)
       if (result?.quota) {
+        work.quotaPending = false
         account.quotaDate = today
         account.worker = '空闲'
         this.endTask(taskId, '额度不够，换号重试')
@@ -1486,6 +1521,7 @@ export const useAppStore = defineStore('app', {
         work.status = '已生成'
         work.progress = 100
         work.finishedAt = formatTime(new Date())
+        work.quotaPending = false
         account.worker = '空闲'
         if (!this.settings.outputDir && result.saveDir) this.settings.outputDir = result.saveDir
         this.syncDoubaoStats()
@@ -1498,6 +1534,7 @@ export const useAppStore = defineStore('app', {
       }
       work.status = '生成失败'
       work.progress = 0
+      work.quotaPending = false
       work.failReason = result?.message || '网页版豆包没有返回视频'
       account.worker = '空闲'
       this.endTask(taskId, work.failReason, 'failed')
@@ -1507,6 +1544,7 @@ export const useAppStore = defineStore('app', {
       } catch (error) {
         work.status = '生成失败'
         work.progress = 0
+        work.quotaPending = false
         work.failReason = /could not be cloned/i.test(String(error?.message || error))
           ? '参数无法传给桌面进程，请再点一次重新生成'
           : (error.message || '生成中断')

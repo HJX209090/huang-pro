@@ -452,6 +452,85 @@ function clickTextScript(labels) {
   })()`
 }
 
+/** 只点文案完全一致的按钮，避免「登录」抢在「手机号登录」前面 */
+function clickExactScript(label) {
+  return `(() => {
+    const label = ${JSON.stringify(String(label || ''))}
+    const compact = (value) => String(value || '').replace(/\\s+/g, '')
+    const nodes = []
+    const walk = (root) => {
+      if (!root || !root.querySelectorAll) return
+      root.querySelectorAll('button, a, [role="button"], div, span, li').forEach((el) => nodes.push(el))
+      root.querySelectorAll('*').forEach((el) => { if (el.shadowRoot) walk(el.shadowRoot) })
+    }
+    walk(document)
+    const hits = nodes.filter((el) => {
+      if (compact(el.innerText || el.textContent) !== label) return false
+      const rect = el.getBoundingClientRect()
+      return rect.width > 36 && rect.height > 18 && rect.bottom > 0 && rect.top < window.innerHeight + 40
+    })
+    hits.sort((a, b) => {
+      const ra = a.getBoundingClientRect()
+      const rb = b.getBoundingClientRect()
+      return (rb.width * rb.height) - (ra.width * ra.height)
+    })
+    if (!hits[0]) return 'miss'
+    ;(hits[0].closest('button, a, [role="button"]') || hits[0]).click()
+    return 'clicked'
+  })()`
+}
+
+/** 抖音电商首页：点右上角登录，再点菜单里的「达人工作台」 */
+function buyinPortalStepScript() {
+  return `(() => {
+    const compact = (value) => String(value || '').replace(/\\s+/g, '')
+    const body = compact(document.body?.innerText || '')
+    if (/选品车|选品广场|精选联盟|达人广场|带货数据|商品决策/.test(body) && !/加入抖音电商/.test(body)) return 'in'
+    const nodes = []
+    const walk = (root) => {
+      if (!root || !root.querySelectorAll) return
+      root.querySelectorAll('button, a, [role="button"], [role="menuitem"], div, span, li').forEach((el) => nodes.push(el))
+      root.querySelectorAll('*').forEach((el) => { if (el.shadowRoot) walk(el.shadowRoot) })
+    }
+    walk(document)
+    const visible = (el) => {
+      const rect = el.getBoundingClientRect()
+      return rect.width > 16 && rect.height > 12 && rect.bottom > 0 && rect.top < window.innerHeight + 20
+    }
+    const talent = nodes.find((el) => visible(el) && compact(el.innerText || el.textContent) === '达人工作台')
+    if (talent) {
+      ;(talent.closest('a, li, button, [role="menuitem"]') || talent).click()
+      return 'talent'
+    }
+    const logins = nodes.filter((el) => visible(el) && compact(el.innerText || el.textContent) === '登录')
+    logins.sort((a, b) => {
+      const ra = a.getBoundingClientRect()
+      const rb = b.getBoundingClientRect()
+      return ra.top - rb.top || rb.left - ra.left
+    })
+    if (logins[0]) {
+      ;(logins[0].closest('button, a, [role="button"]') || logins[0]).click()
+      return 'login'
+    }
+    return 'miss'
+  })()`
+}
+
+async function enterBuyinTalent(win) {
+  if (!win || win.isDestroyed()) return 'miss'
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const step = await runInFrames(win, buyinPortalStepScript()).catch(() => 'miss')
+    runtimeLog.info('buyin.entry', `第 ${attempt + 1} 次门户 ${step || 'miss'}`)
+    if (step === 'in') return 'in'
+    if (step === 'talent') {
+      await wait(1600)
+      return 'talent'
+    }
+    await wait(650)
+  }
+  return 'miss'
+}
+
 function phoneScript(phone) {
   return `(() => {
     const phone = ${JSON.stringify(String(phone || '').replace(/\\D/g, '').slice(-11))}
@@ -600,8 +679,11 @@ async function autoSendPhoneCode(win, phone, { times = 10 } = {}) {
   let last = 'miss'
   for (let attempt = 0; attempt < times; attempt += 1) {
     if (win.isDestroyed()) return 'destroyed'
-    await runInFrames(win, clickTextScript(['登录', '立即登录', '手机号登录', '验证码登录', '短信登录']))
-    await wait(500)
+    const phoneEntry = await runInFrames(win, clickExactScript('手机号登录'))
+    if (phoneEntry !== 'clicked') {
+      await runInFrames(win, clickExactScript('验证码登录'))
+    }
+    await wait(700)
     last = await runInFrames(win, phoneScript(mobile))
     if (last === 'sent') {
       runtimeLog.success('login.sms', `第 ${attempt + 1} 次已发送验证码`)
@@ -831,6 +913,7 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
     await applyProxy(existing.webContents.session)
     if (prompt) await fillPrompt(existing, prompt)
     // 未登录：主动填账密 / 发短信；扫码模式才点扫码
+    if (!direct && onBuyin) await enterBuyinTalent(existing)
     if (!direct) {
       const secret = secrets.read(id)
       const account = String(login || secret?.login || '').trim()
@@ -949,6 +1032,15 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
 
   if (sessionOk) {
     return { ok: true, loginStatus: '已登录', direct: true, scope: onBuyin ? 'buyin' : '', message: onBuyin ? '已进入达人工作台（与创作者共用同一浏览器会话）' : '' }
+  }
+
+  if (onBuyin) {
+    await enterBuyinTalent(win)
+    await wait(800)
+    cookies = await ses.cookies.get({})
+    if (buyinLoggedIn(cookies)) {
+      return { ok: true, loginStatus: '已登录', direct: true, scope: 'buyin', message: '已进入达人工作台' }
+    }
   }
 
   // 未登录：优先自动填账密（新建发布账号的主路径）
@@ -1151,6 +1243,7 @@ async function bootstrapPublishLogin({ id, name, login, mode }) {
   })
   const buyinWin = windows.get(sessionKey('publish', id, buyinUrl)) || findPublishMainWindow(id)
   if (buyinWin && !buyinWin.isDestroyed()) {
+    await enterBuyinTalent(buyinWin)
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const clicked = await runInFrames(buyinWin, clickTextScript(['扫码登录', '扫码']))
       if (clicked === 'clicked') break

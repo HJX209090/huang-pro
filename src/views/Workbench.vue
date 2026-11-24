@@ -41,7 +41,7 @@
         <el-button type="danger" plain @click="reject">驳回</el-button>
       </div>
       <p v-else-if="current?.status === '审核通过'" class="review-note">已审核。可直接发布到抖音，或等定时任务自动发。</p>
-      <p v-else-if="current?.status === '已发布'" class="review-note">已发布完成。</p>
+      <p v-else-if="current?.status === '已发布'" class="review-note">软件已点过发布。若抖音上没有这条，可再点下面的「再发布」。</p>
       <el-input v-if="current?.status === '已生成'" v-model="reason" placeholder="驳回原因，不填则记为画面不通过" />
       <el-button style="width: 100%; margin: 10px 0" @click="playCurrent">直接播放</el-button>
       <div class="hotkeys">
@@ -77,7 +77,7 @@
         </div>
         <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px">
           <el-button v-if="current.status === '待生成' || current.status === '生成中'" type="primary" @click="store.kickGenerate(current.id)">用豆包生成 10 秒</el-button>
-          <el-button v-if="current.videoPath" type="primary" :loading="publishing" @click="publish">发布到抖音</el-button>
+          <el-button v-if="current.videoPath" type="primary" :loading="publishing" @click="publish">{{ current.status === '已发布' || current.status === '发布中' ? '再发布到抖音' : '发布到抖音' }}</el-button>
           <el-button v-if="current.productId" @click="store.openPrompt([current.productId])">按原商品再生成</el-button>
         </div>
       </template>
@@ -285,6 +285,7 @@ async function publish() {
     const payload = store.buildPublishPayload(current.value, account)
     current.value.publishTitle = payload.title
     current.value.publishTags = payload.tags
+    const statusBefore = current.value.status
     const result = await window.tujian.publishWork(payload)
     if (result?.loginStatus) account.loginStatus = result.loginStatus
     if (!result?.ok || !result.attached) {
@@ -295,7 +296,7 @@ async function publish() {
     current.value.publishAccountId = account.id
     current.value.publishAccount = account.name
     // 未真正点到抖音「发布」时保持已审核，避免定时任务找不到成片
-    current.value.status = result.published ? '已发布' : '审核通过'
+    current.value.status = result.published ? '已发布' : (statusBefore === '已发布' ? '已发布' : '审核通过')
     if (result.published && result.deleted) current.value.sourceDeleted = true
     if (result.published) store.notifyWebhook(`【huang++pro】已发布：${current.value.title}`)
     await store.flush()

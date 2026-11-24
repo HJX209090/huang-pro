@@ -67,6 +67,7 @@
           <template #default="{ row }">
             <div class="row-ops">
               <el-button v-if="canReview(row)" link type="primary" @click="open(row)">审核</el-button>
+              <el-button v-if="canRepublish(row)" link type="primary" :loading="publishId === row.id" @click="republish(row)">再发布</el-button>
               <el-button v-if="canRegenerate(row)" link type="primary" :loading="regenId === row.id" @click="regenerate(row)">重新生成</el-button>
               <el-button v-if="row.videoPath" link type="primary" @click="strip(row)">去水印</el-button>
               <el-button link type="danger" @click="remove(row)">删除</el-button>
@@ -91,6 +92,7 @@
             <div class="goods-sub">{{ work.platform || '抖音' }} · {{ work.createdAt }}</div>
             <div v-if="work.failReason" class="fail-line">{{ work.failReason }}</div>
             <div class="work-actions" @click.stop>
+              <el-button v-if="canRepublish(work)" size="small" type="primary" :loading="publishId === work.id" @click="republish(work)">再发布</el-button>
               <el-button v-if="canRegenerate(work)" size="small" type="primary" :loading="regenId === work.id" @click="regenerate(work)">重新生成</el-button>
               <el-button v-if="canReview(work)" size="small" @click="open(work)">审核</el-button>
             </div>
@@ -236,6 +238,7 @@ async function strip(work) {
 }
 
 const regenId = ref('')
+const publishId = ref('')
 
 function canReview(work) {
   // 仅「已生成/待审核」可点审核；审核通过后不再出现
@@ -244,6 +247,24 @@ function canReview(work) {
 
 function canRegenerate(work) {
   return ['已生成', '审核通过', '生成失败', '待生成', '审核失败', '已发布'].includes(work?.status)
+}
+
+function canRepublish(work) {
+  return Boolean(work?.videoPath) && ['已发布', '发布中', '审核通过'].includes(work.status)
+}
+
+async function republish(work) {
+  if (publishId.value) return ElMessage.info('已有一条正在发布')
+  publishId.value = work.id
+  try {
+    const message = await store.republishWork(work.id)
+    if (message) ElMessage.warning(message)
+    else ElMessage.success('已再次走完发布流程')
+  } catch (error) {
+    ElMessage.error(error.message || '再发布失败')
+  } finally {
+    publishId.value = ''
+  }
 }
 
 async function regenerate(work) {
