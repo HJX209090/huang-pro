@@ -332,22 +332,58 @@ async function ensurePublishLogin({ id, name, login, mode, url, captcha }) {
 
 function loginScript(login, password) {
   return `(() => {
-    const login = ${JSON.stringify(String(login))}
-    const password = ${JSON.stringify(String(password))}
-    const pass = document.querySelector('input[type="password"]')
+    const login = ${JSON.stringify(String(login || ''))}
+    const password = ${JSON.stringify(String(password || ''))}
+    const compact = (value) => String(value || '').replace(/\\s+/g, '')
+    const nodes = []
+    const walk = (root) => {
+      if (!root || !root.querySelectorAll) return
+      root.querySelectorAll('input, button, [role="button"], a, span, div, li').forEach((el) => nodes.push(el))
+      root.querySelectorAll('*').forEach((el) => { if (el.shadowRoot) walk(el.shadowRoot) })
+    }
+    walk(document)
+    const clickTab = (labels) => {
+      const hit = nodes.find((el) => {
+        const text = compact(el.innerText || el.textContent)
+        if (!text || text.length > 10) return false
+        const rect = el.getBoundingClientRect()
+        if (!(rect.width > 20 && rect.height > 12)) return false
+        return labels.some((label) => text === label || text.includes(label))
+      })
+      if (!hit) return false
+      ;(hit.closest('button, [role="button"], a, li, div') || hit).click()
+      return true
+    }
+    clickTab(['密码登录', '账号登录', '账密登录', '邮箱登录'])
+    const inputs = nodes.filter((el) => el.tagName === 'INPUT' && !el.disabled && el.type !== 'hidden')
+    const pass = inputs.find((el) => el.type === 'password')
+      || inputs.find((el) => /密码|password/i.test((el.placeholder || '') + (el.name || '') + (el.getAttribute('aria-label') || '')))
     if (!pass) return 'no-form'
-    const text = Array.from(document.querySelectorAll('input')).find((el) => ['text', 'tel', 'email'].includes(el.type) && !el.disabled)
+    const account = inputs.find((el) => {
+      if (el === pass) return false
+      const hint = ((el.placeholder || '') + (el.name || '') + (el.getAttribute('aria-label') || '')).toLowerCase()
+      if (/验证码|code|search/.test(hint)) return false
+      return ['text', 'tel', 'email', 'number'].includes(el.type) || /手机|账号|邮箱|账户|user|account|phone|mail/.test(hint)
+    }) || inputs.find((el) => el !== pass && ['text', 'tel', 'email'].includes(el.type))
     const setValue = (el, value) => {
       if (!el) return
+      el.focus()
       const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')
       proto.set.call(el, value)
-      el.dispatchEvent(new Event('input', { bubbles: true }))
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }))
       el.dispatchEvent(new Event('change', { bubbles: true }))
+      el.dispatchEvent(new Event('blur', { bubbles: true }))
     }
-    setValue(text, login)
-    setValue(pass, password)
-    const button = Array.from(document.querySelectorAll('button, [role="button"]')).find((el) => /登录|登陆/.test(el.innerText || ''))
-    if (button) button.click()
+    if (account && login) setValue(account, login)
+    if (password) setValue(pass, password)
+    const button = nodes.find((el) => {
+      const text = compact(el.innerText || el.textContent)
+      if (!text || text.length > 8) return false
+      if (!/^(登录|登陆|立即登录|确认登录)$/.test(text) && !/^登录|登陆/.test(text)) return false
+      const rect = el.getBoundingClientRect()
+      return rect.width > 40 && rect.height > 24
+    })
+    if (button) (button.closest('button, [role="button"]') || button).click()
     return 'filled'
   })()`
 }
@@ -375,31 +411,56 @@ function clickTextScript(labels) {
 
 function phoneScript(phone) {
   return `(() => {
-    const phone = ${JSON.stringify(String(phone || ''))}
+    const phone = ${JSON.stringify(String(phone || '').replace(/\\D/g, '').slice(-11))}
     const compact = (value) => String(value || '').replace(/\\s+/g, '')
-    document.querySelectorAll('input[type="checkbox"]').forEach((el) => { if (!el.checked) el.click() })
-    document.querySelectorAll('[role="checkbox"][aria-checked="false"]').forEach((el) => el.click())
-    const agree = Array.from(document.querySelectorAll('span, label, p, div')).find((el) => {
-      const text = compact(el.innerText)
-      return text.length > 0 && text.length <= 28 && text.includes('已阅读')
+    const nodes = []
+    const walk = (root) => {
+      if (!root || !root.querySelectorAll) return
+      root.querySelectorAll('input, button, [role="button"], a, span, div, label, p').forEach((el) => nodes.push(el))
+      root.querySelectorAll('*').forEach((el) => { if (el.shadowRoot) walk(el.shadowRoot) })
+    }
+    walk(document)
+    nodes.filter((el) => el.tagName === 'INPUT' && el.type === 'checkbox' && !el.checked).forEach((el) => el.click())
+    nodes.filter((el) => el.getAttribute && el.getAttribute('role') === 'checkbox' && el.getAttribute('aria-checked') === 'false').forEach((el) => el.click())
+    const agree = nodes.find((el) => {
+      const text = compact(el.innerText || el.textContent)
+      return text.length > 0 && text.length <= 36 && /已阅读|同意.*协议|我已阅读/.test(text)
     })
-    if (agree) agree.click()
-    const input = Array.from(document.querySelectorAll('input')).find((el) => {
+    if (agree) (agree.closest('label, span, div') || agree).click()
+    const clickTab = (labels) => {
+      const hit = nodes.find((el) => {
+        const text = compact(el.innerText || el.textContent)
+        if (!text || text.length > 12) return false
+        return labels.some((label) => text === label || text.includes(label))
+      })
+      if (!hit) return false
+      ;(hit.closest('button, [role="button"], a, li, div') || hit).click()
+      return true
+    }
+    clickTab(['验证码登录', '短信登录', '手机号登录', '验证码'])
+    const inputs = nodes.filter((el) => el.tagName === 'INPUT' && !el.disabled && el.type !== 'hidden' && el.type !== 'password')
+    const input = inputs.find((el) => {
       const hint = (el.placeholder || '') + (el.name || '') + (el.getAttribute('aria-label') || '')
-      return ['tel', 'text', 'number'].includes(el.type) && !el.disabled && !/验证码|密码/.test(hint)
-    })
+      return /手机|电话|mobile|phone/i.test(hint) && !/验证码|密码|code/.test(hint)
+    }) || inputs.find((el) => el.type === 'tel')
+      || inputs.find((el) => {
+        const hint = (el.placeholder || '') + (el.name || '')
+        return ['text', 'number'].includes(el.type) && !/验证码|密码|code|搜索/.test(hint)
+      })
     if (!input || !phone) return 'no-input'
     input.focus()
     const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')
     proto.set.call(input, phone)
     input.dispatchEvent(new InputEvent('input', { bubbles: true, data: phone, inputType: 'insertText' }))
     input.dispatchEvent(new Event('change', { bubbles: true }))
-    const send = Array.from(document.querySelectorAll('button, [role="button"], a, span, div')).find((el) => {
-      const text = compact(el.innerText)
-      return text.length > 0 && text.length <= 8 && /获取验证码|发送验证码/.test(text)
+    input.dispatchEvent(new Event('blur', { bubbles: true }))
+    const send = nodes.find((el) => {
+      const text = compact(el.innerText || el.textContent)
+      if (!text || text.length > 12) return false
+      return /获取验证码|发送验证码|获取短信|发送短信/.test(text)
     })
-    if (!send) return 'no-button'
-    const button = send.closest('button, [role="button"]') || send
+    if (!send) return 'typed'
+    const button = send.closest('button, [role="button"], a') || send
     if (button.disabled || button.getAttribute('aria-disabled') === 'true') return 'wait'
     button.click()
     return 'sent'
@@ -465,6 +526,52 @@ async function fillLogin(win, login, password) {
     } catch { /* 这个框架没有登录框 */ }
   }
   return filled ? 'filled' : 'no-form'
+}
+
+/** 反复切到密码登录并填写账密（百应/创作者通用） */
+async function autoFillPasswordLogin(win, login, password, { times = 8 } = {}) {
+  const account = String(login || '').trim()
+  const pass = String(password || '').trim()
+  if (!win || win.isDestroyed() || !account || !pass) return 'skip'
+  runtimeLog.info('login.fill', `自动填账密 account=${account.slice(0, 3)}***`)
+  for (let attempt = 0; attempt < times; attempt += 1) {
+    if (win.isDestroyed()) return 'destroyed'
+    await runInFrames(win, clickTextScript(['密码登录', '账号登录', '账密登录', '邮箱登录', '手机号登录']))
+    await wait(500)
+    const filled = await fillLogin(win, account, pass)
+    if (filled === 'filled') {
+      runtimeLog.success('login.fill', `第 ${attempt + 1} 次已填入账密并点登录`)
+      return 'filled'
+    }
+    await wait(700)
+  }
+  runtimeLog.warn('login.fill', '未找到密码登录表单')
+  return 'no-form'
+}
+
+/** 自动填手机号并点获取验证码 */
+async function autoSendPhoneCode(win, phone, { times = 10 } = {}) {
+  const mobile = String(phone || '').replace(/\D/g, '').slice(-11)
+  if (!win || win.isDestroyed() || mobile.length < 6) return 'skip'
+  runtimeLog.info('login.sms', `自动填手机号 ${mobile.slice(0, 3)}****${mobile.slice(-4)}`)
+  let last = 'miss'
+  for (let attempt = 0; attempt < times; attempt += 1) {
+    if (win.isDestroyed()) return 'destroyed'
+    await runInFrames(win, clickTextScript(['验证码登录', '短信登录', '手机号登录', '登录', '验证码']))
+    await wait(450)
+    last = await runInFrames(win, phoneScript(mobile))
+    if (last === 'sent') {
+      runtimeLog.success('login.sms', `第 ${attempt + 1} 次已发送验证码`)
+      return 'sent'
+    }
+    if (last === 'typed' || last === 'wait') {
+      runtimeLog.info('login.sms', `手机号已填 status=${last}`)
+      if (last === 'typed') return 'typed'
+    }
+    await wait(800)
+  }
+  runtimeLog.warn('login.sms', `发码未完成 last=${last}`)
+  return last
 }
 
 function wait(ms) {
@@ -601,17 +708,25 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
     }
     await applyProxy(existing.webContents.session)
     if (prompt) await fillPrompt(existing, prompt)
-    // 分区已有登录态时绝不再点扫码
-    if (!direct && mode === 'qr' && !onBuyin) await runInFrames(existing, clickTextScript(['扫码登录', '扫码']))
-    if (!direct && onBuyin && mode !== 'qr') {
-      await runInFrames(existing, clickTextScript(['密码登录']))
+    // 未登录：主动填账密 / 发短信；扫码模式才点扫码
+    if (!direct) {
       const secret = secrets.read(id)
-      if (secret?.password && mode !== 'code') await fillLogin(existing, login || secret.login, secret.password)
+      const account = String(login || secret?.login || '').trim()
+      if (secret?.password && account && mode !== 'qr' && mode !== 'code') {
+        await autoFillPasswordLogin(existing, account, secret.password, { times: 8 })
+        await wait(1000)
+        cookies = await existing.webContents.session.cookies.get({})
+        direct = kind === 'doubao' ? loggedIn(cookies, kind) : (buyinLoggedIn(cookies) || creatorLoggedIn(cookies))
+      } else if (mode === 'code' && account) {
+        await autoSendPhoneCode(existing, account, { times: 8 })
+      } else if (mode === 'qr') {
+        await runInFrames(existing, clickTextScript(['扫码登录', '扫码']))
+      }
     }
     if (kind === 'doubao' && !direct) await watchCaptcha(existing, captcha)
     const openedMessage = prompt
       ? '提示词已填进豆包，请生成 10 秒视频后把成片选回作品'
-      : (direct ? '已进入达人工作台（与创作者共用同一浏览器会话）' : '')
+      : (direct ? '已进入达人工作台（与创作者共用同一浏览器会话）' : '已尝试自动填写登录信息，请在窗口确认')
     return { ok: true, loginStatus: direct ? '已登录' : '待确认', direct, scope: onBuyin ? 'buyin' : '', message: openedMessage }
   }
   if (existing && !existing.isDestroyed() && force) existing.close()
@@ -673,8 +788,6 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
   let sessionOk = kind === 'doubao'
     ? loggedIn(cookies, kind)
     : (onCreator ? hasCreator : (hasBuyin || loggedIn(cookies, kind)))
-  const preferReuse = sessionOk || Boolean(already)
-
   if (onCreator) {
     const bridged = await bridgeBuyinToCreator(win, url || 'https://creator.douyin.com/creator-micro/content/upload', { quiet })
     cookies = await ses.cookies.get({})
@@ -689,34 +802,53 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
         message: bridged.message || '已在同一浏览器会话打开创作者中心'
       }
     }
+    // 创作者登录墙：有账密就主动填（抖音创作账号密码）
+    if (secret?.password && account && method !== 'qr') {
+      await autoFillPasswordLogin(win, account, secret.password, { times: 10 })
+      await wait(1500)
+      cookies = await ses.cookies.get({})
+      if (creatorLoggedIn(cookies)) {
+        return { ok: true, loginStatus: '已登录', direct: true, scope: 'creator', sameBrowser: true, message: '已自动填写创作者账密并登录' }
+      }
+    }
     return {
       ok: true,
       loginStatus: '待确认',
       direct: false,
       scope: 'creator',
       sameBrowser: true,
-      message: bridged.message || '请在本窗口扫抖音码。达人与创作者必须同一浏览器；扫完后免二次扫码'
+      message: bridged.message || '请在本窗口扫抖音码或确认账密。达人与创作者必须同一浏览器；登录后免二次扫码'
     }
   }
 
   if (sessionOk) {
     return { ok: true, loginStatus: '已登录', direct: true, scope: onBuyin ? 'buyin' : '', message: onBuyin ? '已进入达人工作台（与创作者共用同一浏览器会话）' : '' }
   }
-  // 调用方声称已登录但 cookie 实际没了：有密码就自动填，绝不先逼扫码
-  if (preferReuse && secret?.password && method !== 'code') {
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      await wait(900)
-      if (onBuyin) await runInFrames(win, clickTextScript(['密码登录', '账号登录']))
-      await fillLogin(win, account, secret.password)
-      await wait(1200)
-      cookies = await ses.cookies.get({})
-      if (buyinLoggedIn(cookies) || loggedIn(cookies, kind)) {
-        return { ok: true, loginStatus: '已登录', direct: true, scope: onBuyin ? 'buyin' : '', message: '登录态已刷新，已进入页面' }
-      }
+
+  // 未登录：优先自动填账密（新建发布账号的主路径）
+  if (secret?.password && account && method !== 'qr' && method !== 'code') {
+    await wait(800)
+    await autoFillPasswordLogin(win, account, secret.password, { times: 10 })
+    await wait(1500)
+    if (kind === 'doubao') await watchCaptcha(win, captcha)
+    cookies = await ses.cookies.get({})
+    if (buyinLoggedIn(cookies) || loggedIn(cookies, kind)) {
+      return { ok: true, loginStatus: '已登录', direct: true, scope: onBuyin ? 'buyin' : '', message: '已自动填写账号密码并登录' }
+    }
+    return {
+      ok: true,
+      loginStatus: '待确认',
+      scope: onBuyin ? 'buyin' : '',
+      message: '已尝试自动填写账号密码，请在窗口里确认登录（验证码/滑块需人工过一下）'
     }
   }
-  // 仅在真正没有 cookie 时才扫码；分区已登录过绝不再逼扫
-  if (!sessionOk && !preferReuse && method === 'qr') {
+
+  if (method === 'code' && !skipSend) {
+    return requestCode({ kind, id, name, login: account, captcha })
+  }
+
+  // 仅扫码模式才点扫码
+  if (method === 'qr') {
     for (let attempt = 0; attempt < 6; attempt += 1) {
       await wait(800)
       const clicked = await runInFrames(win, clickTextScript(['扫码登录', '扫码']))
@@ -725,18 +857,7 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
     if (kind === 'doubao') await watchCaptcha(win, captcha)
     return { ok: true, loginStatus: '待确认', message: '请用抖音 App 扫描窗口里的二维码。扫完后这个账号会记住登录。' }
   }
-  if (!loggedIn(cookies, kind) && method === 'code' && !skipSend) {
-    return requestCode({ kind, id, name, login: account, captcha })
-  } else if (secret?.password && method !== 'code' && method !== 'qr') {
-    for (let attempt = 0; attempt < 4 && !(onBuyin ? buyinLoggedIn(cookies) : loggedIn(cookies, kind)); attempt += 1) {
-      await wait(1200)
-      if (onBuyin) await runInFrames(win, clickTextScript(['密码登录']))
-      await fillLogin(win, account, secret.password)
-      await wait(800)
-      if (kind === 'doubao') await watchCaptcha(win, captcha)
-      cookies = await ses.cookies.get({})
-    }
-  }
+
   cookies = await ses.cookies.get({})
   const signed = onBuyin ? buyinLoggedIn(cookies) : loggedIn(cookies, kind)
   return { ok: true, loginStatus: signed ? '已登录' : '待确认', scope: onBuyin ? 'buyin' : '', message: signed && onBuyin ? '已进入达人工作台（与创作者共用同一浏览器会话）' : '' }
@@ -775,48 +896,59 @@ async function requestCode({ kind, id, name, login, captcha }) {
   }
 }
 
-/** 新建账号后：自动打开豆包 → 填手机号并发码 → 切到扫码登录，验证弹窗自动处理 */
+/** 新建账号后：自动打开豆包 → 填手机号 → 主动点获取验证码（验证弹窗自动处理） */
 async function bootstrapDoubaoLogin({ id, name, login, captcha }) {
-  const phone = String(login || secrets.read(id)?.login || '').trim()
+  const phone = String(login || secrets.read(id)?.login || '').replace(/\D/g, '').slice(-11)
+  const secret = secrets.read(id)
   const page = 'https://www.doubao.com/chat/'
+  runtimeLog.info('doubao.bootstrap', `打开豆包并自动登录 phone=${phone ? `${phone.slice(0, 3)}****` : '无'}`)
+  // 用 code 模式打开，避免一上来就切到扫码页导致填不了手机号
   const opened = await openAccount({
     kind: 'doubao',
     id,
     name,
-    login: phone,
-    mode: 'qr',
+    login: phone || login,
+    mode: secret?.password ? 'password' : 'code',
     url: page,
     force: true,
+    skipSend: true,
     captcha: captcha || { enabled: true }
   })
-  const win = windows.get(sessionKey('doubao', id, page))
-  if (!win || win.isDestroyed()) {
+  const target = windows.get(sessionKey('doubao', id, page))
+  if (!target || target.isDestroyed()) {
     return { ok: false, loginStatus: '待确认', message: opened?.message || '豆包窗口没有打开' }
   }
-  bringToFront(win)
-  let sendStatus = 'miss'
-  if (phone) {
-    for (let attempt = 0; attempt < 6; attempt += 1) {
-      await runInFrames(win, clickTextScript(['验证码登录', '短信登录', '手机号登录', '登录']))
-      sendStatus = await runInFrames(win, phoneScript(phone))
-      await watchCaptcha(win, captcha || { enabled: true })
-      if (sendStatus === 'sent' || sendStatus === 'wait') break
-      await wait(900)
+  bringToFront(target)
+  await wait(1200)
+
+  // 有密码：先尝试账密登录
+  if (secret?.password && (phone || login)) {
+    const filled = await autoFillPasswordLogin(target, phone || login, secret.password, { times: 6 })
+    await watchCaptcha(target, captcha || { enabled: true })
+    if (filled === 'filled') {
+      await wait(1200)
+      const cookies = await target.webContents.session.cookies.get({})
+      if (loggedIn(cookies, 'doubao')) {
+        return { ok: true, loginStatus: '已登录', message: '已自动填写豆包账密并登录' }
+      }
     }
   }
-  for (let attempt = 0; attempt < 6; attempt += 1) {
-    const clicked = await runInFrames(win, clickTextScript(['扫码登录', '扫码']))
-    if (clicked === 'clicked') break
-    await wait(700)
+
+  // 主路径：填手机号 + 发送验证码
+  let sendStatus = 'miss'
+  if (phone) {
+    sendStatus = await autoSendPhoneCode(target, phone, { times: 12 })
+    await watchCaptcha(target, captcha || { enabled: true })
   }
-  await watchCaptcha(win, captcha || { enabled: true })
-  const cookies = await win.webContents.session.cookies.get({})
+  const cookies = await target.webContents.session.cookies.get({})
   const signed = loggedIn(cookies, 'doubao')
   const parts = []
-  if (phone && sendStatus === 'sent') parts.push('已填手机号并点了获取验证码')
-  else if (phone && sendStatus === 'wait') parts.push('手机号已填入，获取验证码按钮待点')
-  else if (phone) parts.push('已填手机号')
-  parts.push(signed ? '已登录' : '请用抖音 App 扫窗口里的码')
+  if (phone && sendStatus === 'sent') parts.push('已填手机号并点击获取验证码')
+  else if (phone && sendStatus === 'typed') parts.push('已填手机号，请再点一次获取验证码')
+  else if (phone && sendStatus === 'wait') parts.push('手机号已填入，获取验证码按钮冷却中')
+  else if (phone) parts.push('未点到获取验证码，请在窗口里确认')
+  else parts.push('未提供手机号')
+  parts.push(signed ? '已登录' : '验证码发到手机后，在窗口里填入即可')
   return {
     ok: true,
     loginStatus: signed ? '已登录' : '待确认',

@@ -3,6 +3,7 @@
     <div class="page-head">
       <div>
         <h1>发布中心 · 账号管理</h1>
+        <p class="muted">每个抖音号独立浏览器会话，登录后本地长期存活；可同时添加多个，并发窗口数由「同时打开」控制（1–10）。</p>
       </div>
     </div>
     <div class="panel filters">
@@ -73,7 +74,7 @@
       </el-table>
     </div>
     <el-dialog v-model="visible" :title="form.id ? '编辑抖音账号' : '添加抖音账号'" width="520px">
-      <p class="muted">达人工作台与创作者中心共用同一浏览器会话。请先在本软件窗口登录百应，再打开创作者；若创作者仍要授权，在同一窗口扫一次抖音即可，之后免二次扫码（换设备/无痕除外）。巨量百应登录态不能直接当成创作者已登录。</p>
+      <p class="muted">保存后会打开达人工作台并<strong>自动填写账号密码</strong>（或验证码登录）。达人与创作者共用同一浏览器会话；每个账号独立存活，可添加多个。</p>
       <el-form label-width="96px">
         <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>
         <el-form-item label="登录方式">
@@ -238,7 +239,9 @@ async function openWorkbench(row) {
     watchScan(row)
     return
   }
-  ElMessage.success(row.loginMode === 'code' ? '达人工作台已打开，验证码登录后就会记住' : '已打开达人工作台并填入账号密码')
+  ElMessage.success(row.loginMode === 'code'
+    ? '达人工作台已打开，正在自动填手机号并发验证码'
+    : (result?.message || '已打开达人工作台，并尝试自动填写账号密码'))
 }
 
 async function scanLogin(row) {

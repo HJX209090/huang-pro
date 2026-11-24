@@ -69,17 +69,17 @@
       </el-table>
     </div>
     <el-dialog v-model="visible" :title="form.id ? '编辑豆包账号' : '新建豆包账号'" width="460px">
-      <p class="muted">保存后会自动打开豆包：填入手机号、点发送验证码，并切到扫码登录。遇到验证弹窗会自动处理，你只需用抖音扫码。</p>
+      <p class="muted">保存后会自动打开豆包：主动填入手机号并点击「获取验证码」。有密码则先尝试账密登录。验证弹窗会自动处理。</p>
       <el-form label-width="88px">
         <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>
         <el-form-item label="登录方式">
           <el-radio-group v-model="form.loginMode">
-            <el-radio value="qr">扫码（推荐）</el-radio>
+            <el-radio value="code">验证码（推荐）</el-radio>
             <el-radio value="password">密码</el-radio>
-            <el-radio value="code">验证码</el-radio>
+            <el-radio value="qr">扫码</el-radio>
           </el-radio-group>
         </el-form-item>
-        <el-form-item label="豆包账号"><el-input v-model="form.login" placeholder="手机号" /></el-form-item>
+        <el-form-item label="豆包账号"><el-input v-model="form.login" placeholder="手机号，保存后自动填入并发码" /></el-form-item>
         <el-form-item v-if="form.loginMode === 'password'" label="密码">
           <el-input v-model="form.password" type="password" show-password :placeholder="form.id ? '不修改可留空' : '登录密码'" />
         </el-form-item>
@@ -319,7 +319,7 @@ function limitOf(row) {
 
 function edit(row) {
   if (row) Object.assign(form, { id: row.id, name: row.name, login: row.login || '', password: '', loginMode: row.loginMode || 'qr', group: row.group, quota: limitOf(row) })
-  else Object.assign(form, { id: '', name: '', login: '', password: '', loginMode: 'qr', group: store.groups[0] || '默认分组', quota: '5' })
+  else Object.assign(form, { id: '', name: '', login: '', password: '', loginMode: 'code', group: store.groups[0] || '默认分组', quota: '5' })
   visible.value = true
 }
 
