@@ -26,7 +26,7 @@ export function blankPublishPage(delay = 0) {
   return {
     dyTitle: false,
     dyFakeTitle: false,
-    dyTags: false,
+    dyTags: true,
     dyCart: true,
     dyDeclare: true,
     dySchedule: false,

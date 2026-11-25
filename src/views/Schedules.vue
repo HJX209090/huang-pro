@@ -303,20 +303,25 @@ function selectFiltered() {
 
 function accountName(idOrName) {
   const found = store.publishAccounts.find((item) => item.id === idOrName || item.name === idOrName)
-  return found?.name || idOrName
+  return found?.name || ''
 }
 
 function accountIds(row) {
   const raw = Array.isArray(row?.accounts) && row.accounts.length
     ? row.accounts
     : (row?.account ? String(row.account).split(/[、,，]/).map((item) => item.trim()).filter(Boolean) : [])
-  return raw.map((item) => store.publishAccounts.find((account) => account.id === item || account.name === item)?.id || item)
+  const ids = []
+  for (const item of raw) {
+    const id = store.publishAccounts.find((account) => account.id === item || account.name === item)?.id
+    if (id && !ids.includes(id)) ids.push(id)
+  }
+  return ids
 }
 
 function accountLabel(row) {
-  const ids = accountIds(row)
-  if (!ids.length) return '全部账号'
-  return ids.map((item) => accountName(item)).join('、')
+  const names = accountIds(row).map((item) => accountName(item)).filter(Boolean)
+  if (!names.length) return '全部账号'
+  return names.join('、')
 }
 
 function triggerLabel(row) {
@@ -402,8 +407,8 @@ function save() {
     date: form.mode === '单次' ? (form.date || '') : '',
     time: form.mode === '循环' ? '' : form.time,
     intervalMinutes: form.mode === '循环' ? Math.max(5, Number(form.intervalMinutes) || 30) : 0,
-    account: (form.accounts || []).map((item) => accountName(item)).join('、'),
-    accounts: [...(form.accounts || [])],
+    account: (form.accounts || []).map((item) => accountName(item)).filter(Boolean).join('、'),
+    accounts: (form.accounts || []).filter((item) => store.publishAccounts.some((account) => account.id === item || account.name === item)),
     picks: [...(form.picks || [])],
     enabled: form.enabled !== false,
     desc: form.desc || ''

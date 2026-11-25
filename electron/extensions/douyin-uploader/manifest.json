@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "huang++pro 抖音发布",
+  "version": "1.0.0",
+  "description": "内置浏览器里自动上传并发布抖音视频",
+  "action": {
+    "default_title": "huang++pro 抖音发布",
+    "default_popup": "popup.html"
+  },
+  "permissions": ["activeTab"],
+  "host_permissions": ["https://creator.douyin.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://creator.douyin.com/creator-micro/content/upload*",
+        "https://creator.douyin.com/creator-micro/content/post*",
+        "https://creator.douyin.com/creator-micro/content/manage*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

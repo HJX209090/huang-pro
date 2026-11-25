@@ -1,6 +1,6 @@
 {
   "name": "huang-plusplus-pro",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "description": "huang++pro 本地桌面框架",
   "main": "electron/main.cjs",
   "private": true,
@@ -47,6 +47,12 @@
       "package.json"
     ],
     "asar": true,
+    "extraResources": [
+      {
+        "from": "electron/extensions/douyin-uploader",
+        "to": "extensions/douyin-uploader"
+      }
+    ],
     "win": {
       "icon": "build/icon.ico",
       "target": [

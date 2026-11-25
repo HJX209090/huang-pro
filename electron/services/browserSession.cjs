@@ -6,6 +6,8 @@ const path = require('path')
 const secrets = require('./secrets.cjs')
 const unwatermark = require('./doubaoUnwatermark.cjs')
 const doubaoCaptcha = require('./doubaoCaptcha.cjs')
+const doubaoMonitor = require('./doubaoMonitor.cjs')
+const douyinUploader = require('./douyinUploader.cjs')
 const media = require('./media.cjs')
 const runtimeLog = require('./runtimeLog.cjs')
 
@@ -13,6 +15,8 @@ const URLS = {
   doubao: 'https://www.doubao.com/chat/',
   publish: 'https://buyin.jinritemai.com/dashboard'
 }
+const CREATOR_HOME = 'https://creator.douyin.com/'
+const CREATOR_UPLOAD = 'https://creator.douyin.com/creator-micro/content/upload'
 const TITLES = {
   doubao: '豆包',
   publish: '达人工作台'
@@ -62,7 +66,8 @@ async function applyProxy(ses) {
   }
   await ses.setProxy({ proxyRules }).catch(() => {})
 }
-const CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+const CHROME_VER = process.versions.chrome || '130.0.0.0'
+const CHROME_UA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_VER} Safari/537.36`
 
 function bringToFront(win) {
   if (!win || win.isDestroyed()) return
@@ -76,16 +81,33 @@ function bringToFront(win) {
   }, 500)
 }
 
-/** 网页里的 window.open 一律留在当前窗口，避免越点越多浏览器 */
+/** 创作者扫码过程禁止 loadURL 冲掉当前页；护照回调用同分区小窗 */
 function bindSameWindow(win) {
   if (!win || win.isDestroyed() || win.__boundOpen) return
   win.__boundOpen = true
   win.webContents.setWindowOpenHandler(({ url }) => {
     const next = String(url || '')
-    if (/^https?:/i.test(next)) {
-      const current = String(win.webContents.getURL() || '')
-      if (current !== next) win.loadURL(next).catch(() => {})
+    if (!/^https?:/i.test(next)) return { action: 'deny' }
+    const current = String(win.webContents.getURL() || '')
+    const creatorFlow = /creator\.douyin\.com|passport|scan_login|sso[./]/i.test(current)
+      || /passport\.|scan_login|sso[./]|open\.douyin\.com|login\.douyin|creator\.douyin\.com/i.test(next)
+    if (creatorFlow) {
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          width: 720,
+          height: 800,
+          autoHideMenuBar: true,
+          webPreferences: {
+            partition: win.webContents.session.partition,
+            contextIsolation: true,
+            nodeIntegration: false,
+            sandbox: false
+          }
+        }
+      }
     }
+    if (current !== next) win.loadURL(next).catch(() => {})
     return { action: 'deny' }
   })
 }
@@ -117,12 +139,12 @@ function samePage(current, target) {
   }
 }
 
-async function loadPage(win, url, { quiet = false } = {}) {
+async function loadPage(win, url, { quiet = false, force = false } = {}) {
   if (!win || win.isDestroyed()) return false
   // 已在目标页：不刷新（定时发布反复 load 会刷屏、易掉登录）
   try {
     const current = String(win.webContents.getURL() || '')
-    if (current && samePage(current, url)) {
+    if (!force && current && samePage(current, url)) {
       runtimeLog.info('nav', `已在目标页，跳过刷新 ${String(url).slice(0, 60)}`)
       return true
     }
@@ -132,9 +154,7 @@ async function loadPage(win, url, { quiet = false } = {}) {
   win.webContents.session.setUserAgent(CHROME_UA)
   const once = () => Promise.race([
     win.loadURL(url, { userAgent: CHROME_UA }),
-    wait(20000).then(() => {
-      if (!win.isDestroyed()) win.webContents.stop()
-    })
+    wait(25000)
   ])
   try {
     await once()
@@ -199,13 +219,45 @@ function buyinLoggedIn(cookies) {
   }) || cookies.some((item) => /douyin/.test(String(item.domain || '')) && /^sessionid/i.test(String(item.name || '')))
 }
 
-/** 创作者中心：必须有 douyin 域通行证，不能拿百应 cookie 冒充 */
+/** 创作者中心：只认 douyin.com 上的通行证，过期/跟踪 cookie 不算已登录 */
 function creatorLoggedIn(cookies) {
-  return cookies.some((item) => {
+  return (cookies || []).some((item) => {
     const domain = String(item.domain || '')
     const name = String(item.name || '')
-    return /douyin\.com/.test(domain) && /^(sessionid|sessionid_ss|sid_guard|uid_tt|sid_tt)$/i.test(name)
+    const value = String(item.value || '')
+    if (value.length < 8) return false
+    if (!/douyin\.com/.test(domain)) return false
+    return /^(sessionid|sessionid_ss|sid_guard|uid_tt|uid_tt_ss|sid_tt)$/i.test(name)
   })
+}
+
+async function clearCreatorAuthCookies(ses) {
+  if (!ses) return 0
+  const cookies = await ses.cookies.get({}).catch(() => [])
+  let removed = 0
+  for (const cookie of cookies || []) {
+    const domain = String(cookie.domain || '')
+    if (!/douyin\.com|snssdk\.com|iesdouyin\.com/.test(domain)) continue
+    const host = domain.replace(/^\./, '')
+    const url = `https://${host}${cookie.path || '/'}`
+    try {
+      await ses.cookies.remove(url, cookie.name)
+      removed += 1
+    } catch { /* ignore */ }
+  }
+  try { await ses.cookies.flushStore() } catch { /* ignore */ }
+  runtimeLog.info('sso.bridge', `已清理失效创作者 cookie ${removed} 条`)
+  return removed
+}
+
+function preparePublishSession(ses) {
+  if (!ses || ses.__huangPrepared) return
+  ses.__huangPrepared = true
+  try { ses.setUserAgent(CHROME_UA) } catch { /* ignore */ }
+  try { ses.setPermissionCheckHandler(() => true) } catch { /* ignore */ }
+  try {
+    ses.setPermissionRequestHandler((_wc, _permission, callback) => callback(true))
+  } catch { /* ignore */ }
 }
 
 const PASSPORT_COOKIE_NAMES = [
@@ -257,12 +309,83 @@ function creatorLoginWallScript() {
   return `(() => {
     const body = String(document.body?.innerText || '').replace(/\\s+/g, '')
     const href = String(location.href || '')
-    if (/\\/pc\\/login|\\/login|passport\\/web\\/login|scan_login/i.test(href)) return 'wall'
-    if (/我是创作者|我是MCN|打开抖音App|扫码登录/.test(body) && /获取验证码|密码登录|创作者中心/.test(body)) return 'wall'
-    if (/上传视频|发布视频|作品管理|内容管理|发布作品|选择视频|填写作品标题|投稿/.test(body)) return 'ok'
-    if (/creator-micro|content\\/upload|content\\/manage/i.test(href) && !/login/i.test(href)) return 'ok'
+    if (/扫码登录|打开抖音App|请使用抖音扫描|我是创作者|我是MCN/.test(body)) return 'wall'
+    if (/\\/pc\\/login|passport\\/web\\/login|scan_login/i.test(href)) return 'wall'
+    if (/加载失败|加载出错|网络异常|网络请求错误|请刷新页面重试|请稍后重试|登录已过期/.test(body)) return 'fail'
+    if (/creator-micro\\//i.test(href) && !/login/i.test(href)) return 'ok'
+    if (/填写作品标题|选择视频|拖拽上传|开始上传/.test(body)) return 'ok'
+    if (/退出登录|账号设置/.test(body) && /数据|内容管理|作品/.test(body)) return 'ok'
+    if (/数据概览|昨日数据|粉丝总量/.test(body)) return 'ok'
+    if (!body || body.length < 12) return 'empty'
     return 'unknown'
   })()`
+}
+
+function creatorScanHintScript() {
+  return `(() => {
+    const href = String(location.href || '')
+    const body = String(document.body?.innerText || '').replace(/\\s+/g, '')
+    if (/登录成功|扫码成功|已确认登录/.test(body)) return 'scanned'
+    if (/扫码登录|打开抖音App|请使用抖音扫描/.test(body)) return 'qr'
+    const qr = document.querySelector('canvas, img[src*="qr"], img[alt*="二维码"], [class*="qrcode" i], [class*="qr-code" i], [class*="qrCode"]')
+    if (qr) return 'qr'
+    if (/加载失败|加载出错|网络异常|网络请求错误|请刷新页面重试|请稍后重试/.test(body)) return 'fail'
+    if (!body || body.length < 12) return 'empty'
+    if (/填写作品标题|选择视频|拖拽上传|开始上传/.test(body)) return 'ok'
+    if (/\\/pc\\/login|passport|scan_login/i.test(href)) return 'login'
+    return 'other'
+  })()`
+}
+
+async function runMainFrame(win, script) {
+  if (!win || win.isDestroyed()) return ''
+  try {
+    return await win.webContents.executeJavaScript(script)
+  } catch {
+    return ''
+  }
+}
+
+/** 登录墙只能看主文档。runInFrames 把 ok/wall 都当成 miss，会把已登录判成未登录。 */
+async function probeCreatorLogin(win) {
+  const wall = (await runMainFrame(win, creatorLoginWallScript())) || 'unknown'
+  let hint = (await runMainFrame(win, creatorScanHintScript())) || 'other'
+  if (wall === 'fail' && hint !== 'qr' && hint !== 'scanned') return { wall, hint: 'fail' }
+  if (hint !== 'qr' && hint !== 'scanned' && hint !== 'fail') {
+    for (const frame of framesOf(win.webContents.mainFrame)) {
+      try {
+        const hit = await frame.executeJavaScript(creatorScanHintScript())
+        if (hit === 'qr' || hit === 'scanned') {
+          hint = hit
+          break
+        }
+      } catch { /* 子框架没有扫码界面 */ }
+    }
+  }
+  return { wall, hint }
+}
+
+async function probeCreatorPage(id) {
+  const win = findPublishMainWindow(id)
+  if (!win || win.isDestroyed()) return 'unknown'
+  const url = String(win.webContents.getURL() || '')
+  if (!/douyin\.com|snssdk\.com|iesdouyin\.com/i.test(url)) return 'unknown'
+  const probed = await probeCreatorLogin(win).catch(() => ({ wall: 'unknown' }))
+  return probed.wall || 'unknown'
+}
+
+async function ensureCreatorQrVisible(win) {
+  if (!win || win.isDestroyed()) return ''
+  const probed = await probeCreatorLogin(win).catch(() => ({ hint: '' }))
+  const hint = probed.hint || ''
+  if (hint === 'qr' || hint === 'scanned' || hint === 'ok') return hint
+  if (hint === 'fail') return hint
+  // 已经在扫码界面就不要再点，刷新二维码会让刚扫过的码失效
+  if (hint === 'login') return hint
+  await runInFrames(win, clickExactScript('我是创作者')).catch(() => {})
+  await wait(400)
+  const again = await probeCreatorLogin(win).catch(() => ({ hint: '' }))
+  return again.hint || ''
 }
 
 /**
@@ -272,33 +395,80 @@ function creatorLoginWallScript() {
  */
 async function bridgeBuyinToCreator(win, targetUrl, { quiet = false, forceNav = false } = {}) {
   if (!win || win.isDestroyed()) return { ok: false, bridged: false }
-  const dest = targetUrl || 'https://creator.douyin.com/creator-micro/content/upload'
   const ses = win.webContents.session
   let cookies = await ses.cookies.get({}).catch(() => [])
   const hadCreator = creatorLoggedIn(cookies)
   const current = String(win.webContents.getURL() || '')
   const onCreator = /creator\.douyin\.com/i.test(current)
-  let wall = onCreator
-    ? await runInFrames(win, creatorLoginWallScript()).catch(() => 'unknown')
-    : 'unknown'
-  runtimeLog.info('sso.bridge', `探测 creatorCookie=${hadCreator} onCreator=${onCreator} wall=${wall} url=${current.slice(0, 60)}`)
+  let wall = 'unknown'
+  let hint = ''
+  if (onCreator) {
+    const probed = await probeCreatorLogin(win).catch(() => ({ wall: 'unknown', hint: '' }))
+    wall = probed.wall || 'unknown'
+    hint = probed.hint || ''
+    if (wall === 'unknown' || wall === 'empty') {
+      await wait(2000)
+      if (!win.isDestroyed()) {
+        const again = await probeCreatorLogin(win).catch(() => ({ wall: 'unknown', hint: '' }))
+        wall = again.wall || 'unknown'
+        hint = again.hint || hint
+      }
+    }
+  }
+  runtimeLog.info('sso.bridge', `探测 creatorCookie=${hadCreator} onCreator=${onCreator} wall=${wall} hint=${hint} url=${current.slice(0, 80)}`)
 
-  // 已在创作者且未登录墙：完全不刷新（定时反复探测也不会刷屏）
-  if (!forceNav && hadCreator && onCreator && wall !== 'wall') {
+  if (wall === 'ok') {
+    const dest = targetUrl && /creator-micro\/content\/upload/i.test(targetUrl) ? targetUrl : ''
+    if (dest && !samePage(current, dest)) {
+      await loadPage(win, dest, { quiet })
+      await wait(800)
+    }
     runtimeLog.info('sso.bridge', '已在创作者中心，跳过刷新')
     return {
       ok: true,
       bridged: false,
-      wall: wall || 'ok',
+      wall: 'ok',
       loginStatus: '已登录',
       sameBrowser: true,
       message: '已在创作者中心，未刷新页面'
     }
   }
 
-  // 没有创作者 cookie：禁止自动跳转（否则会开登录墙、连环 SSO，易掉登录）
-  if (!hadCreator && !forceNav) {
-    runtimeLog.info('sso.bridge', '无创作者 cookie，跳过自动导航')
+  // 登录墙还挂着旧 sessionid：扫完一定「加载失败」白屏，必须先清再出新码
+  if ((wall === 'wall' || hint === 'qr' || hint === 'login') && hadCreator && forceNav && !quiet && hint !== 'scanned') {
+    runtimeLog.info('sso.bridge', '登录墙带着旧 cookie，先离开页面再清登录态')
+    await loadPage(win, 'about:blank', { quiet: true, force: true })
+    await clearCreatorAuthCookies(ses)
+    await loadPage(win, CREATOR_HOME, { quiet, force: true })
+    await wait(1500)
+    await ensureCreatorQrVisible(win)
+    if (!quiet) bringToFront(win)
+    return {
+      ok: false,
+      bridged: true,
+      wall: 'wall',
+      loginStatus: '待确认',
+      sameBrowser: true,
+      message: '请用抖音 App 扫描窗口里的二维码。弹出的登录小窗口不要关'
+    }
+  }
+
+  // 已经在扫码/登录成功瞬间：绝不能再 loadURL，否则会把刚扫完的会话冲掉
+  if (hint === 'qr' || hint === 'scanned' || wall === 'wall') {
+    runtimeLog.info('sso.bridge', `停在扫码页 hint=${hint} wall=${wall}`)
+    if (!quiet) bringToFront(win)
+    return {
+      ok: false,
+      bridged: false,
+      wall: wall === 'ok' ? 'wall' : wall,
+      loginStatus: '待确认',
+      sameBrowser: true,
+      message: '请用抖音 App 扫描窗口里的二维码。弹出的登录小窗口不要关'
+    }
+  }
+
+  if (!forceNav) {
+    runtimeLog.info('sso.bridge', '未登录且非手动打开，跳过自动导航')
     return {
       ok: false,
       bridged: false,
@@ -309,22 +479,24 @@ async function bridgeBuyinToCreator(win, targetUrl, { quiet = false, forceNav = 
     }
   }
 
-  // 有会话或不在目标页：只跳一次目标上传页，绝不 buyin→www→creator 连环跳
-  if (!samePage(current, dest)) {
-    runtimeLog.info('sso.bridge', `单次进入 ${dest.slice(0, 80)}`)
-    await loadPage(win, dest, { quiet })
-    await wait(1200)
+  const staleUpload = hadCreator && /creator-micro|content\/upload/i.test(current)
+  const broken = wall === 'fail' || staleUpload
+  runtimeLog.info('sso.bridge', `未进工作台 wall=${wall} broken=${broken}，打开创作者首页扫码`)
+  if (broken) {
+    await loadPage(win, 'about:blank', { quiet: true, force: true })
+    await clearCreatorAuthCookies(ses)
   }
-
-  wall = await runInFrames(win, creatorLoginWallScript()).catch(() => 'unknown')
-  cookies = await ses.cookies.get({}).catch(() => [])
-  const ok = wall === 'ok' || (wall !== 'wall' && creatorLoggedIn(cookies))
-  if (!ok && !quiet) bringToFront(win)
-  runtimeLog.info('sso.bridge', `结束 wall=${wall || ''} ok=${ok}`)
+  await loadPage(win, CREATOR_HOME, { quiet, force: true })
+  await wait(1500)
+  await ensureCreatorQrVisible(win)
+  if (!quiet) bringToFront(win)
+  const after = await probeCreatorLogin(win).catch(() => ({ wall: 'unknown' }))
+  const ok = after.wall === 'ok'
+  runtimeLog.info('sso.bridge', `结束 wall=${after.wall || ''} ok=${ok}`)
   return {
     ok,
     bridged: true,
-    wall,
+    wall: after.wall || wall,
     loginStatus: ok ? '已登录' : '待确认',
     sameBrowser: true,
     message: ok
@@ -351,12 +523,16 @@ async function accountStatus({ kind, id }) {
   const cookies = await ses.cookies.get({}).catch(() => [])
   if (kind === 'publish') {
     const buyin = buyinLoggedIn(cookies)
-    const creator = creatorLoggedIn(cookies)
+    const cookieOk = creatorLoggedIn(cookies)
+    const page = await probeCreatorPage(id)
+    const creator = page === 'ok'
+    const blocked = page === 'wall' || page === 'fail'
     return {
-      loginStatus: buyin ? '已登录' : '待登录',
+      loginStatus: (!blocked && creator) ? '已登录' : (buyin ? '已登录' : '待登录'),
       buyinLoginStatus: buyin ? '已登录' : '待登录',
-      creatorLoginStatus: creator ? '已登录' : '待登录',
-      cookieCount: cookies.length
+      creatorLoginStatus: blocked ? '待登录' : (creator ? '已登录' : '待登录'),
+      cookieCount: cookies.length,
+      probed: page
     }
   }
   if (kind === 'doubao') {
@@ -572,6 +748,7 @@ function buyinPortalStepScript() {
     const compact = (value) => String(value || '').replace(/\\s+/g, '')
     const body = compact(document.body?.innerText || '')
     if (/选品车|选品广场|精选联盟|达人广场|带货数据|商品决策/.test(body) && !/加入抖音电商/.test(body)) return 'in'
+    if (/扫码登录|打开抖音App|请使用抖音扫描/.test(body)) return 'login'
     const nodes = []
     const walk = (root) => {
       if (!root || !root.querySelectorAll) return
@@ -604,6 +781,7 @@ function buyinPortalStepScript() {
 
 async function enterBuyinTalent(win) {
   if (!win || win.isDestroyed()) return 'miss'
+  let clickedLogin = false
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const step = await runInFrames(win, buyinPortalStepScript()).catch(() => 'miss')
     runtimeLog.info('buyin.entry', `第 ${attempt + 1} 次门户 ${step || 'miss'}`)
@@ -611,6 +789,12 @@ async function enterBuyinTalent(win) {
     if (step === 'talent') {
       await wait(1600)
       return 'talent'
+    }
+    if (step === 'login') {
+      if (clickedLogin) return 'login'
+      clickedLogin = true
+      await wait(1200)
+      continue
     }
     await wait(650)
   }
@@ -854,7 +1038,9 @@ async function dismissDoubaoPromo(win) {
 }
 
 function attachDoubaoPromoGuard(win) {
-  if (!win || win.isDestroyed() || win.__huangPromoGuard) return
+  if (!win || win.isDestroyed()) return
+  doubaoMonitor.attach(win)
+  if (win.__huangPromoGuard) return
   win.__huangPromoGuard = true
   const run = () => {
     if (!win.isDestroyed()) dismissDoubaoPromo(win).catch(() => {})
@@ -963,6 +1149,7 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
   }
   if (existing && !existing.isDestroyed() && !force) {
     bindSameWindow(existing)
+    if (kind === 'publish') preparePublishSession(existing.webContents.session)
     if (kind === 'doubao') attachDoubaoPromoGuard(existing)
     if (!quiet) bringToFront(existing)
     let cookies = await existing.webContents.session.cookies.get({})
@@ -977,20 +1164,20 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
       // 用户手动打开才 forceNav；定时/静默只在有 cookie 时软跳一次
       const bridged = await bridgeBuyinToCreator(existing, target, { quiet, forceNav: !quiet && !already })
       cookies = await existing.webContents.session.cookies.get({})
-      hasCreator = creatorLoggedIn(cookies) || bridged.ok
-      direct = bridged.ok || hasCreator
+      direct = Boolean(bridged.ok)
       await applyProxy(existing.webContents.session)
       if (prompt) await fillPrompt(existing, prompt)
       if (!quiet && !direct) bringToFront(existing)
       return {
         ok: true,
         loginStatus: direct ? '已登录' : '待确认',
+        creatorLoginStatus: direct ? '已登录' : '待登录',
         direct,
         scope: 'creator',
         sameBrowser: true,
         message: bridged.message || (direct
           ? '已在同一浏览器会话打开创作者中心'
-          : '请在本窗口扫抖音码（与达人同会话）；扫完后免二次扫码')
+          : '请用抖音 App 扫描窗口里的二维码')
       }
     }
     if (url && !samePage(existing.webContents.getURL(), target)) {
@@ -1012,7 +1199,8 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
       } else if (mode === 'code' && account) {
         await autoSendPhoneCode(existing, account, { times: 8 })
       } else if (mode === 'qr') {
-        await runInFrames(existing, clickTextScript(['扫码登录', '扫码']))
+        if (onCreator) await ensureCreatorQrVisible(existing)
+        else await runInFrames(existing, clickTextScript(['扫码登录', '扫码']))
       }
     }
     if (kind === 'doubao' && !direct) await watchCaptcha(existing, captcha)
@@ -1023,6 +1211,8 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
   }
   if (existing && !existing.isDestroyed() && force) existing.close()
   const partition = `persist:huang-${kind}-${id}`
+  const sesReady = session.fromPartition(partition)
+  if (kind === 'publish') preparePublishSession(sesReady)
   const win = new BrowserWindow({
     width: quiet ? 1100 : 1200,
     height: quiet ? 800 : 860,
@@ -1083,16 +1273,16 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
     ? loggedIn(cookies, kind)
     : (onCreator ? hasCreator : (hasBuyin || loggedIn(cookies, kind)))
   if (onCreator) {
-    const bridged = await bridgeBuyinToCreator(win, url || 'https://creator.douyin.com/creator-micro/content/upload', {
+    const bridged = await bridgeBuyinToCreator(win, url || CREATOR_HOME, {
       quiet,
       forceNav: !quiet && !already
     })
     cookies = await ses.cookies.get({})
-    hasCreator = creatorLoggedIn(cookies) || bridged.ok
-    if (hasCreator) {
+    if (bridged.ok) {
       return {
         ok: true,
         loginStatus: '已登录',
+        creatorLoginStatus: '已登录',
         direct: true,
         scope: 'creator',
         sameBrowser: true,
@@ -1108,13 +1298,15 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
         return { ok: true, loginStatus: '已登录', direct: true, scope: 'creator', sameBrowser: true, message: '已自动填写创作者账密并登录' }
       }
     }
+    if (!quiet) await ensureCreatorQrVisible(win)
     return {
       ok: true,
       loginStatus: '待确认',
+      creatorLoginStatus: '待登录',
       direct: false,
       scope: 'creator',
       sameBrowser: true,
-      message: bridged.message || '请在本窗口扫抖音码或确认账密。达人与创作者必须同一浏览器；登录后免二次扫码'
+      message: bridged.message || '请用抖音 App 扫描窗口里的二维码。弹出的小窗口不要关'
     }
   }
 
@@ -1155,10 +1347,13 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
 
   // 仅扫码模式才点扫码
   if (method === 'qr') {
-    for (let attempt = 0; attempt < 6; attempt += 1) {
-      await wait(800)
-      const clicked = await runInFrames(win, clickTextScript(['扫码登录', '扫码']))
-      if (clicked === 'clicked') break
+    if (onCreator) await ensureCreatorQrVisible(win)
+    else {
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        await wait(800)
+        const clicked = await runInFrames(win, clickTextScript(['扫码登录', '扫码']))
+        if (clicked === 'clicked') break
+      }
     }
     if (kind === 'doubao') await watchCaptcha(win, captcha)
     return { ok: true, loginStatus: '待确认', message: '请用抖音 App 扫描窗口里的二维码。扫完后这个账号会记住登录。' }
@@ -1296,7 +1491,7 @@ async function bootstrapPublishLogin({ id, name, login, mode, scope }) {
   const buyin = scope === 'buyin'
   const url = buyin
     ? 'https://buyin.jinritemai.com/dashboard'
-    : 'https://creator.douyin.com/creator-micro/content/upload'
+    : CREATOR_HOME
   runtimeLog.info('publish.bootstrap', `${buyin ? '达人' : '创作者'} 单窗口扫码`)
   await openAccount({
     kind: 'publish',
@@ -1307,17 +1502,97 @@ async function bootstrapPublishLogin({ id, name, login, mode, scope }) {
     url
   })
   const win = findPublishMainWindow(id)
+  let wall = 'unknown'
   if (win && !win.isDestroyed()) {
     bindSameWindow(win)
     if (buyin) await enterBuyinTalent(win)
-    else await runInFrames(win, clickTextScript(['扫码登录', '扫码']))
+    else {
+      await ensureCreatorQrVisible(win)
+      wall = (await probeCreatorLogin(win).catch(() => ({ wall: 'unknown' }))).wall || 'unknown'
+    }
     bringToFront(win)
   }
   const status = await publishPartitionStatus(id)
+  const logged = buyin ? status.buyinLoginStatus === '已登录' : wall === 'ok'
   return {
     ok: true,
     ...status,
-    message: buyin ? '已打开达人工作台，请扫码登录' : '已打开创作者中心，请扫码登录'
+    creatorLoginStatus: logged && !buyin ? '已登录' : (buyin ? status.creatorLoginStatus : '待登录'),
+    loginStatus: logged ? '已登录' : '待登录',
+    message: buyin ? '已打开达人工作台，请扫码登录' : '已打开创作者中心，请扫码登录。扫完后如弹出小窗口请不要关'
+  }
+}
+
+/**
+ * 等用户扫码。cookie 落到 douyin.com 后再刷新一次主窗口；不要反复强刷上传页。
+ */
+async function recoverCreatorPage(win, reason) {
+  if (!win || win.isDestroyed()) return
+  runtimeLog.info('publish.scan', `创作者页 ${reason}，刷新一次`)
+  const clicked = await runMainFrame(win, `(() => {
+    const btn = [...document.querySelectorAll('button, a, [role="button"], span')]
+      .find((el) => {
+        const text = String(el.innerText || '').replace(/\\s+/g, '')
+        return text.length <= 8 && /刷新|重试/.test(text)
+      })
+    if (btn) { btn.click(); return 'clicked' }
+    return ''
+  })()`).catch(() => '')
+  if (clicked !== 'clicked') {
+    try { win.webContents.reload() } catch { /* ignore */ }
+  }
+  await wait(2800)
+}
+
+async function watchCreatorScan({ id, timeoutMs }) {
+  const deadline = Date.now() + Math.max(30000, Number(timeoutMs) || 180000)
+  let recovered = false
+  runtimeLog.info('publish.scan', `开始等待扫码 id=${id}`)
+  while (Date.now() < deadline) {
+    const win = findPublishMainWindow(id)
+    if (!win || win.isDestroyed()) {
+      await wait(1500)
+      continue
+    }
+    const url = String(win.webContents.getURL() || '')
+    const probed = await probeCreatorLogin(win).catch(() => ({ wall: 'unknown', hint: '' }))
+    const wall = probed.wall || 'unknown'
+    const hint = probed.hint || ''
+    const cookies = await win.webContents.session.cookies.get({}).catch(() => [])
+    const cookieOk = creatorLoggedIn(cookies)
+    const names = (cookies || [])
+      .filter((item) => /douyin\.com/i.test(String(item.domain || '')) && isSessionCookie(item.name))
+      .map((item) => `${item.name}@${String(item.domain || '').slice(0, 24)}`)
+      .slice(0, 8)
+    runtimeLog.info('publish.scan', `wall=${wall} hint=${hint} cookie=${cookieOk} names=${names.join(',') || '-'} url=${url.slice(0, 90)}`)
+    const insideStudio = /creator\.douyin\.com\/creator-micro\//i.test(url) && wall !== 'wall' && wall !== 'fail'
+    if (wall === 'ok' || (cookieOk && insideStudio)) {
+      const status = await publishPartitionStatus(id)
+      return { ok: true, ...status, creatorLoginStatus: '已登录', loginStatus: '已登录', message: '创作者已登录' }
+    }
+    if (wall === 'empty' || hint === 'empty') {
+      runtimeLog.info('publish.scan', '页面跳转中的空白，等它自己加载，不刷新')
+      await wait(3000)
+      continue
+    }
+    if ((wall === 'fail' || hint === 'fail') && !recovered) {
+      recovered = true
+      await recoverCreatorPage(win, '加载失败')
+      continue
+    }
+    if (hint === 'scanned') {
+      runtimeLog.info('publish.scan', '扫码已确认，等页面自己跳转，不强制刷新')
+      await wait(4000)
+      continue
+    }
+    await wait(2000)
+  }
+  const status = await publishPartitionStatus(id)
+  return {
+    ok: false,
+    ...status,
+    creatorLoginStatus: '待登录',
+    message: '还在登录页。请确认抖音 App 已点登录；弹出的小窗口不要关'
   }
 }
 
@@ -2143,11 +2418,6 @@ async function pressConfirm(win, snippet, minVideos) {
   if (state.state === 'mismatch') {
     return { ...state, confirmNeeded: false, confirmSent: false, confirmNote: '图片和商品对不上，已停止，没有回复 1 或 2' }
   }
-  if (state.inputHasPrompt && !state.echoed && !state.confirmVisible && !state.asks) {
-    await pressEnter(win)
-    await wait(800)
-    state = await readDoubao(win, snippet, minVideos)
-  }
   if (state.confirmVisible) {
     await runInFrames(win, confirmClickScript())
     await wait(700)
@@ -2191,7 +2461,7 @@ async function ensureDelivered(win, snippet, notify, workId, minVideos) {
     if (state.state === 'quota') return { ...state, quota: true, confirmNeeded: false, confirmSent: false, confirmNote: '这个豆包账号额度不够' }
     if (state.state === 'mismatch') return { ...state, mismatch: true, confirmNeeded: false, confirmSent: false, confirmNote: '图片和商品对不上，已停止，没有回复 1 或 2' }
     if (state.state === 'ready') return { ...state, ready: true, confirmNeeded: last.confirmNeeded, confirmSent: last.confirmSent, confirmNote: last.confirmNote || '已直接发送，没有出现确认框' }
-    if (state.confirmVisible || state.asks || (state.inputHasPrompt && !state.echoed)) {
+    if (state.confirmVisible || state.asks) {
       last = await pressConfirm(win, snippet, minVideos)
       notify?.({ workId, progress: 48, status: '生成中', confirmSent: last.confirmSent, confirmNeeded: last.confirmNeeded, confirmNote: last.confirmNote })
       if (last.quota || last.confirmSent || (!last.confirmNeeded && (last.echoed || last.generating))) return last
@@ -2231,7 +2501,7 @@ async function waitForReply(win, beforeText, message) {
 async function resubmitDoubaoJob(win, { text, savedImages, filePayload, freshChat = true }) {
   if (!win || win.isDestroyed()) return { ok: false, note: '窗口已关' }
   if (freshChat) {
-    await loadPage(win, 'https://www.doubao.com/chat/')
+    await loadPage(win, 'https://www.doubao.com/chat/', { force: true })
     await wait(800)
   }
   const composer = await waitDoubaoComposer(win)
@@ -2406,6 +2676,7 @@ async function pressEnter(win) {
 }
 
 async function sendPreparedDoubao(win, text, savedImages, filePayload) {
+  doubaoMonitor.note(win, `正在放入 ${savedImages.length} 张商品图`)
   let attached = 'miss'
   const placed = await setFileInputs(win, savedImages)
   runtimeLog.info('doubao.send', placed ? '已把本地图写入文件选择框' : '页面没有文件选择框，改走粘贴')
@@ -2421,7 +2692,11 @@ async function sendPreparedDoubao(win, text, savedImages, filePayload) {
     }
   }
   await wait(400)
-  if (attached !== 'file') return { ok: false, message: '商品图没有放进输入框' }
+  if (attached !== 'file') {
+    doubaoMonitor.note(win, '商品图没有放进输入框')
+    return { ok: false, message: '商品图没有放进输入框' }
+  }
+  doubaoMonitor.note(win, '图片已放入，正在写入提示词')
   const snippet = String(text || '').slice(0, 12)
   let filled = 'miss'
   for (let attempt = 0; attempt < 8 && filled !== 'filled'; attempt += 1) {
@@ -2429,10 +2704,18 @@ async function sendPreparedDoubao(win, text, savedImages, filePayload) {
     await wait(400)
     filled = await runInFrames(win, promptLandedScript(snippet))
   }
-  if (filled !== 'filled') return { ok: false, message: '提示词没有写进输入框' }
+  if (filled !== 'filled') {
+    doubaoMonitor.note(win, '提示词没有写进输入框')
+    return { ok: false, message: '提示词没有写进输入框' }
+  }
+  doubaoMonitor.note(win, '提示词已写入，正在回车发送')
   const sent = await pressEnter(win)
-  if (!sent) return { ok: false, message: '提示词和图片已放进输入框，但没有发出去' }
+  if (!sent) {
+    doubaoMonitor.note(win, '回车没有发出去')
+    return { ok: false, message: '提示词和图片已放进输入框，但没有发出去' }
+  }
   await wait(600)
+  doubaoMonitor.note(win, '图片和提示词已发出')
   return { ok: true, message: '已发送' }
 }
 
@@ -2504,15 +2787,31 @@ async function readAssignedTask(win, job) {
   }
 }
 
+async function messageAlreadySent(win, snippet) {
+  const url = pageChatUrl(win)
+  const state = await readDoubao(win, snippet, 0).catch(() => null)
+  if (!state) return Boolean(url)
+  if (state.generating || state.echoed || state.confirmVisible || state.asks || state.confirmEcho || state.state === 'ready' || state.state === 'confirm') return true
+  return Boolean(url)
+}
+
 async function sendJobThroughCaptcha(win, { text, savedImages, filePayload, captchaConfig, notify, workId, page, fresh = false }) {
   const tell = (msg) => notify?.({ workId, status: '生成中', confirmNote: msg })
+  const snippet = String(text || '').slice(0, 12)
   for (let round = 0; round < 3; round += 1) {
     if (!win || win.isDestroyed()) return { ok: false, message: '豆包窗口被关掉了' }
     if (round > 0 || fresh) {
+      if (await messageAlreadySent(win, snippet)) {
+        doubaoMonitor.note(win, '验证码已过，这条已经发出，不再重发')
+        tell('验证码已过，这条已经发出，不再重发')
+        runtimeLog.info('doubao.send', '验证码已过，但对话已经发出，跳过重发')
+        return { ok: true, resent: false }
+      }
       fresh = false
-      tell('验证码已过，正在重新发送图片和提示词')
-      runtimeLog.info('doubao.send', `验证码已过，第 ${round + 1} 次重新发起生成`)
-      await loadPage(win, page)
+      doubaoMonitor.note(win, '上一条没发出去，验证后补发一次')
+      tell('上一条没发出去，验证后补发一次')
+      runtimeLog.info('doubao.send', `验证后补发第 ${round + 1} 次`)
+      await loadPage(win, page, { force: true })
       await wait(800)
       if (!(await waitDoubaoComposer(win))) {
         return { ok: false, message: '验证过后输入框没出来，没有重新发送' }
@@ -2575,7 +2874,7 @@ async function generateAssignedTasks(payload) {
     const workId = String(job.workId || '')
     const text = String(job.prompt || '').trim()
     const urls = [...new Set((Array.isArray(job.images) ? job.images : []).map((item) => String(item || '')).filter(Boolean))].slice(0, 12)
-    runtimeLog.info('doubao.send', `第 ${index + 1}/${list.length} 条 图${urls.length}张`)
+    runtimeLog.info('doubao.send', `第 ${index + 1}/${list.length} 条 图${urls.length}张 提示:${text.slice(0, 18)} 图1:${String(urls[0] || '').slice(-24)}`)
     const file = path.join(folder, `${workId || Date.now()}.mp4`)
     const knownUrl = /doubao\.com\/chat\/[^/?#]+/i.test(String(job.chatUrl || '')) ? String(job.chatUrl) : ''
     if (watch && knownUrl) {
@@ -2586,10 +2885,8 @@ async function generateAssignedTasks(payload) {
       tasks.push({ workId, done: true, last: { outcome: 'failed', message: !text ? '提示词是空的' : '没有商品图' } })
       continue
     }
-    if (index > 0 || pageChatUrl(win)) {
-      await loadPage(win, page)
-      await wait(800)
-    }
+    await loadPage(win, page, { force: index > 0 || Boolean(pageChatUrl(win)) })
+    await wait(index > 0 ? 900 : 400)
     const composer = await waitDoubaoComposer(win)
     if (!composer) {
       tasks.push({ workId, done: true, last: { outcome: 'failed', message: '豆包输入框还没出来，图片和提示词没有发送' } })
@@ -2661,31 +2958,36 @@ async function generateAssignedTasks(payload) {
         task.last = { outcome: 'failed', message: midGate.error || '验证码没有通过' }
         continue
       }
-      if (midGate.hit && midGate.cleared && task.savedImages?.length) {
-        notify?.({ workId: task.workId, status: '生成中', confirmNote: '验证码打断了生成，正在重新发送图片和提示词' })
-        runtimeLog.info('doubao.send', '看守时验证码已过，重新发起生成')
-        const resent = await sendJobThroughCaptcha(win, {
-          text: task.prompt,
-          savedImages: task.savedImages,
-          filePayload: task.filePayload,
-          captchaConfig,
-          notify,
-          workId: task.workId,
-          page,
-          fresh: true
-        })
-        if (!resent.ok) {
-          task.done = true
-          task.last = { outcome: 'failed', message: resent.message }
+      if (midGate.hit && midGate.cleared) {
+        if (task.chatUrl || await messageAlreadySent(win, task.snippet)) {
+          doubaoMonitor.note(win, '验证码已过，继续等这条成片，不再重发')
+          notify?.({ workId: task.workId, status: '生成中', confirmNote: '验证码已过，继续等成片，不再重发' })
+        } else if (task.savedImages?.length) {
+          notify?.({ workId: task.workId, status: '生成中', confirmNote: '验证码打断了发送，正在补发一次' })
+          runtimeLog.info('doubao.send', '看守时发现还没发出，补发一次')
+          const resent = await sendJobThroughCaptcha(win, {
+            text: task.prompt,
+            savedImages: task.savedImages,
+            filePayload: task.filePayload,
+            captchaConfig,
+            notify,
+            workId: task.workId,
+            page,
+            fresh: true
+          })
+          if (!resent.ok) {
+            task.done = true
+            task.last = { outcome: 'failed', message: resent.message }
+            continue
+          }
+          const nextUrl = await waitOwnChatUrl(win, usedChats)
+          if (nextUrl) {
+            usedChats.add(nextUrl)
+            task.chatUrl = nextUrl
+          }
+          task.last = { ...task.last, outcome: 'running', confirmNote: '验证后已补发，等待成片', doubaoChatUrl: task.chatUrl }
           continue
         }
-        const nextUrl = await waitOwnChatUrl(win, usedChats)
-        if (nextUrl) {
-          usedChats.add(nextUrl)
-          task.chatUrl = nextUrl
-        }
-        task.last = { ...task.last, outcome: 'running', confirmNote: '验证后已重新发送，等待成片', doubaoChatUrl: task.chatUrl }
-        continue
       }
       const read = await readAssignedTask(win, task)
       task.last = { ...task.last, ...read, doubaoChatUrl: task.chatUrl }
@@ -2948,15 +3250,20 @@ async function generateOnDoubao(payload = {}) {
         return withConfirm({ ok: false, saveDir: folder, message: midGate.error || '生成过程中验证码没有通过' })
       }
       if (midGate.hit && midGate.cleared) {
-        delivery = { ...delivery, confirmNote: '验证码已过，正在重新发送图片和提示词' }
-        notify?.({ workId, progress: Math.min(90, 50 + tick), status: '生成中', confirmNote: delivery.confirmNote })
-        const again = await resubmitDoubaoJob(win, { text, savedImages, filePayload, freshChat: true })
-        delivery = { ...delivery, confirmNote: again.ok ? '验证后已重新发送，等待成片' : `验证后重新发送失败：${again.note}` }
-        if (!again.ok) {
-          await endChain()
-          return withConfirm({ ok: false, saveDir: folder, imagePaths: savedImages, message: delivery.confirmNote })
+        if (await messageAlreadySent(win, snippet)) {
+          delivery = { ...delivery, confirmNote: '验证码已过，这条已经发出，继续等成片' }
+          notify?.({ workId, progress: Math.min(90, 50 + tick), status: '生成中', confirmNote: delivery.confirmNote })
+        } else {
+          delivery = { ...delivery, confirmNote: '验证码打断了发送，正在补发一次' }
+          notify?.({ workId, progress: Math.min(90, 50 + tick), status: '生成中', confirmNote: delivery.confirmNote })
+          const again = await resubmitDoubaoJob(win, { text, savedImages, filePayload, freshChat: true })
+          delivery = { ...delivery, confirmNote: again.ok ? '验证后已补发，等待成片' : `验证后补发失败：${again.note}` }
+          if (!again.ok) {
+            await endChain()
+            return withConfirm({ ok: false, saveDir: folder, imagePaths: savedImages, message: delivery.confirmNote })
+          }
+          continue
         }
-        continue
       }
     }
     const nudgeTexts = (activeReplyRules?.nudge || []).map((item) => String(item || '').trim()).filter(Boolean)
@@ -3762,47 +4069,111 @@ function selectProductByIdScript(productId) {
   })()`
 }
 
-function selectAiDeclareScript() {
+function aiDeclareStepScript() {
   return `(() => {
-    const scroller = document.scrollingElement || document.documentElement
-    const panels = Array.from(document.querySelectorAll('main, [class*="content"], [class*="scroll"], [class*="form"]'))
-    panels.forEach((el) => { try { el.scrollTop = el.scrollHeight } catch { /* ignore */ } })
-    window.scrollTo(0, document.body.scrollHeight || scroller.scrollHeight || 0)
     const compact = (value) => String(value || '').replace(/\\s+/g, '')
-    const nodes = []
-    const walk = (root) => {
-      if (!root || !root.querySelectorAll) return
-      root.querySelectorAll('label, span, div, p, li, button, [role="radio"], [role="checkbox"]').forEach((el) => nodes.push(el))
-      root.querySelectorAll('*').forEach((el) => { if (el.shadowRoot) walk(el.shadowRoot) })
-    }
-    walk(document)
     const visible = (el) => {
       const rect = el.getBoundingClientRect()
-      return rect.width > 16 && rect.height > 10 && rect.bottom > 0 && rect.top < window.innerHeight + 80
+      return rect.width > 8 && rect.height > 8 && rect.bottom > 0 && rect.top < window.innerHeight + 60
     }
-    const option = nodes.find((el) => {
-      const text = compact(el.innerText || el.getAttribute('aria-label') || '')
-      if (!text || text.length > 24 || /AI分身/.test(text)) return false
-      if (!visible(el)) return false
-      return text === 'AI自主声明' || text === '内容由AI生成' || text === '由AI生成'
-        || text.includes('AI自主声明') || text.includes('内容由AI生成') || text.includes('人工智能生成')
-        || text === 'AI生成' || text === 'AIGC' || text.includes('由AI生成')
-    })
-    if (!option) {
-      const opener = nodes.find((el) => {
-        const text = compact(el.innerText || '')
-        return visible(el) && text.length < 16 && (text === '自主声明' || text === '添加声明' || text === '内容声明' || text === '发文助手' || text.includes('添加声明'))
+    const click = (el) => {
+      if (!el) return false
+      const target = el.closest('button, [role="button"], [role="radio"], label') || el
+      try { target.click() } catch { el.click() }
+      return true
+    }
+    const pageText = compact(document.body?.innerText || '')
+    const modalOpen = /对作品内容添加声明|请选择声明类型/.test(pageText)
+    if (modalOpen) {
+      const option = Array.from(document.querySelectorAll('button, [role="button"], [role="radio"], label, span, div, li')).find((el) => {
+        return visible(el) && compact(el.innerText || '') === '内容由AI生成'
       })
-      if (opener) {
-        opener.click()
-        return 'opened'
+      if (option) click(option)
+      const cancel = Array.from(document.querySelectorAll('button, [role="button"], span, div')).find((el) => visible(el) && compact(el.innerText) === '取消')
+      const oks = Array.from(document.querySelectorAll('button, [role="button"], span, div')).filter((el) => {
+        const text = compact(el.innerText || '')
+        return visible(el) && (text === '确定' || text === '确认')
+      })
+      const ok = oks.find((el) => {
+        if (!cancel) return true
+        const a = el.getBoundingClientRect()
+        const b = cancel.getBoundingClientRect()
+        return Math.abs(a.top - b.top) < 56
+      }) || oks[oks.length - 1]
+      if (ok) {
+        click(ok)
+        return 'confirmed'
       }
-      return 'miss'
+      return 'picked'
     }
-    option.click()
-    const input = option.querySelector?.('input') || option.closest('label')?.querySelector('input')
-    if (input && input.checked === false) input.click()
-    return 'clicked'
+    const row = Array.from(document.querySelectorAll('div, span, p, button')).find((el) => {
+      const text = compact(el.innerText || '')
+      return visible(el) && /自主声明/.test(text) && text.length < 40
+    })
+    if (row && /内容由AI生成/.test(compact(row.innerText)) && !/请选择自主声明/.test(compact(row.innerText))) return 'done'
+    const opener = Array.from(document.querySelectorAll('div, span, p, button, [role="button"]')).find((el) => {
+      const text = compact(el.innerText || '')
+      return visible(el) && text.length <= 16 && (text === '请选择自主声明' || text.includes('请选择自主声明'))
+    })
+    if (opener) {
+      try { opener.scrollIntoView({ block: 'center', inline: 'nearest' }) } catch { /* ignore */ }
+      click(opener)
+      return 'opened'
+    }
+    window.scrollTo(0, document.scrollingElement?.scrollHeight || 0)
+    return 'miss'
+  })()`
+}
+
+async function selectAiDeclare(win) {
+  if (!win || win.isDestroyed()) return false
+  let opened = 0
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const last = await runMainFrame(win, aiDeclareStepScript()).catch(() => 'miss')
+    runtimeLog.info('publish.declare', `第 ${attempt + 1} 步 → ${last || 'miss'}`)
+    if (last === 'done' || last === 'confirmed') {
+      if (last === 'confirmed') await wait(700)
+      return true
+    }
+    if (last === 'opened') opened += 1
+    if (opened > 1 && last === 'opened') return true
+    await wait(last === 'opened' ? 600 : 400)
+  }
+  return opened > 0
+}
+
+function clickTopicChipsScript(wanted) {
+  const list = (Array.isArray(wanted) ? wanted : []).map((item) => String(item || '').replace(/^#/, '').trim()).filter(Boolean)
+  return `(() => {
+    const wanted = ${JSON.stringify(list)}
+    const compact = (value) => String(value || '').replace(/\\s+/g, '')
+    const area = Array.from(document.querySelectorAll('div, section, form, main')).find((el) => {
+      const text = String(el.innerText || '')
+      return /#添加话题|添加话题/.test(text) && text.length < 2800
+    }) || document.body
+    const chips = []
+    area.querySelectorAll('button, span, div, a, [role="button"]').forEach((el) => {
+      const text = compact(el.innerText || el.textContent)
+      const rect = el.getBoundingClientRect()
+      if (!/^#[^#]{1,16}$/.test(text)) return
+      if (/添加话题|好友/.test(text)) return
+      if (rect.width < 20 || rect.height < 12 || rect.height > 48) return
+      if ((el.children?.length || 0) > 3) return
+      chips.push({ el, tag: text.replace(/^#/, '') })
+    })
+    const picked = []
+    const used = new Set()
+    const take = (item) => {
+      if (!item || used.has(item.tag) || picked.length >= 5) return
+      item.el.click()
+      used.add(item.tag)
+      picked.push(item.tag)
+    }
+    for (const want of wanted) {
+      take(chips.find((item) => item.tag === want || item.tag.includes(want) || (want.length >= 2 && want.includes(item.tag))))
+    }
+    for (const item of chips) take(item)
+    return JSON.stringify(picked)
   })()`
 }
 
@@ -3890,23 +4261,7 @@ async function applyPublishOptions(win, options = {}, productLink = '', productI
     if (!scheduleOk) notes.push('schedule-miss')
   }
   if (options.dyDeclare !== false) {
-    let declared = false
-    for (let attempt = 0; attempt < 3 && !declared; attempt += 1) {
-      const clicked = await runInFrames(win, selectAiDeclareScript())
-      if (clicked === 'opened') {
-        await wait(500)
-        const again = await runInFrames(win, selectAiDeclareScript())
-        if (again === 'clicked') {
-          const marked = await runInFrames(win, `(() => /AI自主声明|内容由AI生成|人工智能生成|由AI生成|AIGC/.test(String(document.body?.innerText || '')) ? 'yes' : 'no')()`)
-          if (marked === 'yes') declared = true
-        }
-      } else if (clicked === 'clicked') {
-        const marked = await runInFrames(win, `(() => /AI自主声明|内容由AI生成|人工智能生成|由AI生成|AIGC/.test(String(document.body?.innerText || '')) ? 'yes' : 'no')()`)
-        if (marked === 'yes') declared = true
-      } else {
-        await wait(400)
-      }
-    }
+    const declared = await selectAiDeclare(win)
     notes.push(declared ? 'declare' : 'declare-miss')
   }
   return notes
@@ -4042,7 +4397,7 @@ async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, 
     const cookies = await win.webContents.session.cookies.get({})
     if (creatorLoggedIn(cookies)) opened.loginStatus = '已登录'
   } catch { /* ignore */ }
-  const wall = await runInFrames(win, creatorLoginWallScript()).catch(() => 'unknown')
+  const wall = (await probeCreatorLogin(win).catch(() => ({ wall: 'unknown' }))).wall || 'unknown'
   if (wall === 'wall' || opened?.loginStatus !== '已登录') {
     if (wall === 'wall') {
       bringToFront(win)
@@ -4106,26 +4461,37 @@ async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, 
     notify?.({ workId, status: '发布中', confirmNote: '发布页还在加载，先继续挂商品和声明' })
   }
   const titled = 'skip'
-  const optionNotes = await applyPublishOptions(win, { ...opts, dyDeclare: opts.dyDeclare !== false, dyCart: opts.dyCart !== false && Boolean(productId || productLink) }, productLink, productId)
+  const optionNotes = await applyPublishOptions(win, { ...opts, dyDeclare: false, dyCart: opts.dyCart !== false && Boolean(productId || productLink) }, productLink, productId)
   const placed = []
   const topicLimit = 5
-  if (topicTags.length) {
+  if (opts.dyTags !== false) {
+    await runMainFrame(win, creatorBoxesScript()).catch(() => {})
+    await runInFrames(win, clickByLabelsScript(['#添加话题', '添加话题'], 16)).catch(() => {})
+    await wait(400)
+    let rec = []
+    try {
+      rec = JSON.parse(await runMainFrame(win, clickTopicChipsScript(topicTags)) || '[]')
+    } catch { rec = [] }
+    if (Array.isArray(rec)) {
+      rec.forEach((tag) => {
+        if (tag && !placed.includes(tag) && placed.length < topicLimit) placed.push(tag)
+      })
+    }
+    runtimeLog.info('publish.tags', `推荐话题 ${placed.join(',') || '-'}`)
     for (const tag of topicTags.slice(0, topicLimit)) {
       if (placed.length >= topicLimit) break
-      const already = await runInFrames(win, `(() => {
-        const box = window.__huangBody
-        const text = String(box?.innerText || box?.textContent || box?.value || '')
-        return (text.match(/#[^#\\s]{1,16}/g) || []).length
-      })()`).catch(() => 0)
-      if (Number(already) >= topicLimit) break
+      if (placed.includes(tag)) continue
       const typed = await runInFrames(win, insertCreatorTagScript(tag))
       if (typed === 'miss') continue
       await wait(280)
       const picked = await runInFrames(win, pickCreatorTagScript(tag))
       if (picked === 'picked' || typed === 'typed') placed.push(tag)
-      if (placed.length >= topicLimit) break
       await wait(180)
     }
+  }
+  if (opts.dyDeclare !== false) {
+    const declared = await selectAiDeclare(win)
+    optionNotes.push(declared ? 'declare' : 'declare-miss')
   }
   await runInFrames(win, `(() => {
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
@@ -4151,6 +4517,13 @@ async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, 
     notify?.({ workId, progress: 94, status: '发布中', confirmNote: '检测超时，尝试继续点发布' })
   }
   let published = 'miss'
+  notify?.({ workId, progress: 95, status: '发布中', confirmNote: '用内置浏览器插件点发布' })
+  const plugin = await douyinUploader.fillAndPublish(win, {
+    title: String(title || '').trim(),
+    description: ''
+  })
+  runtimeLog.info('publish.plugin', `state=${plugin?.state || ''} ${plugin?.note || ''}`)
+  if (plugin?.state === 'published') published = 'published'
   for (let attempt = 0; attempt < 18 && published !== 'published'; attempt += 1) {
     await runInFrames(win, dismissAssistPanelScript()).catch(() => {})
     if (attempt < 2) {
@@ -4212,7 +4585,7 @@ async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, 
       loginStatus: opened.loginStatus || '已登录',
       title: shortTitle,
       tags: placed.length ? placed : topicTags,
-      message: `已打开抖音上传页，${titleNote}${tagText ? `，标签 ${tagText}` : ''}，并点了发布。${extras}${deleted ? '；原片已删除' : ''}`
+      message: `已打开抖音上传页，${titleNote}${tagText ? `，标签 ${tagText}` : ''}，${plugin?.state === 'published' ? '已由内置浏览器插件点发布' : '并点了发布'}。${extras}${deleted ? '；原片已删除' : ''}`
     }
   }
   return {
@@ -5409,6 +5782,7 @@ module.exports = {
   requestCode,
   bootstrapDoubaoLogin,
   bootstrapPublishLogin,
+  watchCreatorScan,
   silentPasswordLogin,
   ensurePublishLogin,
   accountStatus,

@@ -2,6 +2,7 @@ const https = require('https')
 const http = require('http')
 const { nativeImage } = require('electron')
 const runtimeLog = require('./runtimeLog.cjs')
+const doubaoMonitor = require('./doubaoMonitor.cjs')
 
 const CAPTCHA_KEYS = [
   'captcha',
@@ -725,6 +726,7 @@ async function localSemanticSolve(win, notify) {
   }
   const category = promptCategory(layout.prompt)
   notify?.({ confirmNote: `正在识别验证图「${layout.prompt || category}」并自动拖拽` })
+  doubaoMonitor.note(win, `正在拖验证图「${layout.prompt || category}」`)
   runtimeLog.info('captcha', `题目「${layout.prompt || ''}」分类=${category} 图${layout.tiles.length}张`)
   const scored = []
   for (const tile of layout.tiles) {
@@ -874,6 +876,7 @@ async function tryAutoSolve(win, config, notify) {
     }
     const typeId = cfg.types[kind] || cfg.type
     runtimeLog.info('captcha', `检测到${kindLabel(kind)} 第 ${attempt}/${cfg.maxRetries} 次`)
+    doubaoMonitor.note(win, `检测到${kindLabel(kind)}验证，自动处理第 ${attempt} 次`)
     notify?.({ confirmNote: `检测到${kindLabel(kind)}验证码，自动处理第 ${attempt}/${cfg.maxRetries} 次` })
 
     // 点选/拖拽：优先本地语义拖拽。弹窗没有 iframe 时也必须跑，不能因为没定位到框就停
@@ -885,6 +888,7 @@ async function tryAutoSolve(win, config, notify) {
           out.ok = true
           out.cleared = true
           out.error = ''
+          doubaoMonitor.note(win, `验证码已自动通过（拖了 ${local.picks} 张）`)
           notify?.({ confirmNote: `验证码已自动通过（拖了 ${local.picks} 张）` })
           return out
         }
@@ -1007,27 +1011,36 @@ function kindLabel(kind) {
 
 async function resolveHit(win, config, notify) {
   const cfg = normalizeConfig(config)
+  doubaoMonitor.note(win, '检测到验证码，正在自动处理')
   notify?.({ confirmNote: '检测到验证码，正在自动处理' })
   if (cfg.enabled) {
     const auto = await tryAutoSolve(win, cfg, notify)
-    if (auto.cleared) return { hit: true, cleared: true, timedOut: false, auto: true, pointsRaw: auto.pointsRaw, kind: auto.kind }
+    if (auto.cleared) {
+      doubaoMonitor.note(win, '验证码已自动通过')
+      return { hit: true, cleared: true, timedOut: false, auto: true, pointsRaw: auto.pointsRaw, kind: auto.kind }
+    }
     if (!cfg.fallbackHuman) {
+      doubaoMonitor.note(win, auto.error || '自动验证失败')
       return { hit: true, cleared: false, timedOut: true, auto: true, error: auto.error || '自动验证失败', kind: auto.kind }
     }
+    doubaoMonitor.note(win, `自动拖未过：${auto.error || '等待人工拖完'}`)
     notify?.({ confirmNote: `自动处理未过：${auto.error || '请在窗口里拖一下'}。等待你完成后继续` })
     try { if (!win.isDestroyed()) { win.show(); win.focus() } } catch { /* ignore */ }
   } else {
+    doubaoMonitor.note(win, '请在窗口里完成验证')
     notify?.({ confirmNote: '检测到验证码。请在打开的窗口里完成验证，完成后会自动继续' })
     try { if (!win.isDestroyed()) { win.show(); win.focus() } } catch { /* ignore */ }
   }
   const humanDeadline = Date.now() + cfg.humanTimeoutSec * 1000
   while (Date.now() < humanDeadline) {
     if (!(await detect(win)).hit) {
+      doubaoMonitor.note(win, '验证码已通过，继续生成')
       notify?.({ confirmNote: '验证码已通过，继续' })
       return { hit: true, cleared: true, timedOut: false, auto: false }
     }
     await wait(1000)
   }
+  doubaoMonitor.note(win, '验证码等待超时')
   return { hit: true, cleared: false, timedOut: true, auto: false, error: '验证码等待超时' }
 }
 

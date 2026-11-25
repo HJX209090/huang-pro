@@ -229,7 +229,7 @@ async function openWorkbench(row) {
     name: row.name,
     login: row.loginMode === 'qr' ? '' : row.login,
     mode: row.loginMode || 'password',
-    url: 'https://creator.douyin.com/creator-micro/content/upload'
+    url: 'https://creator.douyin.com/'
   })
   row.loginStatus = result.creatorLoginStatus || result.loginStatus
   store.persist()
@@ -246,36 +246,54 @@ async function scanLogin(row) {
     name: row.name,
     login: row.login,
     mode: 'qr',
-    already: row.loginStatus === '已登录',
-    url: 'https://creator.douyin.com/creator-micro/content/upload'
+    already: false,
+    url: 'https://creator.douyin.com/'
   })
   row.loginStatus = result.creatorLoginStatus || result.loginStatus
   row.creatorLoginStatus = result.creatorLoginStatus || row.creatorLoginStatus
   store.persist()
-  if (row.loginStatus === '已登录') {
+  if (result?.creatorLoginStatus === '已登录') {
     ElMessage.success('这个创作者账号已经登录')
     return
   }
-  ElMessage.success(result.message || '请用抖音 App 扫描窗口里的二维码')
+  ElMessage.success(result.message || '请用抖音 App 扫描窗口里的二维码。弹出的登录小窗口不要关')
   watchScan(row)
 }
 
-async function watchScan(row) {
-  for (let i = 0; i < 40; i += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 3000))
-    if (!window.tujian?.accountStatus) return
-    const result = await window.tujian.accountStatus({ kind: 'publish', id: row.id })
-    if (result.buyinLoginStatus) row.buyinLoginStatus = result.buyinLoginStatus
-    if (result.creatorLoginStatus) row.creatorLoginStatus = result.creatorLoginStatus
-    const signed = result.creatorLoginStatus === '已登录'
-    if (!signed) continue
+async function applyLoginResult(row, result, { requireOk = false } = {}) {
+  if (result?.buyinLoginStatus) row.buyinLoginStatus = result.buyinLoginStatus
+  if (result?.creatorLoginStatus) row.creatorLoginStatus = result.creatorLoginStatus
+  const signed = requireOk
+    ? Boolean(result?.ok)
+    : (result?.ok || result?.creatorLoginStatus === '已登录')
+  if (signed) {
     row.creatorLoginStatus = '已登录'
     row.loginStatus = '已登录'
     store.persist()
     ElMessage.success(`${row.name} 创作者已登录`)
     store.addLog('success', '发布', `${row.name} 扫码登录成功`)
-    return
+    return true
   }
+  if (result?.loginStatus) row.loginStatus = result.loginStatus
+  return false
+}
+
+async function watchScan(row) {
+  if (window.tujian?.watchCreatorScan) {
+    try {
+      const result = await window.tujian.watchCreatorScan({ id: row.id })
+      if (await applyLoginResult(row, result, { requireOk: true })) return
+      if (result?.message) ElMessage.warning(result.message)
+      return
+    } catch { /* 退回轮询 cookie */ }
+  }
+  for (let i = 0; i < 60; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+    if (!window.tujian?.accountStatus) return
+    const result = await window.tujian.accountStatus({ kind: 'publish', id: row.id })
+    if (await applyLoginResult(row, result)) return
+  }
+  ElMessage.warning('还在登录页。请确认抖音 App 已点登录，窗口会自动跳进创作者中心')
 }
 
 async function openRow(row) {
@@ -292,15 +310,19 @@ async function openRow(row) {
     name: row.name,
     login: '',
     mode: 'qr',
-    already: row.creatorLoginStatus === '已登录' || row.loginStatus === '已登录',
-    url: 'https://creator.douyin.com/creator-micro/content/upload'
+    already: false,
+    url: 'https://creator.douyin.com/'
   })
-  if (result?.loginStatus) {
-    row.loginStatus = result.loginStatus
-    store.persist()
+  if (result?.creatorLoginStatus) row.creatorLoginStatus = result.creatorLoginStatus
+  if (result?.loginStatus) row.loginStatus = result.creatorLoginStatus || result.loginStatus
+  store.persist()
+  if (result?.creatorLoginStatus === '已登录' || result?.loginStatus === '已登录') {
+    ElMessage.success(result.message || '已进入创作者中心')
+    return
   }
-  if (result.message && !already) result.ok ? ElMessage.success(result.message) : ElMessage.warning(result.message)
+  if (result?.message) ElMessage.success(result.message)
   store.addLog('info', '发布', `${row.name} 打开自己的创作者中心`)
+  watchScan(row)
 }
 
 async function requestCode(row) {
@@ -369,6 +391,7 @@ async function remove(row) {
   try { await ElMessageBox.confirm(`删除环境 ${row.name}？`, '删除', { type: 'warning' }) } catch { return }
   store.publishAccounts = store.publishAccounts.filter((item) => item.id !== row.id)
   if (store.activeAccountId === row.id) store.activeAccountId = store.publishAccounts[0]?.id || ''
+  store.pruneStaleScheduleAccounts()
   await store.removeAccountSecret(row.id)
   store.persist()
 }

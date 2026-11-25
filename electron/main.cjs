@@ -13,7 +13,13 @@ const media = require('./services/media.cjs')
 const shopAuth = require('./services/shopAuth.cjs')
 const updater = require('./services/updater.cjs')
 
-const BLOCKED_SCHEMES = ['bytedance', 'snssdk1128', 'aweme', 'douyin', 'sslocal', 'doubao']
+const BLOCKED_SCHEMES = [
+  'bytedance', 'snssdk1128', 'aweme', 'douyin', 'sslocal', 'doubao',
+  'bitbrowser', 'bitsbrowser', 'adspower', 'morelogin'
+]
+
+// 抖音扫码在 passport/snssdk iframe 里写 cookie；Chrome 130+ 默认拦第三方 cookie，扫完会退回登录页
+app.commandLine.appendSwitch('disable-features', 'ThirdPartyCookiePhaseout,TrackingProtection3pcd')
 
 protocol.registerSchemesAsPrivileged([
   { scheme: 'local-video', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, bypassCSP: true } },
@@ -107,19 +113,17 @@ function createWindow(size = {}) {
 
 app.on('web-contents-created', (_event, contents) => {
   contents.setWindowOpenHandler(({ url }) => ({ action: !url || isPageUrl(url) ? 'allow' : 'deny' }))
-  contents.on('will-navigate', (event, url) => {
-    if (!isPageUrl(url)) event.preventDefault()
-  })
-  contents.on('will-frame-navigate', (event, url) => {
-    const target = typeof url === 'string' ? url : event.url
+  const blockAppLink = (event, url) => {
+    const target = typeof url === 'string' ? url : String(event?.url || '')
     if (target && !isPageUrl(target)) event.preventDefault()
-  })
+  }
+  contents.on('will-navigate', blockAppLink)
+  contents.on('will-frame-navigate', blockAppLink)
+  contents.on('will-redirect', blockAppLink)
 })
 
 app.whenReady().then(() => {
-  BLOCKED_SCHEMES.forEach((scheme) => {
-    protocol.handle(scheme, () => new Response('', { status: 204 }))
-  })
+  // 自定义协议只拦主文档跳到系统弹窗；不要 204 空文档，iframe 被换成空白会「加载失败」白屏
   protocol.handle('local-video', (request) => {
     const filePath = new URL(request.url).searchParams.get('path')
     if (!filePath || !fs.existsSync(filePath)) return new Response('missing', { status: 404 })
@@ -329,6 +333,14 @@ ipcMain.handle('publish:bootstrap-login', async (_event, payload) => {
     return JSON.parse(JSON.stringify(result || { ok: false, message: '无结果' }))
   } catch (error) {
     return { ok: false, message: String(error?.message || error || '打开登录页失败') }
+  }
+})
+ipcMain.handle('publish:watch-scan', async (_event, payload) => {
+  try {
+    const result = await browserSession.watchCreatorScan(payload || {})
+    return JSON.parse(JSON.stringify(result || { ok: false, message: '无结果' }))
+  } catch (error) {
+    return { ok: false, creatorLoginStatus: '待登录', message: String(error?.message || error || '等待扫码失败') }
   }
 })
 ipcMain.handle('account:silent-login', async (_event, payload) => {

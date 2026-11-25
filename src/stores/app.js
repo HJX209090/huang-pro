@@ -268,11 +268,38 @@ export const useAppStore = defineStore('app', {
       this.applyWindowSize()
       this.ensureBuiltinSchedules()
     },
+    /** 定时任务账号必须以当前发布账号为准，去掉已删除的 PB* 残留 */
+    pruneStaleScheduleAccounts() {
+      const list = Array.isArray(this.publishAccounts) ? this.publishAccounts : []
+      let changed = false
+      for (const task of this.schedules || []) {
+        const raw = Array.isArray(task.accounts) && task.accounts.length
+          ? task.accounts.map((item) => String(item || '').trim()).filter(Boolean)
+          : String(task.account || '').split(/[、,，]/).map((item) => item.trim()).filter(Boolean)
+        const kept = []
+        for (const item of raw) {
+          const found = list.find((account) => account.id === item || account.name === item)
+          if (found && !kept.includes(found.id)) kept.push(found.id)
+        }
+        const label = kept
+          .map((id) => list.find((account) => account.id === id)?.name || '')
+          .filter(Boolean)
+          .join('、')
+        const prevIds = Array.isArray(task.accounts) ? task.accounts : []
+        if (JSON.stringify(prevIds) !== JSON.stringify(kept) || String(task.account || '') !== label) {
+          task.accounts = kept
+          task.account = label
+          changed = true
+        }
+      }
+      return changed
+    },
     ensureBuiltinSchedules() {
       if (!Array.isArray(this.schedules)) this.schedules = []
       if (!Array.isArray(this.settings.dismissedBuiltinIds)) this.settings.dismissedBuiltinIds = []
       const dismissed = new Set(this.settings.dismissedBuiltinIds)
       let changed = false
+      if (this.pruneStaleScheduleAccounts()) changed = true
       for (const def of BUILTIN_SCHEDULE_DEFS) {
         if (dismissed.has(def.id)) continue
         const existing = this.schedules.find((item) => item.id === def.id)
@@ -466,7 +493,7 @@ export const useAppStore = defineStore('app', {
       const productLink = String(product?.link || product?.goodsUrl || item.productLink || '').trim()
         || (productId ? `https://haohuo.jinritemai.com/ecommerce/trade/detail/index.html?id=${productId}` : '')
       const wantCart = (usingOverride ? page.dyCart !== false : page.dyCart !== false) && Boolean(productId || productLink)
-      const wantTags = usingOverride ? Boolean(page.dyTags) : page.dyTags !== false
+      const wantTags = page.dyTags !== false
       const optimizedTags = Array.isArray(item.optimizedTags)
         ? item.optimizedTags.map((tag) => String(tag || '').replace(/^#/, '').trim()).filter((tag) => tag && tag.length <= 12).slice(0, 5)
         : []
@@ -1763,7 +1790,10 @@ export const useAppStore = defineStore('app', {
             model: work.model,
             voice: work.voice || this.settings.voice
           }, product || { title: work.title })
-        const voiced = withVoice(prompt || storedPrompt, work.voice || this.settings.voice)
+        const voiced = withVoice(
+          `${prompt || storedPrompt}\n\n只根据本条上传的商品图生成，编号${work.no || work.id}，不要沿用上一条对话或上一条视频的画面。`,
+          work.voice || this.settings.voice
+        )
         const removed = new Set(product?.removedImages || [])
         const shots = this.productShots(work)
         const fallbackShots = shots.length
@@ -2172,6 +2202,10 @@ export const useAppStore = defineStore('app', {
         : [null]
       const created = []
         products.forEach((product) => {
+        if (product?.id && this.works.some((item) => item.productId === product.id && ['待生成', '生成中'].includes(item.status))) {
+          this.addLog('info', '作品', `「${product.title}」已经在排队或生成中，不再重复加一条`)
+          return
+        }
         const picked = form.imagesByProduct?.[product?.id || '']
         const images = (Array.isArray(picked) ? picked : this.productImagesOf(product)).filter(Boolean)
         const work = {
@@ -2237,16 +2271,17 @@ export const useAppStore = defineStore('app', {
         if (!generatePending.includes(id)) generatePending.push(id)
       })
       if (account && ready.length) {
-        doubaoRunning.delete(account.id)
-        doubaoRunningAt.delete(account.id)
-        generateActive = Math.max(0, generateActive - 1)
-        const ids = []
-        while (ids.length < 5 && generatePending.length) ids.push(generatePending.shift())
-        if (ids.length) {
-          try {
-            this.launchDoubaoBatch(ids, account.id, false, { immediate: true, force: true })
-          } catch (error) {
-            this.addLog('error', '豆包', error.message || '打开豆包后没有发出图片和提示词')
+        if (doubaoRunning.has(account.id)) {
+          this.addLog('info', '豆包', '上一批还在这个窗口里跑，这几条会排在后面，不会再发一遍')
+        } else {
+          const ids = []
+          while (ids.length < 5 && generatePending.length) ids.push(generatePending.shift())
+          if (ids.length) {
+            try {
+              this.launchDoubaoBatch(ids, account.id, false, { immediate: true, force: true })
+            } catch (error) {
+              this.addLog('error', '豆包', error.message || '打开豆包后没有发出图片和提示词')
+            }
           }
         }
       }
