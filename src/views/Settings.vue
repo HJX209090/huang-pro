@@ -166,7 +166,7 @@
         </el-form-item>
         <el-form-item v-show="tab === 'doubao'" label="豆包同时打开">
           <el-input-number v-model="store.settings.doubaoOpen" :min="1" :max="10" />
-          <span class="num-hint">例如 3，同时开几个豆包窗口</span>
+          <span class="num-hint">同时跑几个窗口。每个窗口最多 5 条任务，10 条会开 2 个窗口</span>
         </el-form-item>
         <el-form-item v-show="tab === 'doubao'" label="豆包启动间隔">
           <el-input-number v-model="store.settings.doubaoGap" :min="0" :max="60" />

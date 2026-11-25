@@ -81,6 +81,8 @@ export const PERSIST_KEYS = [
 
 let saveTimer = null
 const busyDoubao = new Set()
+const doubaoRunning = new Set()
+const doubaoWatchAfter = new Map()
 let generateActive = 0
 const generatePending = []
 let nextDoubaoLaunch = 0
@@ -513,7 +515,7 @@ export const useAppStore = defineStore('app', {
         const tagHint = Array.isArray(payload.tags) && payload.tags.length
           ? '，话题 ' + payload.tags.map((t) => '#' + t).join(' ')
           : ''
-        this.addLog('info', '发布', item.title + '：将填写作品标题「' + (payload.title || '空') + '」' + tagHint)
+        this.addLog('info', '发布', item.title + '：作品标题留空，不代填' + tagHint)
         const taskId = this.beginTask({
           kind: '发布',
           title: item.title,
@@ -1539,36 +1541,23 @@ export const useAppStore = defineStore('app', {
       work.publishAccount = ''
       work.failReason = ''
       work.progress = 5
-      work.status = '生成中'
-      work.doubaoSlot = `gen-${work.id}-${Date.now()}`
-      // 从排队里去掉旧任务，避免卡在后面
+      work.doubaoSlot = 'acct'
+      work.status = '待生成'
       for (let i = generatePending.length - 1; i >= 0; i -= 1) {
         if (generatePending[i] === workId) generatePending.splice(i, 1)
       }
-      const today = todayKey()
-      const account = (this.doubaoAccounts || []).find((item) => {
-        if (!item.enabled || item.quotaDate === today) return false
-        return doubaoQuotaUsed(this.works, item, today) < quotaLimit(item)
-      })
+      const account = this.pickIdleDoubaoAccount()
       if (!account) {
-        work.status = '待生成'
-        this.addLog('error', '豆包', '没有还有额度的豆包账号')
-        return '豆包账号今日额度都用完了，或还没有添加账号'
+        this.addLog('error', '豆包', '没有空闲且还有额度的豆包账号。这条已排到当前这条成片保存之后')
+        this.kickGenerate(workId, { immediate: true })
+        return '这个豆包号正在做上一条，成片保存后会在同一个窗口里接着做'
       }
       work.doubaoAccountId = account.id
       work.doubaoAccount = account.name
-      // 同账号卡死时放行，重新生成要马上开窗
       busyDoubao.delete(account.id)
       this.persist()
-      this.addLog('info', '豆包', `重新生成「${work.title}」，立即打开豆包并发送提示词和 ${images.length} 张商品图`)
-      generateActive += 1
-      Promise.resolve()
-        .then(() => this.runDoubao(workId))
-        .catch((error) => this.addLog('error', '豆包', error.message || '重新生成中断'))
-        .finally(() => {
-          generateActive = Math.max(0, generateActive - 1)
-          this.pumpGenerate()
-        })
+      this.addLog('info', '豆包', `重新生成「${work.title}」，使用 ${account.name} 的同一个窗口`)
+      this.kickGenerate(workId, { immediate: true })
       return ''
     },
     kickGenerate(workId, options = {}) {
@@ -1579,28 +1568,259 @@ export const useAppStore = defineStore('app', {
       generatePending.push(...pending)
       this.pumpGenerate({ immediate: Boolean(options.immediate) })
     },
+    pickIdleDoubaoAccount(skipped = []) {
+      const today = todayKey()
+      const accounts = (this.doubaoAccounts || []).filter((item) => {
+        if (!item.enabled || skipped.includes(item.id) || doubaoRunning.has(item.id)) return false
+        if (item.quotaDate && item.quotaDate === today) return false
+        if (this.works.some((row) => row.doubaoAccountId === item.id && row.status === '生成中')) return false
+        return doubaoQuotaUsed(this.works, item, today) < quotaLimit(item)
+      }).sort((a, b) => {
+        const load = (id) => this.works.filter((row) => row.doubaoAccountId === id && row.quotaPending && row.status === '生成中').length
+        return load(a.id) - load(b.id)
+      })
+      return accounts.find((item) => item.loginStatus === '已登录') || accounts[0] || null
+    },
+    pickWatchDoubaoAccount() {
+      const now = Date.now()
+      const accounts = (this.doubaoAccounts || []).filter((item) => {
+        if (!item.enabled || doubaoRunning.has(item.id)) return false
+        if ((doubaoWatchAfter.get(item.id) || 0) > now) return false
+        return this.works.some((row) => row.doubaoAccountId === item.id && row.status === '生成中' && row.doubaoChatUrl)
+      })
+      return accounts[0] || null
+    },
     pumpGenerate(options = {}) {
       const limit = Math.max(1, Math.min(10, Number(this.settings.doubaoOpen) || 1))
-      while (generateActive < limit && generatePending.length) {
-        const workId = generatePending.shift()
-        generateActive += 1
-        const gap = options.immediate ? 0 : Math.max(0, Number(this.settings.doubaoGap) || 0) * 1000
-        const now = Date.now()
-        const at = gap ? Math.max(now, nextDoubaoLaunch) : now
-        nextDoubaoLaunch = at + (gap || 0)
-        const delay = Math.max(0, at - now)
-        options.immediate = false
-        Promise.resolve()
-          .then(() => (delay ? new Promise((resolve) => setTimeout(resolve, delay)) : null))
-          .then(() => this.runDoubao(workId))
-          .catch((error) => this.addLog('error', '豆包', error.message || '生成中断'))
-          .finally(() => {
-            generateActive = Math.max(0, generateActive - 1)
-            this.pumpGenerate()
-          })
+      while (generateActive < limit) {
+        const watchAccount = this.pickWatchDoubaoAccount()
+        if (watchAccount) {
+          const ids = this.works.filter((row) => row.doubaoAccountId === watchAccount.id && row.status === '生成中' && row.doubaoChatUrl).slice(0, 5).map((row) => row.id)
+          this.launchDoubaoBatch(ids, watchAccount.id, true, options)
+          continue
+        }
+        if (!generatePending.length) break
+        const account = this.pickIdleDoubaoAccount()
+        if (!account) break
+        const room = Math.min(5, quotaLimit(account) - doubaoQuotaUsed(this.works, account, todayKey()))
+        if (room <= 0) break
+        const ids = []
+        while (ids.length < room && generatePending.length) ids.push(generatePending.shift())
+        if (!ids.length) break
+        this.launchDoubaoBatch(ids, account.id, false, options)
       }
     },
-    async runDoubao(workId, skipped = []) {
+    launchDoubaoBatch(workIds, accountId, watch, options = {}) {
+      doubaoRunning.add(accountId)
+      generateActive += 1
+      const gap = options.immediate || watch ? 0 : Math.max(0, Number(this.settings.doubaoGap) || 0) * 1000
+      const now = Date.now()
+      const at = gap ? Math.max(now, nextDoubaoLaunch) : now
+      nextDoubaoLaunch = at + (gap || 0)
+      const delay = Math.max(0, at - now)
+      options.immediate = false
+      Promise.resolve()
+        .then(() => (delay ? new Promise((resolve) => setTimeout(resolve, delay)) : null))
+        .then(() => this.runDoubaoBatch(workIds, accountId, watch))
+        .catch((error) => this.addLog('error', '豆包', error.message || '生成中断'))
+        .finally(() => {
+          doubaoRunning.delete(accountId)
+          generateActive = Math.max(0, generateActive - 1)
+          this.pumpGenerate()
+        })
+    },
+    async runDoubaoBatch(workIds, accountId, watch = false) {
+      const account = (this.doubaoAccounts || []).find((item) => item.id === accountId)
+      const works = (workIds || []).map((id) => this.works.find((item) => item.id === id)).filter(Boolean)
+      if (!account || !works.length) return
+      if (!window.tujian?.generateDoubao) {
+        works.forEach((work) => {
+          if (watch) return
+          work.status = '生成失败'
+          work.failReason = '请在桌面窗口里用网页版豆包生成'
+        })
+        this.addLog('warning', '豆包', '请在桌面窗口里用网页版豆包生成')
+        this.persist()
+        return
+      }
+      ensureDoubaoRules(this.settings)
+      const jobs = []
+      const taskIds = new Map()
+      for (const work of works) {
+        if (!watch && this.isWorkCancelled(work.id)) {
+          cancelledWorks.delete(String(work.id))
+          work.status = '待生成'
+          work.failReason = '已在任务中心手动结束'
+          continue
+        }
+        const product = this.products.find((item) => item.id === work.productId)
+        const storedPrompt = work.prompt || product?.filledPrompt || ''
+        const prompt = product && this.promptFitsProduct(storedPrompt, product)
+          ? storedPrompt
+          : this.promptForProduct({
+            promptText: this.settings.promptText,
+            lockText: work.lockText,
+            storyline: work.storyline,
+            caption: work.caption,
+            script: work.script,
+            compliance: work.compliance,
+            duration: work.duration,
+            ratio: work.ratio,
+            model: work.model,
+            voice: work.voice || this.settings.voice
+          }, product || { title: work.title })
+        const voiced = withVoice(prompt, work.voice || this.settings.voice)
+        const shots = this.productShots(work)
+        if (!watch) {
+          if (!String(voiced || '').trim() || !shots.length) {
+            work.status = '生成失败'
+            work.failReason = !String(voiced || '').trim() ? '提示词是空的。提示词和图片必须一起发' : '没有商品图。提示词和图片必须一起发'
+            this.addLog('warning', '豆包', `「${work.title}」${work.failReason}`)
+            continue
+          }
+          work.prompt = voiced
+          work.images = shots
+          work.image = shots[0]
+          if (!work.no) work.no = this.nextWorkNo()
+          work.status = '生成中'
+          work.progress = 10
+          work.failReason = ''
+          work.confirmNote = ''
+          work.doubaoAccount = account.name
+          work.doubaoAccountId = account.id
+          work.doubaoSlot = 'acct'
+          chargeWorkQuota(work)
+        }
+        jobs.push({
+          workId: work.id,
+          prompt: voiced,
+          images: shots,
+          chatUrl: work.doubaoChatUrl || ''
+        })
+        taskIds.set(work.id, this.beginTask({
+          kind: '生成',
+          title: work.title,
+          workId: work.id,
+          accountId: account.id,
+          note: watch ? '检查已分配的任务' : '正在挂新工作任务'
+        }))
+      }
+      if (!jobs.length) {
+        this.persist()
+        return
+      }
+      account.worker = '生成中'
+      this.syncDoubaoStats()
+      this.addLog('info', '豆包', watch
+        ? `${account.name} 正在检查这个窗口里的 ${jobs.length} 条任务`
+        : `${account.name} 开 1 个窗口，挂 ${jobs.length} 条新工作任务（每个窗口最多 5 条）`)
+      this.persist()
+      let result
+      try {
+        result = await window.tujian.generateDoubao(toPlain({
+          id: account.id,
+          name: account.name,
+          login: account.login,
+          mode: account.loginMode || 'password',
+          slot: 'acct',
+          saveDir: this.settings.outputDir,
+          watch,
+          jobs,
+          captcha: this.settings.captchaSolver || {},
+          replyRules: this.settings.doubaoReply,
+          failMarkers: [
+            ...(this.settings.doubaoFail?.immediate || []).filter((item) => item.enabled && item.match).map((item) => item.match),
+            ...(this.settings.doubaoFail?.weak || []).filter((item) => item.enabled && item.match).map((item) => item.match)
+          ],
+          retryMarkers: {
+            copyright: (this.settings.doubaoFail?.retryCopyright || []).filter((item) => item.enabled !== false && item.match).map((item) => item.match),
+            busy: (this.settings.doubaoFail?.retryBusy || []).filter((item) => item.enabled !== false && item.match).map((item) => item.match)
+          }
+        }))
+      } catch (error) {
+        const message = /could not be cloned/i.test(String(error?.message || error))
+          ? '参数无法传给桌面进程，请再点一次开始生成'
+          : (error.message || '生成中断')
+        jobs.forEach((job) => {
+          const work = works.find((item) => item.id === job.workId)
+          if (!work || watch) return
+          work.status = '生成失败'
+          releaseWorkQuota(work)
+          work.failReason = message
+          this.endTask(taskIds.get(work.id), message, 'failed')
+        })
+        this.addLog('error', '豆包', message)
+        this.persist()
+        return
+      }
+      const rows = Array.isArray(result?.results) ? result.results : []
+      let stillRunning = false
+      for (const job of jobs) {
+        const work = works.find((item) => item.id === job.workId)
+        if (!work) continue
+        if (this.isWorkCancelled(work.id)) {
+          cancelledWorks.delete(String(work.id))
+          if (!watch) releaseWorkQuota(work)
+          work.status = '待生成'
+          work.failReason = '已在任务中心手动结束'
+          this.endTask(taskIds.get(work.id), work.failReason, 'cancelled')
+          continue
+        }
+        const row = rows.find((item) => item.workId === work.id) || { outcome: 'failed', message: result?.message || '没有返回这条任务的结果' }
+        this.finishDoubaoTask(work, account, row, taskIds.get(work.id), watch)
+        if (work.status === '生成中') stillRunning = true
+      }
+      if (stillRunning) doubaoWatchAfter.set(account.id, Date.now() + 20000)
+      else doubaoWatchAfter.delete(account.id)
+      const still = this.works.some((item) => item.doubaoAccountId === account.id && item.status === '生成中')
+      if (!still) account.worker = '空闲'
+      this.syncDoubaoStats()
+      this.persist()
+    },
+    finishDoubaoTask(work, account, row, taskId, watch) {
+      if (row.doubaoChatUrl) work.doubaoChatUrl = row.doubaoChatUrl
+      work.confirmNeeded = Boolean(row.confirmNeeded)
+      work.confirmSent = Boolean(row.confirmSent)
+      if (row.confirmNote) work.confirmNote = row.confirmNote
+      if (row.outcome === 'success' && row.videoPath) {
+        work.videoPath = row.videoPath
+        work.status = '已生成'
+        work.progress = 100
+        work.generatedAt = formatTime(new Date())
+        work.finishedAt = work.generatedAt
+        work.failReason = ''
+        keepWorkQuota(work)
+        this.doneNotice = `${work.title}视频生成完成`
+        this.endTask(taskId, '成片已保存（已去水印）')
+        this.addLog('success', '豆包', `「${work.title}」生成成功，已自动去掉水印，保存在 ${row.videoPath}`)
+        this.notifyWebhook(`【huang++pro】生成完成：${work.title}`)
+        return
+      }
+      if (row.outcome === 'quota') {
+        releaseWorkQuota(work)
+        account.quotaDate = todayKey()
+        work.status = '待生成'
+        work.failReason = '这个豆包号额度不够，已改排'
+        this.endTask(taskId, work.failReason)
+        if (!generatePending.includes(work.id)) generatePending.unshift(work.id)
+        this.addLog('warning', '豆包', `${account.name} ${work.failReason}`)
+        return
+      }
+      if (row.outcome === 'failed') {
+        releaseWorkQuota(work)
+        work.status = '生成失败'
+        work.progress = 0
+        work.failReason = row.message || '这条任务生成失败'
+        this.endTask(taskId, work.failReason, 'failed')
+        this.addLog('warning', '豆包', `「${work.title}」${work.failReason}`)
+        return
+      }
+      work.status = '生成中'
+      work.confirmNote = row.confirmNote || (row.confirmNeeded ? '这条任务还要确定' : '生成中')
+      this.endTask(taskId, work.confirmNote)
+      this.addLog(row.confirmNeeded && !row.confirmSent ? 'warning' : 'info', '豆包', `「${work.title}」${work.confirmNote}`)
+    },
+    async runDoubao(workId, skipped = [], forcedAccountId = '') {
       const work = this.works.find((item) => item.id === workId)
       if (!work) return
       if (this.isWorkCancelled(workId)) {
@@ -1613,6 +1833,7 @@ export const useAppStore = defineStore('app', {
       const today = todayKey()
       const accounts = this.doubaoAccounts.filter((item) => {
         if (!item.enabled || (item.quotaDate && item.quotaDate === today) || skipped.includes(item.id)) return false
+        if (forcedAccountId && item.id !== forcedAccountId) return false
         return doubaoQuotaUsed(this.works, item, today) < quotaLimit(item)
       }).sort((a, b) => {
         const load = (id) => this.works.filter((row) => row.doubaoAccountId === id && row.quotaPending && row.status === '生成中').length
@@ -1702,7 +1923,7 @@ export const useAppStore = defineStore('app', {
       const sourceCopy = this.sourceCopy(work)
       work.sourceTitle = sourceCopy.title
       work.sourceTags = sourceCopy.tags
-      const slot = work.doubaoSlot || `gen-${work.id}`
+      const slot = 'acct'
       work.doubaoSlot = slot
       chargeWorkQuota(work)
       this.syncDoubaoStats()
@@ -1759,9 +1980,11 @@ export const useAppStore = defineStore('app', {
         account.worker = '空闲'
         this.endTask(taskId, '额度不够，换号重试')
         this.syncDoubaoStats()
-        this.addLog('warning', '豆包', `${account.name} 额度不够，自动换下一个账号`)
+        this.addLog('warning', '豆包', `${account.name} 额度不够，这条改排到下一个还有额度的号`)
+        work.status = '待生成'
+        if (!generatePending.includes(workId)) generatePending.unshift(workId)
         this.persist()
-        return this.runDoubao(workId, skipped.concat(account.id))
+        return
       }
       let videoPath = result?.videoPath || ''
       let chatUrl = result?.doubaoChatUrl || ''
@@ -1895,7 +2118,7 @@ export const useAppStore = defineStore('app', {
       created.forEach((id) => {
         const work = this.works.find((item) => item.id === id)
         if (!work) return
-        work.doubaoSlot = `gen-${id}`
+        work.doubaoSlot = 'acct'
         if (!String(work.prompt || '').trim()) {
           work.status = '生成失败'
           work.failReason = '提示词是空的。提示词和图片必须一起发'

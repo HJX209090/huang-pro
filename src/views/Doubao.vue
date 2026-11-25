@@ -29,7 +29,7 @@
         <el-input-number v-model="store.settings.doubaoOpen" :min="1" :max="10" @change="store.persist()" />
         <span class="muted">启动间隔（秒）</span>
         <el-input-number v-model="store.settings.doubaoGap" :min="0" :max="60" @change="store.persist()" />
-        <span class="muted">同时打开是正在跑的窗口上限，启动间隔是后一个窗口晚几秒再开。点开始生成会把待生成全部排队。</span>
+        <span class="muted">每个窗口最多挂 5 条分配的任务。10 条开 2 个窗口，8 条是 5 条加 3 条。同时打开是同时跑几个窗口。</span>
       </div>
       <el-table :data="pageRows">
         <el-table-column prop="name" label="账号名称" min-width="140" />
@@ -277,7 +277,7 @@ function startGenerate() {
   const gap = Math.max(0, Number(store.settings.doubaoGap) || 0)
   pending.forEach((work) => store.kickGenerate(work.id))
   store.addLog('info', '豆包', `排队 ${pending.length} 条，同时打开 ${open} 个，间隔 ${gap} 秒`)
-  ElMessage.success(`已排队 ${pending.length} 条。同时最多开 ${open} 个窗口，每个错开 ${gap} 秒`)
+  ElMessage.success(`已排队 ${pending.length} 条。每 5 条一个窗口，同时最多开 ${open} 个窗口`)
 }
 
 function collectOnce() {
@@ -312,7 +312,7 @@ async function showBrowsers(row) {
         login: '',
         mode: 'qr',
         url: work.doubaoChatUrl,
-        slot: work.doubaoSlot || `gen-${work.id}`,
+        slot: work.status === '生成中' ? 'acct' : `see-${work.id}`,
         already: row.loginStatus === '已登录'
       })
     }

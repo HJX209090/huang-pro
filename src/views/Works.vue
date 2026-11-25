@@ -173,7 +173,7 @@ async function openDoubao(work) {
     login: '',
     mode: 'qr',
     url: work.doubaoChatUrl,
-    slot: work.doubaoSlot || `gen-${work.id}`,
+    slot: work.status === '生成中' ? 'acct' : `see-${work.id}`,
     already: account.loginStatus === '已登录'
   })
   ElMessage.success(`已打开编号 ${work.no || ''} 的生成页`)

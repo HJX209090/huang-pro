@@ -2259,7 +2259,291 @@ function optimizeAsk(no, title, tags) {
   return `编号${no || ''}。请只优化这条抖音发布文案，不要重新生成视频，也不要重复我下面的说明。\n原标题：${title || ''}\n原标签：${tagText}\n只回复两行，把内容换成优化后的标题和标签：\n优化标题：\n优化标签：`
 }
 
-async function generateOnDoubao({ id, name, login, mode, prompt, image, images, imageCount, saveDir, workId, notify, slot, failMarkers, replyRules, captcha, retryMarkers, copyNo, copyTitle, copyTags }) {
+function clickNewWorkTaskScript() {
+  return `(() => {
+    const compact = (value) => String(value || '').replace(/\\s+/g, '')
+    const nodes = []
+    const walk = (root) => {
+      if (!root || !root.querySelectorAll) return
+      root.querySelectorAll('button, a, [role="button"], div, span, li').forEach((el) => nodes.push(el))
+      root.querySelectorAll('*').forEach((el) => { if (el.shadowRoot) walk(el.shadowRoot) })
+    }
+    walk(document)
+    const hits = nodes.filter((el) => {
+      const text = compact(el.innerText || el.textContent)
+      if (text !== '新工作任务' && text !== '新建工作任务' && !(text.startsWith('新工作任务') && text.length <= 12)) return false
+      const rect = el.getBoundingClientRect()
+      return rect.width > 16 && rect.height > 12 && rect.left < 460 && rect.bottom > 0 && rect.top < window.innerHeight
+    })
+    hits.sort((a, b) => a.getBoundingClientRect().width * a.getBoundingClientRect().height - b.getBoundingClientRect().width * b.getBoundingClientRect().height)
+    if (!hits[0]) return 'miss'
+    ;(hits[0].closest('button, a, [role="button"]') || hits[0]).click()
+    return 'clicked'
+  })()`
+}
+
+function listChatIdsScript() {
+  return `(() => {
+    const ids = new Set()
+    const take = (href) => {
+      const matched = String(href || '').match(/doubao\\.com\\/chat\\/([^/?#]+)/i)
+      if (matched && matched[1] && matched[1] !== 'chat') ids.add(matched[1])
+    }
+    const walk = (root) => {
+      if (!root || !root.querySelectorAll) return
+      root.querySelectorAll('a[href]').forEach((el) => take(el.href))
+      root.querySelectorAll('*').forEach((el) => { if (el.shadowRoot) walk(el.shadowRoot) })
+    }
+    walk(document)
+    take(location.href)
+    return Array.from(ids)
+  })()`
+}
+
+async function collectChatIds(win) {
+  if (!win || win.isDestroyed()) return new Set()
+  const raw = await win.webContents.executeJavaScript(listChatIdsScript()).catch(() => [])
+  return new Set(Array.isArray(raw) ? raw.map((item) => String(item || '')).filter(Boolean) : [])
+}
+
+async function materializeDoubaoImages(win, urls, folder, workId) {
+  const savedImages = []
+  const filePayload = []
+  for (let index = 0; index < urls.length; index += 1) {
+    const current = urls[index]
+    const local = localImagePath(current)
+    if (local) {
+      if (!fs.existsSync(local)) continue
+      const plain = fs.readFileSync(local)
+      if (plain.length < 100) continue
+      const mime = /\.png$/i.test(local) ? 'image/png' : 'image/jpeg'
+      savedImages.push(local)
+      filePayload.push({ buffer: plain, mime, name: path.basename(local) })
+      continue
+    }
+    if (!/^https?:\/\//.test(current)) continue
+    const plain = await downloadImage(current, win.webContents.session)
+    if (plain.length < 100) continue
+    const mime = /\.png(\?|$)/i.test(current) ? 'image/png' : 'image/jpeg'
+    const imagePath = path.join(folder, `${workId || Date.now()}-product-${index + 1}.${mime === 'image/png' ? 'png' : 'jpg'}`)
+    saveFile(imagePath, plain)
+    savedImages.push(imagePath)
+    filePayload.push({ buffer: plain, mime, name: `product-${index + 1}.${mime === 'image/png' ? 'png' : 'jpg'}` })
+  }
+  return { savedImages, filePayload }
+}
+
+async function sendPreparedDoubao(win, text, savedImages, filePayload) {
+  let attached = 'miss'
+  const placed = await setFileInputs(win, savedImages)
+  if (placed) {
+    await wait(600)
+    attached = await runInFrames(win, imagesPresentScript())
+  }
+  if (attached !== 'file') {
+    const chosen = await chooseLocalImages(win, savedImages)
+    if (chosen) attached = 'file'
+  }
+  if (attached !== 'file') {
+    for (let attempt = 0; attempt < 5 && attached !== 'file'; attempt += 1) {
+      attached = await runInFrames(win, attachFilesScript(filePayload))
+      if (attached !== 'file') await wait(700)
+    }
+  }
+  await wait(800)
+  if (attached !== 'file') return { ok: false, message: '商品图没有放进这条新工作任务' }
+  const snippet = String(text || '').slice(0, 12)
+  let filled = 'miss'
+  for (let attempt = 0; attempt < 8 && filled !== 'filled'; attempt += 1) {
+    await fillPrompt(win, text)
+    await wait(400)
+    filled = await runInFrames(win, promptLandedScript(snippet))
+  }
+  if (filled !== 'filled') return { ok: false, message: '提示词没有写进这条新工作任务' }
+  let sent = 'miss'
+  for (let attempt = 0; attempt < 6 && sent !== 'clicked'; attempt += 1) {
+    sent = await runInFrames(win, sendScript())
+    if (sent !== 'clicked') await wait(400)
+  }
+  if (sent !== 'clicked') return { ok: false, message: '新工作任务没有点到发送' }
+  return { ok: true, message: '已发送' }
+}
+
+async function waitFreshChatUrl(win, before) {
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const url = String(win.webContents.getURL() || '')
+    const matched = url.match(/doubao\.com\/chat\/([^/?#]+)/i)
+    if (matched && !before.has(matched[1])) return `https://www.doubao.com/chat/${matched[1]}`
+    const now = await collectChatIds(win)
+    for (const id of now) {
+      if (!before.has(id)) return `https://www.doubao.com/chat/${id}`
+    }
+    await wait(500)
+  }
+  return ''
+}
+
+async function readAssignedTask(win, job) {
+  const chain = startChainCapture(win)
+  try {
+    await chain.ready
+    await loadPage(win, job.chatUrl, { quiet: true })
+    await wait(1600)
+    const state = await readDoubao(win, job.snippet, 0)
+    let held = await cleanUrlFromBodies(win.webContents.session, chain.bodies.splice(0))
+    if (!held && state.state === 'ready') {
+      try { win.webContents.reload() } catch { /* 刷新失败就等下一轮 */ }
+      await wait(2200)
+      held = await cleanUrlFromBodies(win.webContents.session, chain.bodies.splice(0))
+    }
+    if (state.state === 'mismatch') {
+      return { outcome: 'failed', message: '豆包发现图片和商品不是同一件，已停止。不会回复 1 或 2。' }
+    }
+    if (state.state === 'quota') return { outcome: 'quota', message: '这个豆包账号额度不够' }
+    if (state.state === 'failed') return { outcome: 'failed', message: `豆包拒绝生成：${state.failMarker || '页面出现失败话术'}` }
+    if (state.asks || state.confirmVisible || state.state === 'confirm') {
+      const pressed = await pressConfirm(win, job.snippet, 0)
+      if (pressed.quota) return { outcome: 'quota', message: '这个豆包账号额度不够' }
+      if (pressed.state === 'mismatch') return { outcome: 'failed', message: '图片和商品对不上，已停止' }
+      return {
+        outcome: 'confirm',
+        confirmNeeded: true,
+        confirmSent: Boolean(pressed.confirmSent),
+        confirmNote: pressed.confirmNote || '这条任务还要确定'
+      }
+    }
+    if (held) {
+      const saved = await downloadCleanFile(held, job.file, win.webContents.session)
+      if (saved) return { outcome: 'success', videoPath: saved, clean: true, confirmNote: '生成成功，已按无水印地址保存' }
+    }
+    if (state.state === 'ready') return { outcome: 'running', confirmNote: '视频已出来，正在取无水印地址' }
+    if (state.generating || state.busyMarker) return { outcome: 'running', confirmNote: '生成中' }
+    return { outcome: 'running', confirmNote: '已挂上，等待这条任务出结果' }
+  } finally {
+    await chain.stop()
+  }
+}
+
+async function generateAssignedTasks(payload) {
+  const { id, name, login, mode, slot, saveDir, notify, captcha, replyRules, failMarkers, retryMarkers, jobs, watch } = payload || {}
+  const list = (Array.isArray(jobs) ? jobs : []).slice(0, 5)
+  const copyrightList = Array.isArray(retryMarkers?.copyright) && retryMarkers.copyright.length ? retryMarkers.copyright : DEFAULT_RETRY_COPYRIGHT
+  const busyList = Array.isArray(retryMarkers?.busy) && retryMarkers.busy.length ? retryMarkers.busy : DEFAULT_RETRY_BUSY
+  activeRetryCopyright = copyrightList.map((item) => String(item || '').trim()).filter(Boolean).slice(0, 40)
+  activeRetryBusy = busyList.map((item) => String(item || '').trim()).filter(Boolean).slice(0, 40)
+  const copyrightSet = new Set(activeRetryCopyright.map((item) => item.replace(/\s+/g, '')))
+  activeFailMarkers = (Array.isArray(failMarkers) ? failMarkers : [])
+    .map((item) => String(item || '').trim())
+    .filter((item) => item && !copyrightSet.has(item.replace(/\s+/g, '')) && !activeRetryBusy.some((busy) => item.includes(busy) || busy.includes(item)))
+    .slice(0, 30)
+  activeReplyRules = replyRules && typeof replyRules === 'object' ? replyRules : null
+  const captchaConfig = doubaoCaptcha.normalizeConfig(captcha)
+  const page = 'https://www.doubao.com/chat/'
+  const folder = saveDir || path.join(app.getPath('videos'), 'huang-plusplus-pro')
+  fs.mkdirSync(folder, { recursive: true })
+  await openAccount({ kind: 'doubao', id, name, login, mode: mode || 'password', url: page, slot: slot || 'acct' })
+  const win = windows.get(sessionKey('doubao', id, page, slot || 'acct'))
+  if (!win || win.isDestroyed()) {
+    return { ok: false, message: '网页版豆包没有打开', results: list.map((job) => ({ workId: job.workId, outcome: 'failed', message: '网页版豆包没有打开' })) }
+  }
+  pinHideOnClose(win)
+  win.setTitle(`${name || '豆包'} · ${list.length}个任务`)
+  bringToFront(win)
+  attachDoubaoPromoGuard(win)
+  await dismissDoubaoPromo(win)
+  const tasks = []
+  for (let index = 0; index < list.length; index += 1) {
+    const job = list[index]
+    const workId = String(job.workId || '')
+    const text = String(job.prompt || '').trim()
+    const urls = [...new Set((Array.isArray(job.images) ? job.images : []).map((item) => String(item || '')).filter(Boolean))]
+    const file = path.join(folder, `${workId || Date.now()}.mp4`)
+    const knownUrl = /doubao\.com\/chat\/[^/?#]+/i.test(String(job.chatUrl || '')) ? String(job.chatUrl) : ''
+    if (watch && knownUrl) {
+      tasks.push({ workId, snippet: text.slice(0, 12), chatUrl: knownUrl, file, done: false, last: { outcome: 'running', confirmNote: '继续检查这条已分配的任务' } })
+      continue
+    }
+    if (!text || !urls.length) {
+      tasks.push({ workId, done: true, last: { outcome: 'failed', message: !text ? '提示词是空的' : '没有商品图' } })
+      continue
+    }
+    const before = await collectChatIds(win)
+    let opened = 'miss'
+    for (let attempt = 0; attempt < 4 && opened !== 'clicked'; attempt += 1) {
+      opened = await runInFrames(win, clickNewWorkTaskScript())
+      if (opened !== 'clicked') await wait(500)
+    }
+    if (opened !== 'clicked') {
+      tasks.push({ workId, done: true, last: { outcome: 'failed', message: '没有点到左侧的「新工作任务」' } })
+      continue
+    }
+    await wait(900)
+    await runInFrames(win, clickTextScript(['视频生成', '生成视频']))
+    await wait(700)
+    const prepared = await materializeDoubaoImages(win, urls, folder, workId)
+    if (!prepared.savedImages.length) {
+      tasks.push({ workId, done: true, last: { outcome: 'failed', message: '商品图没有下载下来，这条任务没有发送' } })
+      continue
+    }
+    const sent = await sendPreparedDoubao(win, text, prepared.savedImages, prepared.filePayload)
+    if (!sent.ok) {
+      tasks.push({ workId, done: true, last: { outcome: 'failed', message: sent.message } })
+      continue
+    }
+    const captchaGate = await doubaoCaptcha.waitGate(win, captchaConfig, (data) => notify?.({ workId, status: '生成中', ...data }))
+    if (captchaGate.hit && !captchaGate.cleared) {
+      tasks.push({ workId, done: true, last: { outcome: 'failed', message: captchaGate.error || '验证码没有通过' } })
+      continue
+    }
+    const chatUrl = await waitFreshChatUrl(win, before)
+    if (!chatUrl) {
+      tasks.push({ workId, done: true, last: { outcome: 'failed', message: '这条任务已发送，但没有拿到它自己的对话地址，已停住，避免和旧任务混在一起' } })
+      continue
+    }
+    notify?.({ workId, status: '生成中', progress: 30 + index * 8, doubaoChatUrl: chatUrl, confirmNote: `已挂到第 ${index + 1}/${list.length} 条新工作任务` })
+    tasks.push({ workId, snippet: text.slice(0, 12), chatUrl, file, done: false, last: { outcome: 'running', confirmNote: '已挂上，等待结果', doubaoChatUrl: chatUrl } })
+  }
+  const rounds = watch ? 12 : 24
+  for (let round = 0; round < rounds; round += 1) {
+    const pending = tasks.filter((item) => !item.done && item.chatUrl)
+    if (!pending.length || win.isDestroyed()) break
+    for (const task of pending) {
+      if (win.isDestroyed()) break
+      const read = await readAssignedTask(win, task)
+      task.last = { ...task.last, ...read, doubaoChatUrl: task.chatUrl }
+      notify?.({
+        workId: task.workId,
+        status: '生成中',
+        doubaoChatUrl: task.chatUrl,
+        confirmNeeded: Boolean(read.confirmNeeded),
+        confirmSent: Boolean(read.confirmSent),
+        confirmNote: read.confirmNote || read.message || ''
+      })
+      if (read.outcome === 'success' || read.outcome === 'failed' || read.outcome === 'quota') task.done = true
+    }
+    if (tasks.every((item) => item.done || !item.chatUrl)) break
+    await wait(5000)
+  }
+  return {
+    ok: true,
+    saveDir: folder,
+    results: tasks.map((task) => ({
+      workId: task.workId,
+      outcome: task.last?.outcome || 'failed',
+      message: task.last?.message || '',
+      confirmNote: task.last?.confirmNote || '',
+      confirmNeeded: Boolean(task.last?.confirmNeeded),
+      confirmSent: Boolean(task.last?.confirmSent),
+      videoPath: task.last?.videoPath || '',
+      clean: Boolean(task.last?.clean),
+      doubaoChatUrl: task.chatUrl || task.last?.doubaoChatUrl || ''
+    }))
+  }
+}
+
+async function generateOnDoubao(payload = {}) {
+  if (Array.isArray(payload.jobs) && payload.jobs.length) return generateAssignedTasks(payload)
+  const { id, name, login, mode, prompt, image, images, imageCount, saveDir, workId, notify, slot, failMarkers, replyRules, captcha, retryMarkers, copyNo, copyTitle, copyTags } = payload
   const copyrightList = Array.isArray(retryMarkers?.copyright) && retryMarkers.copyright.length
     ? retryMarkers.copyright
     : DEFAULT_RETRY_COPYRIGHT
@@ -2300,9 +2584,15 @@ async function generateOnDoubao({ id, name, login, mode, prompt, image, images, 
   const savedImages = []
   const filePayload = []
   const currentChat = String(win.webContents.getURL() || '')
-  if (/doubao\.com\/chat\/[^/?#]+/i.test(currentChat)) {
-    await loadPage(win, page)
-    await wait(1200)
+  const oldChat = currentChat.match(/doubao\.com\/chat\/([^/?#]+)/i)
+  if (oldChat) {
+    await runInFrames(win, clickTextScript(['新对话', '新的对话', '开启新对话']))
+    await wait(1000)
+    const afterClick = String(win.webContents.getURL() || '')
+    if (afterClick.includes(oldChat[1])) {
+      await loadPage(win, page)
+      await wait(1200)
+    }
   }
   for (let attempt = 0; attempt < 16; attempt += 1) {
     const ready = await runInFrames(win, `(() => document.querySelector('textarea,[contenteditable="true"]') ? 'filled' : 'miss')()`)
@@ -2401,7 +2691,6 @@ async function generateOnDoubao({ id, name, login, mode, prompt, image, images, 
   let delivery = await ensureDelivered(win, snippet, notify, workId, before)
   const withConfirm = (payload) => ({
     ...payload,
-    ...(latestCopy || {}),
     confirmNeeded: Boolean(delivery.confirmNeeded),
     confirmSent: Boolean(delivery.confirmSent),
     confirmNote: delivery.confirmNote || ''
@@ -2423,8 +2712,6 @@ async function generateOnDoubao({ id, name, login, mode, prompt, image, images, 
   let busyRetries = 0
   let plainResent = false
   let notedChat = false
-  let copySent = false
-  let latestCopy = null
   let lastRetryAt = 0
   const maxCopyrightRetries = 5
   const maxBusyRetries = 4
@@ -2451,20 +2738,6 @@ async function generateOnDoubao({ id, name, login, mode, prompt, image, images, 
         imagePaths: savedImages,
         message: '豆包发现上传的图片和商品不是同一件，已停止。不会改成别的商品，也不会用这组图硬生成。'
       })
-    }
-    if (!copySent && copyTitle && (state.generating || state.state === 'ready')) {
-      copySent = true
-      const ask = optimizeAsk(copyNo, copyTitle, copyTags)
-      await fillPrompt(win, ask)
-      await runInFrames(win, sendScript())
-      notify?.({ workId, status: '生成中', confirmNote: `已把编号${copyNo || ''}的原标题和标签发给豆包优化` })
-    }
-    if (tick % 2 === 0) {
-      const parsed = await readOptimizedCopy(win)
-      if (parsed) {
-        latestCopy = parsed
-        notify?.({ workId, status: '生成中', ...parsed })
-      }
     }
     if ((state.state === 'confirm' || state.confirmVisible || state.asks) && !state.confirmEcho && !delivery.confirmSent && confirmTries < 3) {
       confirmTries += 1
@@ -3689,24 +3962,13 @@ async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, 
     : (Array.isArray(tags) ? tags.map((item) => String(item || '').replace(/^#/, '').trim())
       .filter((item) => item && item.length >= 2 && item.length <= 12 && !/^https?:/i.test(item) && !/haohuo|jinritemai|douyin\.com/i.test(item))
       .slice(0, 5) : [])
-  const shortTitle = String(title || '').replace(/https?:\/\/\S+/gi, '').trim().slice(0, 30)
-  // 等发布编辑页「填写作品标题」输入框（上传/转码完成后才有）
+  const shortTitle = ''
   const editorReady = await waitCreatorEditor(win, notify, workId)
   if (editorReady === 'miss') {
-    notify?.({ workId, status: '发布中', confirmNote: '还没等到标题框，先继续填选项' })
+    notify?.({ workId, status: '发布中', confirmNote: '发布页还在加载，先继续挂商品和声明' })
   }
-  // 先写标题（挂车弹层容易冲掉标题，所以前后各写一次）
-  let titled = shortTitle ? 'miss' : 'skip'
-  if (shortTitle) {
-    notify?.({ workId, progress: 86, status: '发布中', confirmNote: `正在填写作品标题：${shortTitle}` })
-    titled = await fillCreatorTitle(win, shortTitle)
-  }
+  const titled = 'skip'
   const optionNotes = await applyPublishOptions(win, { ...opts, dyDeclare: opts.dyDeclare !== false, dyCart: opts.dyCart !== false && Boolean(productId || productLink) }, productLink, productId)
-  await wait(600)
-  await waitCreatorEditor(win, notify, workId)
-  if (shortTitle) {
-    titled = await fillCreatorTitle(win, shortTitle)
-  }
   const placed = []
   const topicLimit = 5
   if (topicTags.length) {
@@ -3727,12 +3989,6 @@ async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, 
       await wait(180)
     }
   }
-  // 话题后再写一次标题，防止弹层/误填冲掉
-  if (shortTitle) {
-    notify?.({ workId, progress: 92, status: '发布中', confirmNote: `确认作品标题：${shortTitle}` })
-    titled = await fillCreatorTitle(win, shortTitle)
-  }
-  // 收起话题下拉，避免挡住发布
   await runInFrames(win, `(() => {
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     return 'ok'
@@ -3750,7 +4006,7 @@ async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, 
       loginStatus: opened.loginStatus || '已登录',
       title: shortTitle,
       tags: placed.length ? placed : topicTags,
-      message: `${assist.note}。标题等已填好，请在打开的窗口里确认检测结果后再点发布。`
+      message: `${assist.note}。作品标题没有填写。请在打开的窗口里确认检测结果后再点发布。`
     }
   }
   if (assist.state === 'timeout') {
@@ -3786,9 +4042,7 @@ async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, 
   }
   bringToFront(win)
   const tagText = (placed.length ? placed : topicTags).map((item) => `#${item}`).join(' ')
-  const titleNote = titled === 'title' || titled === 'skip'
-    ? (shortTitle ? `标题「${shortTitle}」` : '未写入标题')
-    : `标题还没写进页面，准备的是「${shortTitle}」`
+  const titleNote = '作品标题留空，不代填'
   const extras = [
     optionNotes.includes('cart') ? '已按商品编号挂上购物车' : '',
     optionNotes.includes('cart-no-link') ? '挂车跳过：商品没有链接' : '',
