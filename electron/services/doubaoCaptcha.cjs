@@ -1,6 +1,7 @@
 const https = require('https')
 const http = require('http')
 const { nativeImage } = require('electron')
+const runtimeLog = require('./runtimeLog.cjs')
 
 const CAPTCHA_KEYS = [
   'captcha',
@@ -45,6 +46,25 @@ function detectScript() {
         }
       }
     }
+    const dialogs = Array.from(document.querySelectorAll('div,section,dialog,[role="dialog"]')).filter((el) => {
+      const text = String(el.innerText || '').replace(/\\s+/g, '')
+      const rect = el.getBoundingClientRect()
+      if (rect.width < 240 || rect.width > 760 || rect.height < 260 || rect.height > 920) return false
+      if (rect.left < 80) return false
+      return /拖拽到这里|拖到此处/.test(text) && /请选择/.test(text)
+    })
+    if (dialogs[0]) {
+      const rect = dialogs[0].getBoundingClientRect()
+      return {
+        hit: true,
+        via: 'dialog',
+        src: '',
+        left: Math.round(rect.left),
+        top: Math.round(rect.top),
+        w: Math.round(rect.width),
+        h: Math.round(rect.height)
+      }
+    }
     const body = String(document.body?.innerText || document.body?.textContent || '').slice(0, 10000)
     if (/拖拽到这里|请选择所有符合|拖动滑块|请完成安全验证|完成验证后继续|请完成下列验证|请输入验证码|计算结果|点击.*图标|依次点击|缺口/.test(body)) {
       return { hit: true, via: 'text', src: '', left: 0, top: 0, w: 0, h: 0 }
@@ -82,6 +102,29 @@ function boxInfoScript() {
       }
       src = current.slice(0, 200)
       break
+    }
+    if (!box) {
+      const dialogs = Array.from(document.querySelectorAll('div,section,dialog,[role="dialog"]')).filter((el) => {
+        const text = String(el.innerText || '').replace(/\\s+/g, '')
+        const rect = el.getBoundingClientRect()
+        if (rect.width < 240 || rect.width > 760 || rect.height < 260 || rect.height > 920) return false
+        if (rect.left < 80) return false
+        return /拖拽到这里|拖到此处/.test(text) && /请选择/.test(text)
+      })
+      dialogs.sort((a, b) => {
+        const ar = a.getBoundingClientRect()
+        const br = b.getBoundingClientRect()
+        return (ar.width * ar.height) - (br.width * br.height)
+      })
+      if (dialogs[0]) {
+        const wrap = dialogs[0].getBoundingClientRect()
+        box = {
+          left: Math.round(wrap.left),
+          top: Math.round(wrap.top),
+          width: Math.round(wrap.width),
+          height: Math.round(wrap.height)
+        }
+      }
     }
     if (!box) {
       const imgs = Array.from(document.querySelectorAll('img, canvas'))
@@ -432,30 +475,59 @@ function framesOf(frame, list = []) {
 
 function tilesScript() {
   return `(() => {
-    const body = String(document.body?.innerText || document.documentElement?.innerText || '').slice(0, 20000)
+    const ownText = (el) => {
+      let text = ''
+      for (const node of el.childNodes || []) {
+        if (node.nodeType === 3) text += node.textContent || ''
+      }
+      return text.replace(/\\s+/g, '')
+    }
+    const dialogs = Array.from(document.querySelectorAll('div,section,dialog,[role="dialog"]')).filter((el) => {
+      const text = String(el.innerText || '').replace(/\\s+/g, '')
+      const rect = el.getBoundingClientRect()
+      if (rect.width < 240 || rect.width > 760 || rect.height < 260 || rect.height > 920) return false
+      if (rect.left < 80) return false
+      return /拖拽到这里|拖到此处/.test(text) && /请选择/.test(text)
+    })
+    dialogs.sort((a, b) => {
+      const ar = a.getBoundingClientRect()
+      const br = b.getBoundingClientRect()
+      return (ar.width * ar.height) - (br.width * br.height)
+    })
+    const root = dialogs[0] || document
+    const scoped = root.querySelectorAll ? root : document
+    const body = String((root.innerText || document.body?.innerText || '')).slice(0, 8000)
     const lines = body.split(/\\n+/).map((line) => line.trim()).filter(Boolean)
+    const instruction = /请选择|拖拽到这里|拖到此处|刷新|反馈|提交|请完成安全验证/
     let promptLine = ''
     for (const line of lines) {
-      if (line.length >= 2 && line.length <= 60 && /(请选择|符合上文|拖拽到这里|露营|厨房|浴室|办公室|物品|可以用到|所有符合)/.test(line) && !/刷新|反馈|提交成功/.test(line)) {
+      if (line.length >= 4 && line.length <= 24 && !instruction.test(line) && /(场所|物品|能看到|厨房|浴室|办公室|露营|城市|街道|交通|建筑)/.test(line)) {
         promptLine = line
         break
       }
     }
     if (!promptLine) {
       for (const line of lines) {
-        if (line.length >= 4 && line.length <= 24 && !/刷新|反馈|提交|拖拽到这里/.test(line)) {
+        if (line.length >= 4 && line.length <= 20 && !instruction.test(line) && !/^\\d+$/.test(line)) {
           promptLine = line
           break
         }
       }
     }
-    const drop = Array.from(document.querySelectorAll('div,section,span,p')).find((el) => {
-      const text = String(el.innerText || '').replace(/\\s+/g, '')
+    const dropNodes = Array.from(scoped.querySelectorAll('div,section,span,p')).filter((el) => {
+      const text = ownText(el) || String(el.innerText || '').replace(/\\s+/g, '')
       const rect = el.getBoundingClientRect()
-      return /拖拽到这里|拖到此处|放到这里/.test(text) && rect.width >= 60 && rect.height >= 36
+      return /拖拽到这里|拖到此处|放到这里/.test(text) && text.length <= 24 && rect.width >= 80 && rect.height >= 36 && rect.width <= 560
     })
+    dropNodes.sort((a, b) => {
+      const ar = a.getBoundingClientRect()
+      const br = b.getBoundingClientRect()
+      return (ar.width * ar.height) - (br.width * br.height)
+    })
+    const drop = dropNodes[0]
     const dropRect = drop ? drop.getBoundingClientRect() : null
-    const imgs = Array.from(document.querySelectorAll('img, canvas'))
+    const box = (root !== document ? root.getBoundingClientRect() : null)
+    const imgs = Array.from(scoped.querySelectorAll('img, canvas'))
       .map((el) => {
         const rect = el.getBoundingClientRect()
         return {
@@ -467,12 +539,18 @@ function tilesScript() {
           cy: rect.top + rect.height / 2
         }
       })
-      .filter((item) => item.width >= 40 && item.height >= 40 && item.width <= 260 && item.height <= 260)
+      .filter((item) => {
+        if (item.width < 48 || item.height < 48 || item.width > 280 || item.height > 280) return false
+        if (box && (item.cx < box.left || item.cx > box.right || item.cy < box.top || item.cy > box.bottom)) return false
+        if (dropRect && item.cy > dropRect.top - 8) return false
+        return true
+      })
       .sort((a, b) => (a.top - b.top) || (a.left - b.left))
-    let tiles = imgs.slice(0, 12)
+    const median = imgs.length ? imgs.map((item) => item.width).sort((a, b) => a - b)[Math.floor(imgs.length / 2)] : 0
+    let tiles = imgs.filter((item) => !median || Math.abs(item.width - median) < median * 0.35)
     if (tiles.length >= 9) tiles = tiles.slice(0, 9)
-    const submit = Array.from(document.querySelectorAll('button, [role="button"], div, span')).find((el) => {
-      const text = String(el.innerText || '').replace(/\\s+/g, '')
+    const submit = Array.from(scoped.querySelectorAll('button, [role="button"], div, span')).find((el) => {
+      const text = (ownText(el) || String(el.innerText || '')).replace(/\\s+/g, '')
       const rect = el.getBoundingClientRect()
       return /^(提交|确认|完成验证|确定)$/.test(text) && rect.width >= 40 && rect.height >= 18
     })
@@ -562,6 +640,7 @@ async function readCaptchaLayout(win) {
 
 function promptCategory(prompt) {
   const text = String(prompt || '')
+  if (/城市|都市|街道|建筑|场所|车站|马路|能看到/.test(text)) return 'city'
   if (/露营|野营|帐篷|户外|登山|烧烤架|折叠椅/.test(text)) return 'camping'
   if (/厨房|灶台|锅|碗|菜刀|餐具/.test(text)) return 'kitchen'
   if (/浴室|卫生间|马桶|淋浴|洗漱/.test(text)) return 'bathroom'
@@ -605,6 +684,12 @@ function scoreBitmapForCategory(bitmap, width, height, category) {
   const dRatio = dark / samples
   const bRatio = bright / samples
   const eRatio = edge / samples
+  if (category === 'city') {
+    const objectLike = (bRatio > 0.35 && eRatio < 0.18) || (wRatio > 0.35 && eRatio < 0.16)
+    const denseNature = gRatio > 0.52 && eRatio < 0.16
+    return eRatio * 1.8 + cRatio * 1.0 + dRatio * 0.35 + wRatio * 0.25 + gRatio * 0.35
+      - (objectLike ? 1.3 : 0) - (denseNature ? 0.7 : 0)
+  }
   if (category === 'camping') {
     // 户外绿 + 人造边缘（椅/炉），压低大片白墙/蝴蝶柔边/动物毛绒
     return gRatio * 2.4 + eRatio * 1.6 + wRatio * 0.8 - bRatio * 1.2 - (gRatio > 0.45 && eRatio < 0.15 ? 1.2 : 0) - (dRatio > 0.55 ? 0.4 : 0)
@@ -635,19 +720,23 @@ async function scoreTile(win, tile, category) {
 async function localSemanticSolve(win, notify) {
   const layout = await readCaptchaLayout(win)
   if (!layout?.tiles?.length || layout.tiles.length < 3) {
+    runtimeLog.warn('captcha', `弹窗图不够 tiles=${layout?.tiles?.length || 0} prompt=${layout?.prompt || ''}`)
     return { ok: false, error: '没有找到可拖拽图片（含验证 iframe）' }
   }
   const category = promptCategory(layout.prompt)
   notify?.({ confirmNote: `正在识别验证图「${layout.prompt || category}」并自动拖拽` })
+  runtimeLog.info('captcha', `题目「${layout.prompt || ''}」分类=${category} 图${layout.tiles.length}张`)
   const scored = []
   for (const tile of layout.tiles) {
     const score = await scoreTile(win, tile, category)
     scored.push({ tile, score })
   }
   scored.sort((a, b) => b.score - a.score)
-  const threshold = category === 'camping' ? 0.28 : 0.32
+  const threshold = category === 'city' ? 0.22 : (category === 'camping' ? 0.28 : 0.32)
   const positive = scored.filter((item) => item.score > threshold)
-  const need = category === 'camping' ? Math.min(5, Math.max(2, positive.length || 3)) : Math.min(4, Math.max(2, positive.length || 3))
+  const need = category === 'city'
+    ? Math.min(6, Math.max(3, positive.length || 4))
+    : (category === 'camping' ? Math.min(5, Math.max(2, positive.length || 3)) : Math.min(4, Math.max(2, positive.length || 3)))
   const picks = (positive.length >= 2 ? positive : scored.slice(0, need))
     .slice(0, need)
     .map((item) => item.tile)
@@ -783,14 +872,11 @@ async function tryAutoSolve(win, config, notify) {
         box = { left: spotted.left, top: spotted.top, width: spotted.w, height: spotted.h }
       }
     }
-    if (!box?.width || !box?.height) {
-      out.error = '没有定位到验证区域'
-      break
-    }
     const typeId = cfg.types[kind] || cfg.type
+    runtimeLog.info('captcha', `检测到${kindLabel(kind)} 第 ${attempt}/${cfg.maxRetries} 次`)
     notify?.({ confirmNote: `检测到${kindLabel(kind)}验证码，自动处理第 ${attempt}/${cfg.maxRetries} 次` })
 
-    // 点选/拖拽：优先本地语义拖拽（含 iframe），不依赖云码 token
+    // 点选/拖拽：优先本地语义拖拽。弹窗没有 iframe 时也必须跑，不能因为没定位到框就停
     if (kind === 'click') {
       const local = await localSemanticSolve(win, notify)
       if (local.ok) {
@@ -819,6 +905,15 @@ async function tryAutoSolve(win, config, notify) {
       } else if (!cfg.token) {
         out.error = local.error || '本地识别未通过'
       }
+    }
+
+    if (!box?.width || !box?.height) {
+      out.error = out.error || '没有定位到验证区域'
+      if (kind === 'click') {
+        await wait(700)
+        continue
+      }
+      break
     }
 
     let crop

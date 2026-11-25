@@ -144,7 +144,11 @@ function collectImages(node, depth = 0, list = [], seen = new Set()) {
     node.forEach((item) => collectImages(item, depth + 1, list, seen))
     return list
   }
-  if (typeof node === 'object') Object.values(node).forEach((value) => collectImages(value, depth + 1, list, seen))
+  if (typeof node === 'object') {
+    const nested = node.url || node.uri || node.src || node.pic || node.image || node.img || node.cover
+    if (typeof nested === 'string') collectImages(nested, depth + 1, list, seen)
+    Object.values(node).forEach((value) => collectImages(value, depth + 1, list, seen))
+  }
   return list
 }
 

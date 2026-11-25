@@ -138,6 +138,7 @@ export function keepProductImage(value) {
   const url = String(value || '').trim()
   if (!url) return false
   if (/^(file:|local-video:)/i.test(url)) return true
+  if (/^[a-zA-Z]:[\\/]/.test(url) || url.startsWith('\\\\')) return true
   if (!/^(https?:)?\/\//i.test(url)) return false
   if (/icon|logo|avatar|sprite|favicon|emoji|badge|qrcode|qr_code|shop_logo|placeholder/i.test(url)) return false
   const size = url.match(/(?:www|resize|crop|thumb)[^0-9]{0,8}(\d{1,4})[-x_:](\d{1,4})/i)
@@ -153,9 +154,17 @@ export function imageUrl(value) {
   return videoUrl(src)
 }
 
-export function fillTemplate(template, product) {
-  const title = product?.title || '商品'
-  return String(template || '')
+export function fillTemplate(template, product, otherTitles = []) {
+  const title = String(product?.title || '').trim() || '商品'
+  let text = String(template || '')
+  ;[...otherTitles]
+    .map((item) => String(item || '').trim())
+    .filter((item) => item.length >= 4 && item !== title)
+    .sort((a, b) => b.length - a.length)
+    .forEach((name) => {
+      if (text.includes(name)) text = text.split(name).join(title)
+    })
+  return text
     .replaceAll('{{title}}', title)
     .replaceAll('{{category}}', product?.category || '')
     .replaceAll('{{price}}', product ? String(product.price ?? '') : '')
@@ -172,25 +181,26 @@ function withLabel(label, text) {
 
 export function composePrompt(form, product) {
   const source = String(form?.promptText || '').trim()
+  const others = Array.isArray(form?.otherTitles) ? form.otherTitles : []
   if (source) {
-    let text = fillTemplate(source, product)
+    let text = fillTemplate(source, product, others)
     const seconds = Number(form?.duration)
     if (seconds > 0) text = text.replace(/10\s*秒/, `${seconds} 秒`)
     if (form?.ratio) text = text.replace('9:16', form.ratio)
     if (form?.model && !/mini/i.test(form.model)) text = text.replace(/Seedance\s*2\.0\s*Mini/gi, form.model)
     return withVoice(text, form?.voice)
   }
-  let opening = fillTemplate(form?.lockText, product)
+  let opening = fillTemplate(form?.lockText, product, others)
   const seconds = Number(form?.duration)
   if (seconds > 0) opening = opening.replace(/10\s*秒/, `${seconds} 秒`)
   if (form?.ratio) opening = opening.replace('9:16', form.ratio)
   if (form?.model && !/mini/i.test(form.model)) opening = opening.replace(/Seedance\s*2\.0\s*Mini/gi, form.model)
   const lines = [
     opening,
-    withLabel('画面主线', fillTemplate(form?.storyline, product)),
-    withLabel('字幕 & 视觉', fillTemplate(form?.caption, product)),
-    withLabel('音频 & 口播', fillTemplate(form?.script || form?.oral, product)),
-    withLabel('硬性合规要求', fillTemplate(form?.compliance, product))
+    withLabel('画面主线', fillTemplate(form?.storyline, product, others)),
+    withLabel('字幕 & 视觉', fillTemplate(form?.caption, product, others)),
+    withLabel('音频 & 口播', fillTemplate(form?.script || form?.oral, product, others)),
+    withLabel('硬性合规要求', fillTemplate(form?.compliance, product, others))
   ].filter(Boolean).join('\n\n')
   return withVoice(lines, form?.voice)
 }

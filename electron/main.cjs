@@ -269,6 +269,7 @@ ipcMain.handle('doubao:chat', (_event, payload) => browserSession.chatOnDoubao(p
 ipcMain.handle('doubao:remix', (_event, payload) => browserSession.remixOnDoubao(payload || {}))
 ipcMain.handle('doubao:unwatermark', (_event, payload) => browserSession.unwatermarkChat(payload || {}))
 ipcMain.handle('doubao:pull-clean', (_event, payload) => browserSession.pullCleanVideo(payload || {}))
+ipcMain.handle('doubao:collect', (_event, payload) => browserSession.collectGeneratedVideos(payload || {}))
 ipcMain.handle('doubao:windows', () => browserSession.listWindows())
 ipcMain.handle('doubao:focus', (_event, key) => browserSession.focusWindow(key))
 ipcMain.handle('session:list', () => browserSession.listWindows())

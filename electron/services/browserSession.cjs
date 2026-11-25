@@ -1791,7 +1791,8 @@ function attachFilesScript(files) {
       Object.defineProperty(paste, 'clipboardData', { value: transfer })
       box.dispatchEvent(paste)
     }
-    return input || box ? 'file' : 'miss'
+    if (input && input.files && input.files.length) return 'file'
+    return 'miss'
   })()`
 }
 
@@ -1877,6 +1878,13 @@ async function setFileInputs(win, filePaths) {
       }
     }
     await dbg.sendCommand('DOM.setFileInputFiles', { nodeId: chosen, files: filePaths })
+    await runInFrames(win, `(() => {
+      document.querySelectorAll('input[type="file"]').forEach((el) => {
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+        el.dispatchEvent(new Event('change', { bubbles: true }))
+      })
+      return 'ok'
+    })()`)
     return true
   }).catch(() => false)
 }
@@ -1894,7 +1902,7 @@ async function chooseLocalImages(win, filePaths) {
   try {
     if (attachedHere) dbg.attach('1.3')
     await dbg.sendCommand('Page.setInterceptFileChooserDialog', { enabled: true })
-    await runInFrames(win, clickTextScript(['参考图', '上传图片', '添加图片', '商品图']))
+    await runInFrames(win, clickTextScript(['参考图', '上传图片', '添加图片', '商品图', '本地上传', '上传', '图片']))
     for (let tick = 0; tick < 8 && !opened; tick += 1) await wait(400)
     return opened
   } catch {
@@ -1918,6 +1926,18 @@ function imagesPresentScript() {
     }
     walk(document)
     if (inputs.some((el) => el.files && el.files.length)) return 'file'
+    const imgs = []
+    const walkImg = (root) => {
+      if (!root || !root.querySelectorAll) return
+      root.querySelectorAll('img').forEach((el) => imgs.push(el))
+      root.querySelectorAll('*').forEach((el) => { if (el.shadowRoot) walkImg(el.shadowRoot) })
+    }
+    walkImg(document)
+    if (imgs.some((img) => {
+      const rect = img.getBoundingClientRect()
+      const src = img.currentSrc || img.src || ''
+      return rect.width > 28 && rect.height > 28 && rect.top > window.innerHeight * 0.35 && (src.startsWith('blob:') || src.startsWith('data:'))
+    })) return 'file'
     return 'miss'
   })()`
 }
@@ -1934,15 +1954,23 @@ function sendScript() {
     }
     walk(document)
     const send = buttons.find((el) => {
-      const label = ((el.innerText || '') + (el.getAttribute('aria-label') || '')).replace(/\\s+/g, '')
+      const label = ((el.innerText || '') + (el.getAttribute('aria-label') || '') + (el.getAttribute('title') || '')).replace(/\\s+/g, '')
       if (!/发送/.test(label) || /确认发送|确定发送/.test(label)) return false
       return !el.disabled && el.getAttribute('aria-disabled') !== 'true'
-    }) || buttons.find((el) => /send/i.test((el.className || '') + (el.getAttribute('aria-label') || '')) && !el.disabled)
+    }) || buttons.find((el) => /send/i.test(String(el.className || '') + (el.getAttribute('aria-label') || '') + (el.getAttribute('title') || '')) && !el.disabled)
     if (send) { send.click(); return 'clicked' }
     const box = boxes.filter((el) => el.getBoundingClientRect().width > 40).pop()
     if (!box) return 'miss'
+    const boxRect = box.getBoundingClientRect()
+    const near = buttons.filter((el) => {
+      if (el.disabled || el.getAttribute('aria-disabled') === 'true') return false
+      const rect = el.getBoundingClientRect()
+      return rect.width >= 16 && rect.height >= 16 && rect.left > boxRect.left && rect.top > boxRect.top - 24 && rect.top < boxRect.bottom + 90
+    }).sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left)
+    if (near[0]) { near[0].click(); return 'clicked' }
     box.focus()
-    box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }))
+    box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }))
+    box.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }))
     return 'clicked'
   })()`
 }
@@ -2100,14 +2128,10 @@ async function sendConfirmReply(win, minVideos, replyText) {
     await wait(400)
     filled = await runInFrames(win, promptLandedScript(landed))
   }
-  let sent = 'miss'
-  for (let attempt = 0; attempt < 4 && sent !== 'clicked'; attempt += 1) {
-    sent = await runInFrames(win, sendScript())
-    if (sent !== 'clicked') await wait(500)
-  }
+  const sent = await pressEnter(win)
   await wait(1200)
   const after = await readDoubao(win, text, minVideos)
-  const ok = Boolean(after.confirmEcho) || (filled === 'filled' && sent === 'clicked' && !after.inputHasPrompt && !after.asks)
+  const ok = Boolean(after.confirmEcho) || (filled === 'filled' && sent && !after.inputHasPrompt && !after.asks)
   return { ...after, confirmNeeded: true, confirmSent: ok, confirmNote: ok ? `已把「${text}」发回豆包，并检测到发出` : `豆包要求确认，但这句「${text}」没有发进对话` }
 }
 
@@ -2120,7 +2144,7 @@ async function pressConfirm(win, snippet, minVideos) {
     return { ...state, confirmNeeded: false, confirmSent: false, confirmNote: '图片和商品对不上，已停止，没有回复 1 或 2' }
   }
   if (state.inputHasPrompt && !state.echoed && !state.confirmVisible && !state.asks) {
-    await runInFrames(win, sendScript())
+    await pressEnter(win)
     await wait(800)
     state = await readDoubao(win, snippet, minVideos)
   }
@@ -2203,49 +2227,17 @@ async function waitForReply(win, beforeText, message) {
   return ''
 }
 
-/** 版权/排队时：新开对话（或直接）重贴图 + 重发提示词 */
+/** 版权/排队时：打开新对话页后重写图片和提示词，回车发出 */
 async function resubmitDoubaoJob(win, { text, savedImages, filePayload, freshChat = true }) {
   if (!win || win.isDestroyed()) return { ok: false, note: '窗口已关' }
   if (freshChat) {
-    await runInFrames(win, clickTextScript(['新对话', '新的对话', '开启新对话']))
-    await wait(900)
-    await runInFrames(win, clickTextScript(['视频生成', '生成视频']))
-    await wait(700)
+    await loadPage(win, 'https://www.doubao.com/chat/')
+    await wait(800)
   }
-  let attached = 'miss'
-  if (savedImages?.length) {
-    const placed = await setFileInputs(win, savedImages)
-    if (placed) {
-      await wait(500)
-      attached = await runInFrames(win, imagesPresentScript())
-    }
-    if (attached !== 'file') {
-      const chosen = await chooseLocalImages(win, savedImages)
-      if (chosen) attached = 'file'
-    }
-    if (attached !== 'file' && Array.isArray(filePayload) && filePayload.length) {
-      for (let attempt = 0; attempt < 4 && attached !== 'file'; attempt += 1) {
-        attached = await runInFrames(win, attachFilesScript(filePayload))
-        if (attached !== 'file') await wait(500)
-      }
-    }
-  }
-  await wait(600)
-  const snippet = String(text || '').slice(0, 12)
-  let filled = 'miss'
-  for (let attempt = 0; attempt < 8 && filled !== 'filled'; attempt += 1) {
-    await fillPrompt(win, text)
-    await wait(400)
-    filled = await runInFrames(win, promptLandedScript(snippet))
-  }
-  if (filled !== 'filled') return { ok: false, note: '重发时提示词没写进输入框', attached }
-  let sent = 'miss'
-  for (let attempt = 0; attempt < 6 && sent !== 'clicked'; attempt += 1) {
-    sent = await runInFrames(win, sendScript())
-    if (sent !== 'clicked') await wait(400)
-  }
-  if (sent !== 'clicked') return { ok: false, note: '重发时没有点到发送', attached }
-  return { ok: true, note: freshChat ? '已新开对话并重发图+提示词' : '已再次发送提示词', attached }
+  const composer = await waitDoubaoComposer(win)
+  if (!composer) return { ok: false, note: '重发时输入框还没出来' }
+  const sent = await sendPreparedDoubao(win, text, savedImages || [], filePayload || [])
+  return { ok: sent.ok, note: sent.ok ? (freshChat ? '已打开新对话并重发图+提示词' : '已再次发送提示词') : sent.message }
 }
 
 function parseOptimizedCopy(text) {
@@ -2269,6 +2261,33 @@ async function readOptimizedCopy(win) {
 function optimizeAsk(no, title, tags) {
   const tagText = (Array.isArray(tags) ? tags : []).map((item) => `#${String(item || '').replace(/^#/, '')}`).filter((item) => item.length > 1).join(' ')
   return `编号${no || ''}。请只优化这条抖音发布文案，不要重新生成视频，也不要重复我下面的说明。\n原标题：${title || ''}\n原标签：${tagText}\n只回复两行，把内容换成优化后的标题和标签：\n优化标题：\n优化标签：`
+}
+
+function clickVideoModeScript() {
+  return `(() => {
+    const compact = (value) => String(value || '').replace(/\\s+/g, '')
+    const nodes = []
+    const walk = (root) => {
+      if (!root || !root.querySelectorAll) return
+      root.querySelectorAll('button, a, [role="button"], div, span').forEach((el) => nodes.push(el))
+      root.querySelectorAll('*').forEach((el) => { if (el.shadowRoot) walk(el.shadowRoot) })
+    }
+    walk(document)
+    const visible = (el) => {
+      const rect = el.getBoundingClientRect()
+      return rect.width > 16 && rect.height > 12 && rect.bottom > 0 && rect.top < window.innerHeight
+    }
+    const work = nodes.find((el) => compact(el.innerText || el.textContent) === '工作' && visible(el))
+    if (work) (work.closest('button, [role="button"]') || work).click()
+    const hits = nodes.filter((el) => {
+      const text = compact(el.innerText || el.textContent)
+      return (text === '视频生成' || text === '生成视频') && visible(el)
+    })
+    hits.sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom)
+    if (!hits[0]) return 'miss'
+    ;(hits[0].closest('button, a, [role="button"]') || hits[0]).click()
+    return 'clicked'
+  })()`
 }
 
 function clickNewWorkTaskScript() {
@@ -2318,6 +2337,37 @@ async function collectChatIds(win) {
   return new Set(Array.isArray(raw) ? raw.map((item) => String(item || '')).filter(Boolean) : [])
 }
 
+function listGeneratedChatsScript() {
+  return `(() => {
+    const items = []
+    const seen = new Set()
+    const take = (id, title) => {
+      const chatId = String(id || '')
+      if (!chatId || chatId === 'chat' || seen.has(chatId)) return
+      seen.add(chatId)
+      items.push({ id: chatId, title: String(title || '').replace(/\\s+/g, ' ').trim().slice(0, 80) })
+    }
+    const walk = (root) => {
+      if (!root) return
+      if (root.querySelectorAll) {
+        root.querySelectorAll('a[href]').forEach((el) => {
+          const matched = String(el.href || '').match(/doubao\\.com\\/chat\\/([^/?#]+)/i)
+          if (matched) take(matched[1], el.innerText || el.textContent)
+        })
+        root.querySelectorAll('*').forEach((el) => { if (el.shadowRoot) walk(el.shadowRoot) })
+      }
+      const html = root.innerHTML || ''
+      const finder = /\\/chat\\/(\\d{8,})/g
+      let matched
+      while ((matched = finder.exec(html))) take(matched[1], '')
+    }
+    walk(document)
+    const here = String(location.href || '').match(/doubao\\.com\\/chat\\/([^/?#]+)/i)
+    if (here) take(here[1], document.title)
+    return items
+  })()`
+}
+
 async function materializeDoubaoImages(win, urls, folder, workId) {
   const savedImages = []
   const filePayload = []
@@ -2345,25 +2395,33 @@ async function materializeDoubaoImages(win, urls, folder, workId) {
   return { savedImages, filePayload }
 }
 
+async function pressEnter(win) {
+  return useDebugger(win, async (dbg) => {
+    const key = { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, unmodifiedText: '\r', text: '\r' }
+    await dbg.sendCommand('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...key })
+    await dbg.sendCommand('Input.dispatchKeyEvent', { type: 'char', ...key })
+    await dbg.sendCommand('Input.dispatchKeyEvent', { type: 'keyUp', ...key })
+    return true
+  }).catch(() => false)
+}
+
 async function sendPreparedDoubao(win, text, savedImages, filePayload) {
   let attached = 'miss'
   const placed = await setFileInputs(win, savedImages)
+  runtimeLog.info('doubao.send', placed ? '已把本地图写入文件选择框' : '页面没有文件选择框，改走粘贴')
   if (placed) {
     await wait(600)
     attached = await runInFrames(win, imagesPresentScript())
   }
   if (attached !== 'file') {
-    const chosen = await chooseLocalImages(win, savedImages)
-    if (chosen) attached = 'file'
-  }
-  if (attached !== 'file') {
     for (let attempt = 0; attempt < 5 && attached !== 'file'; attempt += 1) {
-      attached = await runInFrames(win, attachFilesScript(filePayload))
-      if (attached !== 'file') await wait(700)
+      const pasted = await runInFrames(win, attachFilesScript(filePayload))
+      await wait(700)
+      attached = pasted === 'file' ? await runInFrames(win, imagesPresentScript()) : 'miss'
     }
   }
-  await wait(800)
-  if (attached !== 'file') return { ok: false, message: '商品图没有放进这条新工作任务' }
+  await wait(400)
+  if (attached !== 'file') return { ok: false, message: '商品图没有放进输入框' }
   const snippet = String(text || '').slice(0, 12)
   let filled = 'miss'
   for (let attempt = 0; attempt < 8 && filled !== 'filled'; attempt += 1) {
@@ -2371,13 +2429,10 @@ async function sendPreparedDoubao(win, text, savedImages, filePayload) {
     await wait(400)
     filled = await runInFrames(win, promptLandedScript(snippet))
   }
-  if (filled !== 'filled') return { ok: false, message: '提示词没有写进这条新工作任务' }
-  let sent = 'miss'
-  for (let attempt = 0; attempt < 6 && sent !== 'clicked'; attempt += 1) {
-    sent = await runInFrames(win, sendScript())
-    if (sent !== 'clicked') await wait(400)
-  }
-  if (sent !== 'clicked') return { ok: false, message: '新工作任务没有点到发送' }
+  if (filled !== 'filled') return { ok: false, message: '提示词没有写进输入框' }
+  const sent = await pressEnter(win)
+  if (!sent) return { ok: false, message: '提示词和图片已放进输入框，但没有发出去' }
+  await wait(600)
   return { ok: true, message: '已发送' }
 }
 
@@ -2402,7 +2457,6 @@ async function waitDoubaoComposer(win) {
     if (!win || win.isDestroyed()) return false
     const ready = await runInFrames(win, `(() => document.querySelector('textarea,[contenteditable="true"]') ? 'filled' : 'miss')()`)
     if (ready === 'filled') return true
-    if (attempt === 3 || attempt === 8) await runInFrames(win, clickTextScript(['视频生成', '生成视频']))
     await wait(700)
   }
   return false
@@ -2450,6 +2504,31 @@ async function readAssignedTask(win, job) {
   }
 }
 
+async function sendJobThroughCaptcha(win, { text, savedImages, filePayload, captchaConfig, notify, workId, page, fresh = false }) {
+  const tell = (msg) => notify?.({ workId, status: '生成中', confirmNote: msg })
+  for (let round = 0; round < 3; round += 1) {
+    if (!win || win.isDestroyed()) return { ok: false, message: '豆包窗口被关掉了' }
+    if (round > 0 || fresh) {
+      fresh = false
+      tell('验证码已过，正在重新发送图片和提示词')
+      runtimeLog.info('doubao.send', `验证码已过，第 ${round + 1} 次重新发起生成`)
+      await loadPage(win, page)
+      await wait(800)
+      if (!(await waitDoubaoComposer(win))) {
+        return { ok: false, message: '验证过后输入框没出来，没有重新发送' }
+      }
+    }
+    const sent = await sendPreparedDoubao(win, text, savedImages, filePayload)
+    if (!sent.ok) {
+      return { ok: false, message: round ? `验证过后重新发送失败：${sent.message}` : sent.message }
+    }
+    const gate = await doubaoCaptcha.waitGate(win, captchaConfig, (data) => notify?.({ workId, status: '生成中', ...data }))
+    if (!gate.hit) return { ok: true, resent: round > 0 }
+    if (!gate.cleared) return { ok: false, message: gate.error || '验证码没有通过' }
+  }
+  return { ok: true, resent: true }
+}
+
 async function generateAssignedTasks(payload) {
   const { id, name, login, mode, slot, saveDir, notify, captcha, replyRules, failMarkers, retryMarkers, jobs, watch } = payload || {}
   const list = (Array.isArray(jobs) ? jobs : []).slice(0, 5)
@@ -2495,7 +2574,8 @@ async function generateAssignedTasks(payload) {
     const job = list[index]
     const workId = String(job.workId || '')
     const text = String(job.prompt || '').trim()
-    const urls = [...new Set((Array.isArray(job.images) ? job.images : []).map((item) => String(item || '')).filter(Boolean))]
+    const urls = [...new Set((Array.isArray(job.images) ? job.images : []).map((item) => String(item || '')).filter(Boolean))].slice(0, 12)
+    runtimeLog.info('doubao.send', `第 ${index + 1}/${list.length} 条 图${urls.length}张`)
     const file = path.join(folder, `${workId || Date.now()}.mp4`)
     const knownUrl = /doubao\.com\/chat\/[^/?#]+/i.test(String(job.chatUrl || '')) ? String(job.chatUrl) : ''
     if (watch && knownUrl) {
@@ -2506,39 +2586,35 @@ async function generateAssignedTasks(payload) {
       tasks.push({ workId, done: true, last: { outcome: 'failed', message: !text ? '提示词是空的' : '没有商品图' } })
       continue
     }
-    let opened = 'miss'
-    for (let attempt = 0; attempt < 6 && opened !== 'clicked'; attempt += 1) {
-      opened = await runInFrames(win, clickNewWorkTaskScript())
-      if (opened !== 'clicked') await wait(600)
+    if (index > 0 || pageChatUrl(win)) {
+      await loadPage(win, page)
+      await wait(800)
     }
-    if (opened === 'clicked') {
-      await wait(900)
-    } else {
-      const here = String(win.webContents.getURL() || '')
-      if (index > 0 || /doubao\.com\/chat\/[^/?#]+/i.test(here)) {
-        await loadPage(win, page)
-        await wait(800)
-      }
-    }
-    await runInFrames(win, clickTextScript(['视频生成', '生成视频']))
     const composer = await waitDoubaoComposer(win)
     if (!composer) {
       tasks.push({ workId, done: true, last: { outcome: 'failed', message: '豆包输入框还没出来，图片和提示词没有发送' } })
       continue
     }
     const prepared = await materializeDoubaoImages(win, urls, folder, workId)
+    runtimeLog.info('doubao.send', `第 ${index + 1} 条落到本地 ${prepared.savedImages.length}/${urls.length} 张`)
     if (!prepared.savedImages.length) {
       tasks.push({ workId, done: true, last: { outcome: 'failed', message: '商品图没有下载下来，这条任务没有发送' } })
       continue
     }
-    const sent = await sendPreparedDoubao(win, text, prepared.savedImages, prepared.filePayload)
+    const sent = await sendJobThroughCaptcha(win, {
+      text,
+      savedImages: prepared.savedImages,
+      filePayload: prepared.filePayload,
+      captchaConfig,
+      notify,
+      workId,
+      page
+    })
+    runtimeLog.info('doubao.send', sent.ok
+      ? `第 ${index + 1} 条已发出${sent.resent ? '（验证后重发）' : ''}`
+      : `第 ${index + 1} 条失败：${sent.message}`)
     if (!sent.ok) {
       tasks.push({ workId, done: true, last: { outcome: 'failed', message: sent.message } })
-      continue
-    }
-    const captchaGate = await doubaoCaptcha.waitGate(win, captchaConfig, (data) => notify?.({ workId, status: '生成中', ...data }))
-    if (captchaGate.hit && !captchaGate.cleared) {
-      tasks.push({ workId, done: true, last: { outcome: 'failed', message: captchaGate.error || '验证码没有通过' } })
       continue
     }
     const chatUrl = await waitOwnChatUrl(win, usedChats)
@@ -2561,7 +2637,17 @@ async function generateAssignedTasks(payload) {
       tasks.push({ workId, done: true, chatUrl, file, last: { outcome: 'quota', message: '这个豆包账号额度不够', doubaoChatUrl: chatUrl } })
       continue
     }
-    tasks.push({ workId, snippet: text.slice(0, 12), chatUrl, file, done: false, last: { outcome: 'running', confirmNote: pressed.confirmNote || '已挂上，等待结果', doubaoChatUrl: chatUrl, confirmNeeded: Boolean(pressed.confirmNeeded), confirmSent: Boolean(pressed.confirmSent) } })
+    tasks.push({
+      workId,
+      snippet: text.slice(0, 12),
+      prompt: text,
+      savedImages: prepared.savedImages,
+      filePayload: prepared.filePayload,
+      chatUrl,
+      file,
+      done: false,
+      last: { outcome: 'running', confirmNote: pressed.confirmNote || '已挂上，等待结果', doubaoChatUrl: chatUrl, confirmNeeded: Boolean(pressed.confirmNeeded), confirmSent: Boolean(pressed.confirmSent) }
+    })
   }
   const rounds = watch ? 8 : 16
   for (let round = 0; round < rounds; round += 1) {
@@ -2569,6 +2655,38 @@ async function generateAssignedTasks(payload) {
     if (!pending.length || win.isDestroyed()) break
     for (const task of pending) {
       if (win.isDestroyed()) break
+      const midGate = await doubaoCaptcha.checkNow(win, captchaConfig, (data) => notify?.({ workId: task.workId, status: '生成中', ...data }))
+      if (midGate.hit && !midGate.cleared) {
+        task.done = true
+        task.last = { outcome: 'failed', message: midGate.error || '验证码没有通过' }
+        continue
+      }
+      if (midGate.hit && midGate.cleared && task.savedImages?.length) {
+        notify?.({ workId: task.workId, status: '生成中', confirmNote: '验证码打断了生成，正在重新发送图片和提示词' })
+        runtimeLog.info('doubao.send', '看守时验证码已过，重新发起生成')
+        const resent = await sendJobThroughCaptcha(win, {
+          text: task.prompt,
+          savedImages: task.savedImages,
+          filePayload: task.filePayload,
+          captchaConfig,
+          notify,
+          workId: task.workId,
+          page,
+          fresh: true
+        })
+        if (!resent.ok) {
+          task.done = true
+          task.last = { outcome: 'failed', message: resent.message }
+          continue
+        }
+        const nextUrl = await waitOwnChatUrl(win, usedChats)
+        if (nextUrl) {
+          usedChats.add(nextUrl)
+          task.chatUrl = nextUrl
+        }
+        task.last = { ...task.last, outcome: 'running', confirmNote: '验证后已重新发送，等待成片', doubaoChatUrl: task.chatUrl }
+        continue
+      }
       const read = await readAssignedTask(win, task)
       task.last = { ...task.last, ...read, doubaoChatUrl: task.chatUrl }
       notify?.({
@@ -2652,99 +2770,35 @@ async function generateOnDoubao(payload = {}) {
   }
   const savedImages = []
   const filePayload = []
-  const currentChat = String(win.webContents.getURL() || '')
-  const oldChat = currentChat.match(/doubao\.com\/chat\/([^/?#]+)/i)
-  if (oldChat) {
-    await runInFrames(win, clickTextScript(['新对话', '新的对话', '开启新对话']))
-    await wait(1000)
-    const afterClick = String(win.webContents.getURL() || '')
-    if (afterClick.includes(oldChat[1])) {
-      await loadPage(win, page)
-      await wait(1200)
-    }
+  if (pageChatUrl(win)) {
+    await loadPage(win, page)
+    await wait(800)
   }
-  for (let attempt = 0; attempt < 16; attempt += 1) {
-    const ready = await runInFrames(win, `(() => document.querySelector('textarea,[contenteditable="true"]') ? 'filled' : 'miss')()`)
-    if (ready === 'filled') break
-    if (attempt === 4) await runInFrames(win, clickTextScript(['视频生成', '生成视频']))
-    await wait(700)
+  const composer = await waitDoubaoComposer(win)
+  if (!composer) {
+    return { ok: false, saveDir: folder, message: '豆包输入框还没出来，图片和提示词没有发送' }
   }
-  await runInFrames(win, clickTextScript(['视频生成', '生成视频']))
-  await wait(1000)
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    const ready = await runInFrames(win, `(() => document.querySelector('textarea,[contenteditable="true"]') ? 'filled' : 'miss')()`)
-    if (ready === 'filled') break
-    await wait(500)
-  }
-  for (let index = 0; index < urls.length; index += 1) {
-    const current = urls[index]
-    const local = localImagePath(current)
-    if (local) {
-      if (!fs.existsSync(local)) continue
-      const plain = fs.readFileSync(local)
-      if (plain.length < 100) continue
-      const mime = /\.png$/i.test(local) ? 'image/png' : 'image/jpeg'
-      savedImages.push(local)
-      filePayload.push({ buffer: plain, mime, name: path.basename(local) })
-      continue
-    }
-    if (!/^https?:\/\//.test(current)) continue
-    const plain = await downloadImage(current, win.webContents.session)
-    if (plain.length < 100) continue
-    const mime = /\.png(\?|$)/i.test(current) ? 'image/png' : 'image/jpeg'
-    const imagePath = path.join(folder, `${workId || Date.now()}-product-${index + 1}.${mime === 'image/png' ? 'png' : 'jpg'}`)
-    saveFile(imagePath, plain)
-    savedImages.push(imagePath)
-    filePayload.push({ buffer: plain, mime, name: `product-${index + 1}.${mime === 'image/png' ? 'png' : 'jpg'}` })
-  }
+  const prepared = await materializeDoubaoImages(win, urls, folder, workId)
+  savedImages.push(...prepared.savedImages)
+  filePayload.push(...prepared.filePayload)
   if (!savedImages.length) {
     return { ok: false, saveDir: folder, message: '商品图没有下载下来。提示词和图片必须一起发，已停止发送。' }
   }
-  let attached = 'miss'
-  const placed = await setFileInputs(win, savedImages)
-  if (placed) {
-    await wait(600)
-    attached = await runInFrames(win, imagesPresentScript())
-  }
-  if (attached !== 'file') {
-    const chosen = await chooseLocalImages(win, savedImages)
-    if (chosen) attached = 'file'
-  }
-  if (attached !== 'file') {
-    for (let attempt = 0; attempt < 5 && attached !== 'file'; attempt += 1) {
-      attached = await runInFrames(win, attachFilesScript(filePayload))
-      if (attached !== 'file') await wait(700)
-    }
-  }
-  await wait(1200)
-  if (attached !== 'file') {
-    return { ok: false, saveDir: folder, imagePaths: savedImages, message: '商品图没有放进豆包输入框。提示词和图片必须一起发，已停止发送。' }
+  const sent = await sendJobThroughCaptcha(win, {
+    text,
+    savedImages,
+    filePayload,
+    captchaConfig,
+    notify,
+    workId,
+    page
+  })
+  notify?.({ workId, progress: 35, status: '生成中' })
+  if (!sent.ok) {
+    return { ok: false, saveDir: folder, imagePaths: savedImages, message: sent.message }
   }
   const snippet = text.slice(0, 12)
-  let filled = 'miss'
-  for (let attempt = 0; attempt < 10 && filled !== 'filled'; attempt += 1) {
-    await fillPrompt(win, text)
-    await wait(500)
-    filled = await runInFrames(win, promptLandedScript(snippet))
-    if (filled !== 'filled') await wait(400)
-  }
-  notify?.({ workId, progress: 35, status: '生成中' })
-  if (filled !== 'filled') {
-    return { ok: false, needLogin: true, saveDir: folder, imagePaths: savedImages, message: '商品图已上传，但提示词没有写进输入框，所以没有发送' }
-  }
   const before = await win.webContents.executeJavaScript(`document.querySelectorAll('video').length`).catch(() => 0)
-  let sent = 'miss'
-  for (let attempt = 0; attempt < 8 && sent !== 'clicked'; attempt += 1) {
-    sent = await runInFrames(win, sendScript())
-    if (sent !== 'clicked') await wait(500)
-  }
-  if (sent !== 'clicked') {
-    return { ok: false, saveDir: folder, imagePaths: savedImages, message: '提示词和图片已准备好，但没有点到发送' }
-  }
-  const captchaGate = await doubaoCaptcha.waitGate(win, captchaConfig, (data) => notify?.({ workId, progress: 42, status: '生成中', ...data }))
-  if (captchaGate.hit && !captchaGate.cleared) {
-    return { ok: false, saveDir: folder, imagePaths: savedImages, message: captchaGate.error || '豆包验证码没有通过，本条已停在发送后' }
-  }
   let chain = null
   try {
     chain = startChainCapture(win)
@@ -2894,7 +2948,15 @@ async function generateOnDoubao(payload = {}) {
         return withConfirm({ ok: false, saveDir: folder, message: midGate.error || '生成过程中验证码没有通过' })
       }
       if (midGate.hit && midGate.cleared) {
-        delivery = { ...delivery, confirmNote: midGate.auto ? '生成中验证码已自动通过' : '生成中验证码已通过' }
+        delivery = { ...delivery, confirmNote: '验证码已过，正在重新发送图片和提示词' }
+        notify?.({ workId, progress: Math.min(90, 50 + tick), status: '生成中', confirmNote: delivery.confirmNote })
+        const again = await resubmitDoubaoJob(win, { text, savedImages, filePayload, freshChat: true })
+        delivery = { ...delivery, confirmNote: again.ok ? '验证后已重新发送，等待成片' : `验证后重新发送失败：${again.note}` }
+        if (!again.ok) {
+          await endChain()
+          return withConfirm({ ok: false, saveDir: folder, imagePaths: savedImages, message: delivery.confirmNote })
+        }
+        continue
       }
     }
     const nudgeTexts = (activeReplyRules?.nudge || []).map((item) => String(item || '').trim()).filter(Boolean)
@@ -2902,7 +2964,7 @@ async function generateOnDoubao(payload = {}) {
       nudged = true
       const nudgeText = nudgeTexts[Math.floor(Math.random() * nudgeTexts.length)]
       await fillPrompt(win, nudgeText)
-      await runInFrames(win, sendScript())
+      await pressEnter(win)
       delivery = { ...delivery, confirmNote: `等待超过 15 秒，已发送催促「${nudgeText}」` }
       notify?.({ workId, progress: Math.min(90, 50 + tick), status: '生成中', confirmNote: delivery.confirmNote })
     }
@@ -4311,14 +4373,20 @@ function scrapeCartDomScript() {
         && !/^\\d{10,}$/.test(line)
       )) || ''
       if (!title) continue
-      const img = el.querySelector('img')
-      const src = img ? String(img.currentSrc || img.src || '') : ''
+      const imgs = []
+      el.querySelectorAll('img').forEach((img) => {
+        let src = String(img.currentSrc || img.src || img.getAttribute('data-src') || '').trim()
+        if (src.startsWith('//')) src = 'https:' + src
+        if (!/^https?:/.test(src)) return
+        if (/avatar|logo|icon|qrcode|sprite|favicon|badge|emoji|placeholder/i.test(src)) return
+        if (!imgs.includes(src)) imgs.push(src)
+      })
       seen.add(id)
       rows.push({
         id,
         title,
-        image: src.startsWith('//') ? ('https:' + src) : src,
-        images: src ? [src.startsWith('//') ? ('https:' + src) : src] : [],
+        image: imgs[0] || '',
+        images: imgs.slice(0, 30),
         price: 0,
         rate: 0,
         category: '选品车',
@@ -4472,7 +4540,7 @@ function collectImageUrls(node, list = [], seen = new Set(), depth = 0) {
     return list
   }
   if (typeof node === 'object') {
-    const preferred = ['imgs', 'images', 'pic_list', 'picList', 'image_list', 'url_list', 'cover_list', 'white_image', 'cover', 'img', 'image', 'main_img', 'elastic_img']
+    const preferred = ['imgs', 'images', 'pic_list', 'picList', 'image_list', 'url_list', 'cover_list', 'white_image', 'cover', 'img', 'image', 'main_img', 'elastic_img', 'head_imgs', 'headImgs', 'product_imgs', 'detail_imgs', 'sku_imgs', 'pic_url', 'image_uri_list']
     preferred.forEach((key) => {
       if (node[key] != null) collectImageUrls(node[key], list, seen, depth + 1)
     })
@@ -4681,6 +4749,10 @@ function productDetailScore(product) {
   return score
 }
 
+function imagesEnough(product) {
+  return [...new Set([...(product?.images || []), product?.image].filter(Boolean))].length >= 6
+}
+
 /** 从百应选品车/广场表格 DOM 抠价佣销量（页面上有 ¥59.90 / 20% / 9808） */
 function scrapeBuyinTableScript(pid) {
   return `(() => {
@@ -4748,8 +4820,14 @@ function scrapeBuyinTableScript(pid) {
     }
     const categoryMatch = text.match(/商品类目[:：]\\s*([^\\n]+)/)
     const shopMatch = text.match(/([^\\n]{2,24})\\s*体验分/)
-    const img = hit.querySelector('img')
-    const image = img ? (img.currentSrc || img.src || '') : ''
+    const imgs = []
+    hit.querySelectorAll('img').forEach((img) => {
+      let src = String(img.currentSrc || img.src || img.getAttribute('data-src') || '').trim()
+      if (src.startsWith('//')) src = 'https:' + src
+      if (!/^https?:/.test(src)) return
+      if (/avatar|logo|icon|qrcode|sprite|favicon|badge|emoji|placeholder/i.test(src)) return
+      if (!imgs.includes(src)) imgs.push(src)
+    })
     return {
       id: pid,
       title: title || '',
@@ -4758,8 +4836,8 @@ function scrapeBuyinTableScript(pid) {
       monthlySales: sales,
       category: categoryMatch ? categoryMatch[1].trim() : '',
       shop: shopMatch ? shopMatch[1].trim() : '',
-      image,
-      images: image ? [image] : [],
+      image: imgs[0] || '',
+      images: imgs,
       earn,
       source: '百应表格'
     }
@@ -4965,13 +5043,13 @@ async function scrapeProductById({ id, name, login, mode, productId }) {
         ).catch(() => null)
         const found = productFromJsonBlob(json, pid)
         if (found?.title) best = mergeLookedProduct(best, { ...found, source: '选品车' })
-        if (productDetailScore(best) >= 12) break
+        if (productDetailScore(best) >= 12 && imagesEnough(best)) break
       }
-      if (productDetailScore(best) >= 12) break
+      if (productDetailScore(best) >= 12 && imagesEnough(best)) break
     }
     // 2) 决策详情接口（GET + 少量 POST）
     for (const api of apiTries) {
-      if (win.isDestroyed() || productDetailScore(best) >= 12) break
+      if (win.isDestroyed() || (productDetailScore(best) >= 12 && imagesEnough(best))) break
       const json = await win.webContents.executeJavaScript(
         `fetch(${JSON.stringify(api)},{credentials:'include',headers:{accept:'application/json'}}).then((r)=>r.json()).catch(()=>null)`,
         true
@@ -4986,7 +5064,7 @@ async function scrapeProductById({ id, name, login, mode, productId }) {
         { url: 'https://buyin.jinritemai.com/pc/selection/decision/product_detail', body: { product_id: pid } }
       ]
       for (const item of postTries) {
-        if (win.isDestroyed() || productDetailScore(best) >= 12) break
+        if (win.isDestroyed() || (productDetailScore(best) >= 12 && imagesEnough(best))) break
         const json = await win.webContents.executeJavaScript(
           `fetch(${JSON.stringify(item.url)},{method:'POST',credentials:'include',headers:{'content-type':'application/json',accept:'application/json'},body:JSON.stringify(${JSON.stringify(item.body)})}).then((r)=>r.json()).catch(()=>null)`,
           true
@@ -5012,10 +5090,22 @@ async function scrapeProductById({ id, name, login, mode, productId }) {
       }
     }
     // 4) 接口仍缺价/佣/销：直接读百应表格 DOM（页面上就是 ¥xx / xx% / 销量）
-    if ((!best || !(Number(best.price) > 0) || !(Number(best.rate) > 0) || !(Number(best.monthlySales) > 0)) && !win.isDestroyed()) {
+    if ((!best || !(Number(best.price) > 0) || !(Number(best.rate) > 0) || !(Number(best.monthlySales) > 0) || !imagesEnough(best)) && !win.isDestroyed()) {
       runtimeLog.info('product.scrape', `接口字段不全，改读表格 DOM ${pid}`)
       const dom = await scrapeBuyinDomProduct(win, pid)
       if (dom) best = mergeLookedProduct(best, dom)
+    }
+    // 5) 图不够 6 张：打开商品详情页把主图和细节图收齐
+    if (!imagesEnough(best) && !win.isDestroyed()) {
+      const detail = `https://haohuo.jinritemai.com/ecommerce/trade/detail/index.html?id=${pid}`
+      runtimeLog.info('product.scrape', `商品图不足 6 张，补抓详情页 ${pid}`)
+      await loadPage(win, detail, { quiet: true })
+      await wait(1600)
+      const shots = await evalInFrames(win, scrapeDetailDomScript(pid)).catch(() => null)
+      if (shots) {
+        const junk = /点此进入抖音|查看商品信息|登录|验证码/.test(String(shots.title || ''))
+        best = mergeLookedProduct(best, junk ? { ...shots, title: '' } : shots)
+      }
     }
   } catch (error) {
     runtimeLog.warn('product.scrape', `静默抓取异常 ${error?.message || error}`)
@@ -5252,6 +5342,66 @@ function closeWindowsByPrefix(prefix) {
   return { ok: true, closed }
 }
 
+async function collectGeneratedVideos({ id, name, login, mode, known = [], saveDir, limit = 8 } = {}) {
+  const page = 'https://www.doubao.com/chat/'
+  const opened = await openAccount({ kind: 'doubao', id, name, login, mode: mode || 'password', url: page, slot: 'collect' })
+  if (opened && opened.ok === false) return { ok: false, videos: [], message: opened.message || '豆包网页没有打开' }
+  const win = windows.get(sessionKey('doubao', id, page, 'collect'))
+  if (!win || win.isDestroyed()) return { ok: false, videos: [], message: '豆包网页没有打开' }
+  bringToFront(win)
+  await wait(1200)
+  const knownSet = new Set((Array.isArray(known) ? known : []).map((item) => String(item || '')))
+  let found = []
+  for (let attempt = 0; attempt < 4 && !found.length; attempt += 1) {
+    found = await win.webContents.executeJavaScript(listGeneratedChatsScript()).catch(() => [])
+    if (!Array.isArray(found) || !found.length) await wait(700)
+  }
+  const chats = []
+  for (const item of Array.isArray(found) ? found : []) {
+    const chatId = String(item?.id || '')
+    if (!chatId || knownSet.has(chatId)) continue
+    chats.push({ id: chatId, title: String(item?.title || '') })
+    if (chats.length >= Math.max(1, Math.min(8, Number(limit) || 8))) break
+  }
+  const folder = saveDir || path.join(app.getPath('videos'), 'huang-plusplus-pro')
+  fs.mkdirSync(folder, { recursive: true })
+  const videos = []
+  for (const item of chats) {
+    if (win.isDestroyed()) break
+    const chatUrl = `https://www.doubao.com/chat/${item.id}`
+    const chain = startChainCapture(win)
+    try {
+      await chain.ready
+      await loadPage(win, chatUrl, { quiet: true })
+      await wait(1400)
+      const probe = await probeDoubaoJob(win)
+      let held = await cleanUrlFromBodies(win.webContents.session, chain.bodies.splice(0))
+      if (!held && probe.state === 'ready') {
+        try { win.webContents.reload() } catch { /* 刷新失败就用页面上的视频 */ }
+        await wait(1500)
+        held = await cleanUrlFromBodies(win.webContents.session, chain.bodies.splice(0))
+      }
+      if (probe.state !== 'ready' && !held) continue
+      const file = path.join(folder, `doubao-${item.id}.mp4`)
+      let saved = held ? await downloadCleanFile(held, file, win.webContents.session) : ''
+      if (!saved) {
+        const src = await win.webContents.executeJavaScript(`(() => { const video = document.querySelector('video'); return video ? (video.currentSrc || video.src || '') : '' })()`).catch(() => '')
+        if (/^https?:/i.test(String(src || ''))) saved = await downloadCleanFile(src, file, win.webContents.session)
+      }
+      if (!saved || !fs.existsSync(saved)) continue
+      videos.push({ chatUrl, videoPath: saved, title: item.title || '豆包已生成视频' })
+    } finally {
+      await chain.stop()
+    }
+  }
+  if (!videos.length) closeDoubaoWindow(win)
+  return {
+    ok: true,
+    videos,
+    message: videos.length ? `收录了 ${videos.length} 条已生成视频` : '这个豆包号里没有新的已生成视频'
+  }
+}
+
 module.exports = {
   useProxy,
   openAccount,
@@ -5271,6 +5421,7 @@ module.exports = {
   remixOnDoubao,
   unwatermarkChat,
   pullCleanVideo,
+  collectGeneratedVideos,
   followLinks,
   listWindows,
   focusWindow,

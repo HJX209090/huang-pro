@@ -18,8 +18,8 @@
       <el-button @click="keyword = ''; group = ''">重置</el-button>
       <div class="grow">
         <el-button @click="checkAll">批量检测</el-button>
-        <el-button type="primary" @click="startGenerate">开始生成（{{ enabledCount }}）</el-button>
-        <el-button type="primary" plain @click="collectOnce">一次收录（{{ waitingWorks }}）</el-button>
+        <el-button type="primary" @click="startGenerate">开始生成（{{ waitingWorks }}）</el-button>
+        <el-button type="primary" plain @click="collectOnce">一次收录</el-button>
         <el-button @click="edit()">新建账号</el-button>
       </div>
     </div>
@@ -269,22 +269,37 @@ async function checkAll() {
   ElMessage.success(`检测完成：${logged} 个已登录，${list.length - logged} 个未登录`)
 }
 
-function startGenerate() {
+async function startGenerate() {
   const pending = store.works.filter((item) => item.status === '待生成')
-  if (!enabledCount.value) return ElMessage.warning('没有启用的豆包账号')
-  if (!pending.length) return ElMessage.info('没有待生成的作品')
-  const open = Math.max(1, Math.min(10, Number(store.settings.doubaoOpen) || 1))
-  const gap = Math.max(0, Number(store.settings.doubaoGap) || 0)
-  pending.forEach((work) => store.kickGenerate(work.id))
-  store.addLog('info', '豆包', `排队 ${pending.length} 条，同时打开 ${open} 个，间隔 ${gap} 秒`)
-  ElMessage.success(`已排队 ${pending.length} 条。每 5 条一个窗口，同时最多开 ${open} 个窗口`)
+  const account = store.doubaoAccount()
+  if (!enabledCount.value || !account) return ElMessage.warning('没有启用的豆包账号')
+  if (!pending.length) return ElMessage.info('没有待生成的作品。开始生成会把这些作品打开豆包，并发送图片和提示词')
+  if (window.tujian?.openAccount) {
+    try {
+      await window.tujian.openAccount({
+        kind: 'doubao',
+        id: account.id,
+        name: account.name,
+        login: account.login || '',
+        mode: account.loginMode || 'password',
+        url: 'https://www.doubao.com/chat/',
+        slot: 'acct',
+        already: account.loginStatus === '已登录'
+      })
+    } catch (error) {
+      return ElMessage.error(error?.message || '豆包网页没有打开')
+    }
+  }
+  pending.forEach((work) => store.kickGenerate(work.id, { force: true }))
+  store.addLog('info', '豆包', `开始生成 ${pending.length} 条。一个窗口最多挂 5 条任务`)
+  ElMessage.success(`已打开豆包，这个窗口会按商品分别发送 ${pending.length} 条的图片和提示词`)
 }
 
-function collectOnce() {
-  const item = store.plaza.find((row) => !row.added)
-  if (!item) return ElMessage.info('选品广场没有可收录的商品')
-  store.addFromPlaza(item.id)
-  ElMessage.success(`已收录 ${item.title}`)
+async function collectOnce() {
+  const result = await store.collectGeneratedDoubao()
+  if (!result?.ok && !result?.count) return ElMessage.warning(result?.message || '没有收录到已生成的视频')
+  if (!result.count) return ElMessage.info(result.message || '这个豆包号里没有新的已生成视频')
+  ElMessage.success(result.message)
 }
 
 function limitOf(row) {

@@ -82,10 +82,14 @@ export const PERSIST_KEYS = [
 let saveTimer = null
 const busyDoubao = new Set()
 const doubaoRunning = new Set()
+const doubaoRunningAt = new Map()
 const doubaoWatchAfter = new Map()
 let generateActive = 0
 const generatePending = []
+let generateForce = false
 let lastQueueNote = 0
+let nextDoubaoLaunch = 0
+const MIN_PRODUCT_SHOTS = 6
 
 function quotaLimit(account) {
   if (Number(account?.quotaLimit) > 0) return Number(account.quotaLimit)
@@ -248,8 +252,14 @@ export const useAppStore = defineStore('app', {
         const found = plazaById.get(`${row.accountId || ''}:${row.id}`) || plazaById.get(row.id)
         if (!found) return
         if (!row.imagesEdited) {
-          if (!row.image) row.image = found.image || found.images?.[0] || ''
-          if (found.images?.length && !row.images?.length) row.images = found.images.filter((src) => !(row.removedImages || []).includes(src))
+          const removed = new Set(row.removedImages || [])
+          const merged = [...new Set([...(row.images || []), row.image, ...(found.images || []), found.image]
+            .map((item) => String(item || '').trim())
+            .filter((item) => item && !removed.has(item) && keepProductImage(item)))]
+          if (merged.length) {
+            row.images = merged
+            row.image = merged[0]
+          }
         }
         if (found.tags?.length && !row.tags?.length) row.tags = found.tags
         if (found.freeShipping && !row.freeShipping) row.freeShipping = true
@@ -1356,8 +1366,8 @@ export const useAppStore = defineStore('app', {
     },
     async openPrompt(ids = []) {
       this.promptProductIds = [...ids]
-      await Promise.all((ids || []).map((id) => this.enrichProduct(id)))
       this.promptVisible = true
+      Promise.all((ids || []).map((id) => this.enrichProduct(id))).catch(() => {})
     },
     applyProgress({ workId, progress, status, videoPath, confirmSent, confirmNeeded, confirmNote, doubaoChatUrl, optimizedTitle, optimizedTags }) {
       const work = this.works.find((item) => item.id === workId)
@@ -1418,16 +1428,16 @@ export const useAppStore = defineStore('app', {
       return !title
     },
     promptForProduct(form, product) {
+      const others = (this.products || []).map((item) => item.title).filter((item) => item && item !== product?.title)
+      const packed = { ...form, otherTitles: [...(form?.otherTitles || []), ...others] }
       const shared = String(form?.promptText || '').trim()
-      if (shared && this.promptFitsProduct(shared, product)) return composePrompt(form, product)
+      if (shared) return composePrompt(packed, product)
       const own = String(product?.filledPrompt || '').trim()
-      if (own && this.promptFitsProduct(own, product)) return own
+      if (own && this.promptFitsProduct(own, product)) return fillTemplate(own, product, others)
       const template = String(this.settings.promptText || '').trim()
-      if (template && template !== shared && this.promptFitsProduct(template, product)) {
-        return composePrompt({ ...form, promptText: template }, product)
-      }
+      if (template) return composePrompt({ ...packed, promptText: template }, product)
       const rebuilt = composePrompt({
-        ...form,
+        ...packed,
         voice: form?.voice || this.settings.voice,
         promptText: '',
         lockText: form?.lockText || this.settings.productLock,
@@ -1438,6 +1448,7 @@ export const useAppStore = defineStore('app', {
       }, product)
       if (String(rebuilt || '').trim()) return rebuilt
       return composePrompt({
+        ...packed,
         promptText: '围绕商品「商品标题」生成一条 9:16 抖音带货视频。只按上传的这件商品原图实拍口播，不要换成其他商品。直接生成视频。',
         duration: form?.duration,
         ratio: form?.ratio || '9:16',
@@ -1445,11 +1456,17 @@ export const useAppStore = defineStore('app', {
         voice: form?.voice || this.settings.voice
       }, product)
     },
+    productImagesOf(product) {
+      const removed = new Set(product?.removedImages || [])
+      return [...new Set([...(product?.images || []), product?.image]
+        .map((item) => String(item || '').trim())
+        .filter((item) => item && !removed.has(item) && keepProductImage(item))
+        .map((item) => (item.startsWith('//') ? `https:${item}` : item)))]
+    },
     productShots(work) {
       const product = this.products.find((item) => item.id === work?.productId)
       const removed = new Set(product?.removedImages || [])
-      const locked = [...(work?.images || []), work?.image].map((item) => String(item || '').trim()).filter(Boolean)
-      const pool = locked.length ? locked : [...(product?.images || []), product?.image]
+      const pool = [...(product?.images || []), product?.image, ...(work?.images || []), work?.image]
       return [...new Set(pool
         .map((item) => {
           const text = String(item || '').trim()
@@ -1461,9 +1478,13 @@ export const useAppStore = defineStore('app', {
     async enrichProduct(productId) {
       const product = this.products.find((item) => item.id === productId)
       if (!product || !window.tujian?.lookupProduct) return product
-      const thin = !product.image && !(product.images || []).length
+      const current = this.productImagesOf(product)
       const placeholder = /^商品 |^导入商品 /.test(String(product.title || ''))
-      if (!thin && !placeholder) return product
+      if (current.length >= MIN_PRODUCT_SHOTS && !placeholder) {
+        product.images = current
+        product.image = current[0] || ''
+        return product
+      }
       try {
         const account = this.publishAccounts.find((item) => item.id === (product.accountId || this.activeAccountId))
         const result = await window.tujian.lookupProduct({
@@ -1475,9 +1496,10 @@ export const useAppStore = defineStore('app', {
         })
         const looked = result?.product
         if (!looked) return product
+        const removed = new Set(product.removedImages || [])
         const images = [...new Set([...(looked.images || []), looked.image, ...(product.images || []), product.image]
           .map((item) => String(item || '').trim())
-          .filter((item) => keepProductImage(item)))]
+          .filter((item) => item && !removed.has(item) && keepProductImage(item)))]
         if (looked.title && !/^商品 |^导入商品 /.test(looked.title)) {
           const cleaned = cleanTitle(looked.title, this.settings.bannedWords)
           product.rawTitle = cleaned.changed ? looked.title : (product.rawTitle || '')
@@ -1549,7 +1571,7 @@ export const useAppStore = defineStore('app', {
       const account = this.pickIdleDoubaoAccount()
       if (!account) {
         this.addLog('error', '豆包', '没有空闲且还有额度的豆包账号。这条已排到当前这条成片保存之后')
-        this.kickGenerate(workId, { immediate: true })
+        this.kickGenerate(workId, { immediate: true, force: true })
         return '这个豆包号正在做上一条，成片保存后会在同一个窗口里接着做'
       }
       work.doubaoAccountId = account.id
@@ -1557,25 +1579,41 @@ export const useAppStore = defineStore('app', {
       busyDoubao.delete(account.id)
       this.persist()
       this.addLog('info', '豆包', `重新生成「${work.title}」，使用 ${account.name} 的同一个窗口`)
-      this.kickGenerate(workId, { immediate: true })
+      this.kickGenerate(workId, { immediate: true, force: true })
       return ''
     },
     kickGenerate(workId, options = {}) {
+      if (options.force) generateForce = true
       const pending = generatePending.filter((id) => id !== workId)
-      if (options.immediate) pending.unshift(workId)
+      if (options.immediate || options.force) pending.unshift(workId)
       else pending.push(workId)
       generatePending.length = 0
       generatePending.push(...pending)
-      this.pumpGenerate({ immediate: Boolean(options.immediate) })
+      this.pumpGenerate({ immediate: Boolean(options.immediate || options.force), force: generateForce })
     },
-    pickIdleDoubaoAccount(skipped = []) {
+    explainDoubaoQueue() {
+      const account = this.doubaoAccount()
+      const today = todayKey()
+      const used = account ? doubaoQuotaUsed(this.works, account, today) : 0
+      const limit = account ? quotaLimit(account) : 5
+      if (generatePending.length && account && used >= limit) return `这个豆包号今天的 ${limit} 条额度用完了，图片和提示词没有发送`
+      if (generatePending.length && account && doubaoRunning.has(account.id)) return '豆包窗口正在处理上一条，这几条会紧接着发送图片和提示词'
+      if (generatePending.length) return '图片和提示词没有发送。先确认豆包账号已登录，并且今天还有额度'
+      return '正在打开豆包，并发送图片和提示词'
+    },
+    pickIdleDoubaoAccount(skipped = [], options = {}) {
+      const force = Boolean(options.force)
       const today = todayKey()
       const accounts = (this.doubaoAccounts || []).filter((item) => {
         if (!item.enabled || skipped.includes(item.id) || doubaoRunning.has(item.id)) return false
-        if (item.quotaDate && item.quotaDate === today) return false
-        const generating = this.works.filter((row) => row.doubaoAccountId === item.id && row.status === '生成中').length
-        if (generating >= 5) return false
-        return doubaoQuotaUsed(this.works, item, today) < quotaLimit(item)
+        if (!force) {
+          const used = doubaoQuotaUsed(this.works, item, today)
+          if (used >= quotaLimit(item)) return false
+          if (item.quotaDate && item.quotaDate === today) return false
+          const generating = this.works.filter((row) => row.doubaoAccountId === item.id && row.status === '生成中').length
+          if (generating >= 5) return false
+        }
+        return true
       }).sort((a, b) => {
         const load = (id) => this.works.filter((row) => row.doubaoAccountId === id && row.quotaPending && row.status === '生成中').length
         return load(a.id) - load(b.id)
@@ -1593,21 +1631,42 @@ export const useAppStore = defineStore('app', {
     },
     pumpGenerate(options = {}) {
       this.releaseStuckGenerations()
+      const force = Boolean(options.force) || generateForce
+      if (generateActive > 0 && !doubaoRunning.size) generateActive = 0
+      if (force) {
+        for (const id of [...doubaoRunning]) {
+          if (Date.now() - (doubaoRunningAt.get(id) || 0) < 180000) continue
+          doubaoRunning.delete(id)
+          doubaoRunningAt.delete(id)
+          generateActive = Math.max(0, generateActive - 1)
+          this.addLog('warning', '豆包', '上一批卡住了，已重新打开窗口继续发送')
+        }
+      }
+      const today = todayKey()
+      ;(this.doubaoAccounts || []).forEach((item) => {
+        if (item.quotaDate === today && doubaoQuotaUsed(this.works, item, today) < quotaLimit(item)) item.quotaDate = ''
+      })
       const configured = Math.max(1, Math.min(10, Number(this.settings.doubaoOpen) || 1))
       const idleCount = (this.doubaoAccounts || []).filter((item) => {
         if (!item.enabled || doubaoRunning.has(item.id)) return false
-        if (item.quotaDate && item.quotaDate === todayKey()) return false
-        const generating = this.works.filter((row) => row.doubaoAccountId === item.id && row.status === '生成中').length
-        return generating < 5 && doubaoQuotaUsed(this.works, item, todayKey()) < quotaLimit(item)
+        if (!force) {
+          const used = doubaoQuotaUsed(this.works, item, today)
+          if (used >= quotaLimit(item)) return false
+          if (item.quotaDate && item.quotaDate === today) return false
+          const generating = this.works.filter((row) => row.doubaoAccountId === item.id && row.status === '生成中').length
+          if (generating >= 5) return false
+        }
+        return true
       }).length
       const needed = Math.ceil(generatePending.length / 5)
-      const limit = Math.min(10, Math.max(configured, Math.min(idleCount, needed || configured)))
+      const limit = Math.min(10, Math.max(configured, Math.min(Math.max(idleCount, force ? 1 : 0), needed || configured)))
       while (generateActive < limit) {
         if (generatePending.length) {
-          const account = this.pickIdleDoubaoAccount()
+          const account = this.pickIdleDoubaoAccount([], { force })
           if (account) {
             const generating = this.works.filter((row) => row.doubaoAccountId === account.id && row.status === '生成中').length
-            const room = Math.min(5 - generating, quotaLimit(account) - doubaoQuotaUsed(this.works, account, todayKey()))
+            const quotaLeft = quotaLimit(account) - doubaoQuotaUsed(this.works, account, today)
+            const room = force ? Math.min(5, generatePending.length) : Math.min(5 - generating, quotaLeft)
             if (room > 0) {
               const ids = []
               while (ids.length < room && generatePending.length) ids.push(generatePending.shift())
@@ -1626,7 +1685,7 @@ export const useAppStore = defineStore('app', {
         }
         break
       }
-      if (generatePending.length && !this.pickIdleDoubaoAccount() && !this.pickWatchDoubaoAccount() && Date.now() - lastQueueNote > 60000) {
+      if (generatePending.length && !this.pickIdleDoubaoAccount([], { force }) && !this.pickWatchDoubaoAccount() && Date.now() - lastQueueNote > 60000) {
         lastQueueNote = Date.now()
         this.addLog('warning', '豆包', `还有 ${generatePending.length} 条在排队。每个号最多同时挂 5 条，额度用完后要等明天或换一个豆包号。`)
       }
@@ -1643,6 +1702,7 @@ export const useAppStore = defineStore('app', {
     },
     launchDoubaoBatch(workIds, accountId, watch, options = {}) {
       doubaoRunning.add(accountId)
+      doubaoRunningAt.set(accountId, Date.now())
       generateActive += 1
       const gap = options.immediate || watch ? 0 : Math.max(0, Number(this.settings.doubaoGap) || 0) * 1000
       const now = Date.now()
@@ -1650,14 +1710,17 @@ export const useAppStore = defineStore('app', {
       nextDoubaoLaunch = at + (gap || 0)
       const delay = Math.max(0, at - now)
       options.immediate = false
+      this.addLog('info', '豆包', watch ? '正在检查已挂上的任务' : `开始发送 ${workIds.length} 条图片和提示词`)
       Promise.resolve()
         .then(() => (delay ? new Promise((resolve) => setTimeout(resolve, delay)) : null))
         .then(() => this.runDoubaoBatch(workIds, accountId, watch))
         .catch((error) => this.addLog('error', '豆包', error.message || '生成中断'))
         .finally(() => {
           doubaoRunning.delete(accountId)
+          doubaoRunningAt.delete(accountId)
           generateActive = Math.max(0, generateActive - 1)
-          this.pumpGenerate()
+          if (!generatePending.length) generateForce = false
+          this.pumpGenerate({ force: generateForce })
         })
     },
     async runDoubaoBatch(workIds, accountId, watch = false) {
@@ -1700,7 +1763,7 @@ export const useAppStore = defineStore('app', {
             model: work.model,
             voice: work.voice || this.settings.voice
           }, product || { title: work.title })
-        const voiced = withVoice(prompt, work.voice || this.settings.voice)
+        const voiced = withVoice(prompt || storedPrompt, work.voice || this.settings.voice)
         const removed = new Set(product?.removedImages || [])
         const shots = this.productShots(work)
         const fallbackShots = shots.length
@@ -1717,7 +1780,7 @@ export const useAppStore = defineStore('app', {
             continue
           }
           work.prompt = voiced
-          work.images = fallbackShots
+          work.images = fallbackShots.slice(0, 12)
           work.image = fallbackShots[0]
           if (!work.no) work.no = this.nextWorkNo()
           work.status = '生成中'
@@ -1732,7 +1795,7 @@ export const useAppStore = defineStore('app', {
         jobs.push({
           workId: work.id,
           prompt: voiced,
-          images: fallbackShots,
+          images: fallbackShots.slice(0, 12),
           chatUrl: work.doubaoChatUrl || ''
         })
         taskIds.set(work.id, this.beginTask({
@@ -2110,9 +2173,7 @@ export const useAppStore = defineStore('app', {
       const created = []
         products.forEach((product) => {
         const picked = form.imagesByProduct?.[product?.id || '']
-        const images = Array.isArray(picked)
-          ? picked
-          : (product?.images?.length ? product.images : (product?.image ? [product.image] : []))
+        const images = (Array.isArray(picked) ? picked : this.productImagesOf(product)).filter(Boolean)
         const work = {
           id: uid('W'),
           productId: product?.id || '',
@@ -2133,7 +2194,7 @@ export const useAppStore = defineStore('app', {
           image: images[0] || '',
           images,
           // 确认框里的提示词优先；否则用选品库已生成的 filledPrompt
-          prompt: this.promptForProduct(form, product),
+          prompt: String(form.promptsByProduct?.[product?.id || ''] || '').trim() || this.promptForProduct(form, product),
           kind: form.kind || 'AI',
           doubaoAccount: '',
           failReason: '',
@@ -2152,7 +2213,7 @@ export const useAppStore = defineStore('app', {
       if (!account) {
         this.addLog('warning', '豆包', '先添加一个豆包账号，确认后才会打开网页')
       }
-      // 不预先空开豆包：由 generateDoubao 在确认有图+提示词后再打开并发送
+      const ready = []
       created.forEach((id) => {
         const work = this.works.find((item) => item.id === id)
         if (!work) return
@@ -2169,11 +2230,89 @@ export const useAppStore = defineStore('app', {
           this.addLog('warning', '豆包', `「${work.title}」${work.failReason}`)
           return
         }
-        this.kickGenerate(id, { immediate: true })
+        ready.push(id)
       })
+      generateForce = true
+      ready.forEach((id) => {
+        if (!generatePending.includes(id)) generatePending.push(id)
+      })
+      if (account && ready.length) {
+        doubaoRunning.delete(account.id)
+        doubaoRunningAt.delete(account.id)
+        generateActive = Math.max(0, generateActive - 1)
+        const ids = []
+        while (ids.length < 5 && generatePending.length) ids.push(generatePending.shift())
+        if (ids.length) {
+          try {
+            this.launchDoubaoBatch(ids, account.id, false, { immediate: true, force: true })
+          } catch (error) {
+            this.addLog('error', '豆包', error.message || '打开豆包后没有发出图片和提示词')
+          }
+        }
+      }
       this.persist()
       this.queueOpen = true
       return created
+    },
+    async collectGeneratedDoubao() {
+      const account = (this.doubaoAccounts || []).find((item) => item.enabled && item.loginStatus === '已登录')
+        || (this.doubaoAccounts || []).find((item) => item.enabled)
+        || null
+      if (!account) return { ok: false, count: 0, message: '先添加并登录一个豆包账号' }
+      if (!window.tujian?.collectDoubaoVideos) return { ok: false, count: 0, message: '请在桌面的 huang++pro 窗口里收录' }
+      const known = (this.works || []).map((work) => {
+        const matched = String(work.doubaoChatUrl || '').match(/chat\/([^/?#]+)/i)
+        return matched ? matched[1] : ''
+      }).filter(Boolean)
+      let result
+      try {
+        result = await window.tujian.collectDoubaoVideos({
+          id: account.id,
+          name: account.name,
+          login: account.login || '',
+          mode: account.loginMode || 'password',
+          known,
+          saveDir: this.settings.outputDir
+        })
+      } catch (error) {
+        return { ok: false, count: 0, message: error?.message || '收录失败' }
+      }
+      const videos = Array.isArray(result?.videos) ? result.videos : []
+      let count = 0
+      videos.forEach((item) => {
+        if (!item?.videoPath) return
+        if ((this.works || []).some((work) => work.videoPath === item.videoPath || (item.chatUrl && work.doubaoChatUrl === item.chatUrl))) return
+        this.works.unshift({
+          id: uid('W'),
+          productId: '',
+          no: this.nextWorkNo(),
+          title: item.title || '豆包已生成视频',
+          hue: 210,
+          status: '已生成',
+          progress: 100,
+          model: '',
+          duration: '',
+          ratio: '9:16',
+          voice: '',
+          image: '',
+          images: [],
+          prompt: '',
+          kind: 'AI',
+          doubaoAccount: account.name,
+          doubaoAccountId: account.id,
+          doubaoChatUrl: item.chatUrl || '',
+          videoPath: item.videoPath,
+          failReason: '',
+          createdAt: formatTime(new Date()),
+          finishedAt: formatTime(new Date()),
+          generatedAt: formatTime(new Date())
+        })
+        count += 1
+      })
+      if (count) this.addLog('success', '豆包', `一次收录了 ${count} 条豆包已生成的视频`)
+      else this.addLog('info', '豆包', result?.message || '没有新的已生成视频')
+      this.persist()
+      return { ok: Boolean(result?.ok), count, message: count ? `已收录 ${count} 条豆包已生成的视频` : (result?.message || '这个豆包号里没有新的已生成视频') }
     },
     importProducts(rows) {
       let count = 0

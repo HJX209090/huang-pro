@@ -22,6 +22,7 @@ contextBridge.exposeInMainWorld('tujian', {
   remixDoubao: (payload) => ipcRenderer.invoke('doubao:remix', JSON.parse(JSON.stringify(payload || {}))),
   unwatermarkDoubao: (payload) => ipcRenderer.invoke('doubao:unwatermark', JSON.parse(JSON.stringify(payload || {}))),
   pullCleanDoubao: (payload) => ipcRenderer.invoke('doubao:pull-clean', JSON.parse(JSON.stringify(payload || {}))),
+  collectDoubaoVideos: (payload) => ipcRenderer.invoke('doubao:collect', JSON.parse(JSON.stringify(payload || {}))),
   listDoubaoWindows: () => ipcRenderer.invoke('doubao:windows'),
   focusDoubaoWindow: (key) => ipcRenderer.invoke('doubao:focus', key),
   listSessions: () => ipcRenderer.invoke('session:list'),
