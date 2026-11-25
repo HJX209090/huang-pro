@@ -21,7 +21,6 @@
         <el-button type="primary" @click="startGenerate">开始生成（{{ enabledCount }}）</el-button>
         <el-button type="primary" plain @click="collectOnce">一次收录（{{ waitingWorks }}）</el-button>
         <el-button @click="edit()">新建账号</el-button>
-        <el-button type="primary" plain @click="batchVisible = true">批量添加</el-button>
       </div>
     </div>
     <div class="panel">
@@ -30,8 +29,9 @@
         <el-input-number v-model="store.settings.doubaoOpen" :min="1" :max="10" @change="store.persist()" />
         <span class="muted">启动间隔（秒）</span>
         <el-input-number v-model="store.settings.doubaoGap" :min="0" :max="60" @change="store.persist()" />
+        <span class="muted">同时打开是正在跑的窗口上限，启动间隔是后一个窗口晚几秒再开。点开始生成会把待生成全部排队。</span>
       </div>
-      <el-table :data="rows">
+      <el-table :data="pageRows">
         <el-table-column prop="name" label="账号名称" min-width="140" />
         <el-table-column prop="login" label="豆包账号" min-width="140" />
         <el-table-column prop="group" label="运营分组" width="120" />
@@ -45,15 +45,12 @@
         <el-table-column prop="worker" label="Worker" width="110" />
         <el-table-column prop="recent" label="最近完成" min-width="140" />
         <el-table-column prop="createdAt" label="创建时间" width="160" />
-        <el-table-column label="操作" min-width="420">
+        <el-table-column label="操作" min-width="240">
           <template #default="{ row }">
             <div class="row-ops">
               <el-button size="small" type="primary" plain @click="openRow(row)">打开</el-button>
               <el-button size="small" @click="showBrowsers(row)">浏览器</el-button>
               <el-button size="small" plain @click="openExtra(row)">再开窗口</el-button>
-              <el-button size="small" plain @click="talk(row)">对话</el-button>
-              <el-button size="small" type="primary" plain @click="requestCode(row)">获取验证码</el-button>
-              <el-button size="small" plain @click="fillCode(row)">填写验证码</el-button>
               <el-dropdown trigger="click">
                 <el-button size="small">更多</el-button>
                 <template #dropdown>
@@ -68,6 +65,16 @@
           </template>
         </el-table-column>
       </el-table>
+      <div class="pager">
+        <el-pagination
+          background
+          layout="total, sizes, prev, pager, next"
+          :total="rows.length"
+          :page-sizes="[10, 20, 50]"
+          v-model:page-size="pageSize"
+          v-model:current-page="page"
+        />
+      </div>
     </div>
     <el-dialog v-model="visible" :title="form.id ? '编辑豆包账号' : '新建豆包账号'" width="460px">
       <p class="muted">只填写用户名和分组。保存后打开豆包网页，扫码登录，不填写手机号。</p>
@@ -85,46 +92,11 @@
         <el-button type="primary" :loading="saving" @click="save">保存并登录</el-button>
       </template>
     </el-dialog>
-    <el-dialog v-model="batchVisible" title="批量添加豆包账号" width="560px">
-      <p class="muted">一行一个，格式：名称,登录账号,密码。第一次打开会填入登录信息；登录成功后，这个窗口会记住会话，下次自动登录。</p>
-      <el-input v-model="batchText" type="textarea" :rows="8" placeholder="冬装A,13800000000,密码" />
-      <template #footer>
-        <el-button @click="batchVisible = false">取消</el-button>
-        <el-button type="primary" @click="submitBatch">添加</el-button>
-      </template>
-    </el-dialog>
-
-    <div class="panel chat-panel">
-      <div class="toolbar" style="margin-top: 0">
-        <strong>和豆包对话</strong>
-        <el-select v-model="chatAccountId" placeholder="选择豆包账号" style="width: 180px">
-          <el-option v-for="item in store.doubaoAccounts" :key="item.id" :label="item.name" :value="item.id" />
-        </el-select>
-        <el-button @click="newChatWindow">新开对话窗口</el-button>
-        <el-button @click="refreshWindows">刷新窗口</el-button>
-        <span class="muted">当前窗口 {{ chatSlot }}</span>
-      </div>
-      <div v-if="openWindows.length" class="window-list">
-        <el-button v-for="item in openWindows" :key="item.key" size="small" @click="focusWindow(item)">{{ item.title || item.key }}</el-button>
-      </div>
-      <div class="chat-log">
-        <div v-if="!chatMessages.length" class="muted">选一个账号直接发消息。多个窗口各自记一份对话。豆包如果还要再确认一次，会自动再发，并写明有没有检测到确认发送。</div>
-        <div v-for="item in chatMessages" :key="item.id" class="chat-line" :class="item.role">
-          <b>{{ item.role === 'user' ? '我' : '豆包' }}</b>
-          <span>{{ item.text }}</span>
-          <em v-if="item.confirmNote">{{ item.confirmNote }}</em>
-        </div>
-      </div>
-      <div class="chat-send">
-        <el-input v-model="chatDraft" type="textarea" :rows="3" placeholder="输入要跟豆包说的话，Ctrl+Enter 发送" @keydown.ctrl.enter.prevent="sendChat" />
-        <el-button type="primary" :loading="chatSending" @click="sendChat">发送</el-button>
-      </div>
-    </div>
   </div>
 </template>
 
 <script setup>
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAppStore } from '@/stores/app'
 import ClipTabs from '@/components/ClipTabs.vue'
@@ -145,8 +117,6 @@ function plainCaptcha() {
 }
 const group = ref('')
 const visible = ref(false)
-const batchVisible = ref(false)
-const batchText = ref('')
 const form = reactive({ id: '', name: '', login: '', password: '', loginMode: 'qr', group: '默认分组', quota: '0/5' })
 const saving = ref(false)
 const rows = computed(() => store.doubaoAccounts.filter((item) => {
@@ -154,6 +124,13 @@ const rows = computed(() => store.doubaoAccounts.filter((item) => {
   if (group.value && item.group !== group.value) return false
   return true
 }))
+const page = ref(1)
+const pageSize = ref(10)
+const pageRows = computed(() => rows.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value))
+watch([keyword, group, pageSize, rows], () => {
+  const maxPage = Math.max(1, Math.ceil(rows.value.length / pageSize.value) || 1)
+  if (page.value > maxPage) page.value = maxPage
+})
 const enabledCount = computed(() => store.doubaoAccounts.filter((item) => item.enabled).length)
 const waitingWorks = computed(() => store.works.filter((item) => item.status === '待生成').length)
 const chatAccountId = ref('')
@@ -268,30 +245,39 @@ async function createGroup() {
   } catch { /* 取消 */ }
 }
 
-async function checkOne(row) {
-  if (!window.tujian?.accountStatus) return ElMessage.warning('请在桌面窗口里检测')
+async function checkOne(row, silent = false) {
+  if (!window.tujian?.accountStatus) {
+    ElMessage.warning('请在桌面窗口里检测')
+    return '待登录'
+  }
   const result = await window.tujian.accountStatus({ kind: 'doubao', id: row.id })
-  row.loginStatus = result.loginStatus
-  row.worker = '空闲'
+  row.loginStatus = result?.loginStatus === '已登录' ? '已登录' : '待登录'
+  if (row.worker !== '生成中') row.worker = '空闲'
   store.persist()
+  if (!silent) ElMessage.info(`${row.name}：${row.loginStatus}${result?.message ? `，${result.message}` : ''}`)
+  return row.loginStatus
 }
 
-function checkAll() {
-  store.doubaoAccounts.forEach(checkOne)
-  ElMessage.success('检测结果已写回列表')
+async function checkAll() {
+  const list = rows.value.slice()
+  if (!list.length) return ElMessage.info('还没有豆包账号')
+  let logged = 0
+  for (const row of list) {
+    const status = await checkOne(row, true)
+    if (status === '已登录') logged += 1
+  }
+  ElMessage.success(`检测完成：${logged} 个已登录，${list.length - logged} 个未登录`)
 }
 
 function startGenerate() {
   const pending = store.works.filter((item) => item.status === '待生成')
   if (!enabledCount.value) return ElMessage.warning('没有启用的豆包账号')
   if (!pending.length) return ElMessage.info('没有待生成的作品')
-  const limit = Math.min(pending.length, Number(store.settings.doubaoOpen) || 1)
-  pending.slice(0, limit).forEach((work, index) => {
-    const account = store.doubaoAccounts.filter((item) => item.enabled)[index % enabledCount.value]
-    if (account) account.worker = '生成中'
-    store.kickGenerate(work.id)
-  })
-  store.addLog('info', '豆包', `按同时打开 ${limit} 条开始生成`)
+  const open = Math.max(1, Math.min(10, Number(store.settings.doubaoOpen) || 1))
+  const gap = Math.max(0, Number(store.settings.doubaoGap) || 0)
+  pending.forEach((work) => store.kickGenerate(work.id))
+  store.addLog('info', '豆包', `排队 ${pending.length} 条，同时打开 ${open} 个，间隔 ${gap} 秒`)
+  ElMessage.success(`已排队 ${pending.length} 条。同时最多开 ${open} 个窗口，每个错开 ${gap} 秒`)
 }
 
 function collectOnce() {
@@ -453,17 +439,6 @@ async function fillCode(row) {
   else ElMessage.warning(result.message || '还没找到验证码输入框')
 }
 
-async function submitBatch() {
-  try {
-    const count = await store.batchAccounts('doubao', batchText.value)
-    batchText.value = ''
-    batchVisible.value = false
-    ElMessage.success(`已添加 ${count} 个豆包账号`)
-  } catch (error) {
-    ElMessage.error(error.message || '添加失败')
-  }
-}
-
 async function remove(row) {
   try { await ElMessageBox.confirm(`删除 ${row.name}？`, '删除', { type: 'warning' }) } catch { return }
   store.doubaoAccounts = store.doubaoAccounts.filter((item) => item.id !== row.id)
@@ -482,5 +457,5 @@ async function remove(row) {
 .chat-line em { color: #667085; font-style: normal; font-size: 12px; }
 .chat-send { display: flex; gap: 8px; align-items: flex-end; }
 .chat-send .el-textarea { flex: 1; }
-.window-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.pager { margin-top: 12px; display: flex; justify-content: flex-end; flex-wrap: wrap; }
 </style>

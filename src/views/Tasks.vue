@@ -27,7 +27,7 @@
         <el-table-column prop="note" label="说明" min-width="220" />
         <el-table-column prop="startedAt" label="开始" width="160" />
         <el-table-column prop="finishedAt" label="结束" width="160" />
-        <el-table-column label="操作" width="120" fixed="right">
+        <el-table-column label="操作" min-width="120">
           <template #default="{ row }">
             <el-button v-if="row.status === 'running'" link type="danger" @click="stopOne(row)">结束</el-button>
             <span v-else class="muted">—</span>
@@ -45,7 +45,7 @@
       <el-table :data="sessions">
         <el-table-column prop="key" label="窗口键" min-width="220" />
         <el-table-column prop="title" label="标题" min-width="200" />
-        <el-table-column label="操作" width="160" fixed="right">
+        <el-table-column label="操作" min-width="160">
           <template #default="{ row }">
             <el-button link type="primary" @click="focus(row)">置前</el-button>
             <el-button link type="danger" @click="close(row)">关闭</el-button>

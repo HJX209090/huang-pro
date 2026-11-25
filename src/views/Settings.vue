@@ -49,7 +49,7 @@
         <span class="num-hint">延迟天数，例如 8</span>
         <el-checkbox v-model="publishPage.dyPrivate">发布为私密</el-checkbox>
         <el-checkbox v-model="publishPage.dyManage">发布成功后内容管理</el-checkbox>
-        <p class="muted">挂商品需要商品有链接。定时发布会点「定时发布」，具体日历控件若页面改版可能要你在窗口里补点一次。</p>
+        <p class="muted">发布时按作品上的商品编号，在抖音购物车里点对应商品。勾选 AI 自主声明后，会在发布页底部选中「AI自主声明」。勾选内容管理后，发布成功会打开创作者内容管理。默认声音会写进发给豆包的提示词。</p>
         <h3>本机 RPA 流程</h3>
         <p class="muted">本机流程可在 RPA 页管理。定时发布会打开抖音上传页自动填标题、标签并点发布。</p>
         <el-button type="primary" @click="router.push('/rpa')">管理本机流程</el-button>

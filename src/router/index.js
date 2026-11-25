@@ -33,7 +33,7 @@ const router = createRouter({
 router.beforeEach((to) => {
   const store = useAppStore()
   if (!store.ready) return true
-  if (['/license', '/browser', '/proxy', '/rpa'].includes(to.path) && !store.adminMode) return store.licenseActive ? '/dashboard' : '/account'
+  if (['/license', '/browser', '/proxy'].includes(to.path) && !store.adminMode) return store.licenseActive ? '/dashboard' : '/account'
   if (!store.licenseActive && to.path !== '/account' && !(store.adminMode && to.path === '/license')) return '/account'
   return true
 })

@@ -17,7 +17,7 @@
           <template #default="{ row }"><el-switch v-model="row.enabled" @change="toggle(row)" /></template>
         </el-table-column>
         <el-table-column prop="status" label="检查" width="120" />
-        <el-table-column label="操作" width="180" fixed="right">
+        <el-table-column label="操作" min-width="160">
           <template #default="{ row }">
             <el-button link type="primary" @click="check(row)">测试连接</el-button>
             <el-button link @click="edit(row)">编辑</el-button>

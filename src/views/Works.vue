@@ -33,6 +33,9 @@
         <el-input v-model="keyword" clearable placeholder="标题 / 商品ID / 成片ID" style="width: 260px" @keyup.enter="applied = keyword" />
         <el-button type="primary" @click="applied = keyword">查询</el-button>
         <el-button @click="resetFilters">重置</el-button>
+        <el-select v-model="failReason" clearable placeholder="失败原因" style="width: 180px">
+          <el-option v-for="item in failReasons" :key="item" :label="item" :value="item" />
+        </el-select>
         <el-date-picker v-model="range" type="daterange" value-format="YYYY-MM-DD" start-placeholder="创建开始" end-placeholder="创建结束" />
       </div>
     </div>
@@ -42,6 +45,7 @@
         <span class="muted">已选 {{ selected.length }}</span>
         <div class="grow"></div>
         <el-button @click="exportExcel">导出 Excel</el-button>
+        <el-button :disabled="!selected.length" @click="clearAssign">取消指派</el-button>
         <el-button :disabled="!selected.length" @click="markStatus('已生成')">重新为待审核</el-button>
         <el-button type="success" plain :disabled="!selected.length" @click="markStatus('审核通过')">标为已审核</el-button>
         <el-button type="danger" plain :disabled="!selected.length" @click="removeSelected">删除</el-button>
@@ -63,11 +67,12 @@
           <template #default="{ row }"><el-tag size="small" :type="statusType(row.status)">{{ displayWorkStatus(row.status) }}</el-tag></template>
         </el-table-column>
         <el-table-column prop="createdAt" label="创建时间" width="168" />
-        <el-table-column label="操作" width="220" fixed="right">
+        <el-table-column label="操作" min-width="220">
           <template #default="{ row }">
             <div class="row-ops">
               <el-button v-if="row.videoPath" link type="primary" @click="playWork(row)">播放</el-button>
-              <el-button v-if="row.doubaoChatUrl" link type="primary" @click="openDoubao(row)">生成页</el-button>
+              <el-button v-if="row.doubaoChatUrl" link type="primary" @click="copyChat(row)">复制会话</el-button>
+              <el-button v-if="row.doubaoChatUrl" link type="primary" @click="openDoubao(row)">打开会话</el-button>
               <el-button v-if="canReview(row)" link type="primary" @click="open(row)">审核</el-button>
               <el-button v-if="canRepublish(row)" link type="primary" :loading="publishId === row.id" @click="republish(row)">再发布</el-button>
               <el-button v-if="canRegenerate(row)" link type="primary" :loading="regenId === row.id" @click="regenerate(row)">重新生成</el-button>
@@ -82,7 +87,9 @@
           <div class="work-cover" :class="{ generating: !work.videoPath && work.status === '生成中' }">
             <el-checkbox class="work-pick" :model-value="selected.includes(work.id)" @click.stop @change="toggle(work.id)" />
             <el-tag class="badge" size="small" :type="statusType(work.status)">{{ displayWorkStatus(work.status) }}</el-tag>
-            <video v-if="work.videoPath" class="work-cover" :src="videoUrl(work.videoPath)" muted preload="metadata" @click.stop="playWork(work)"></video>
+            <HoverPreview v-if="work.videoPath" :video="videoUrl(work.videoPath)" block @open="playWork(work)">
+              <video class="work-cover" :src="videoUrl(work.videoPath)" muted preload="metadata"></video>
+            </HoverPreview>
             <button v-if="work.videoPath" type="button" class="play-btn" @click.stop="playWork(work)">播放</button>
             <div v-else-if="work.status === '生成中'" class="gen-motion">
               <i class="gen-spin"></i>
@@ -125,16 +132,18 @@ import { computed, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { useAppStore } from '@/stores/app'
+import HoverPreview from '@/components/HoverPreview.vue'
 import { displayWorkStatus, statusType, videoUrl } from '@/utils/format'
 
 const store = useAppStore()
 const router = useRouter()
-const statuses = ['全部', '待审核', '已审核', '制作中', '待发布', '发布中', '已发布', '数据失败', '发布失败']
+const statuses = ['全部', '待审核', '已审核', '制作中', '待发布', '发布中', '已发布', '数据失败', '审核驳回', '发布失败']
 const kind = ref('全部')
 const status = ref('全部')
 const keyword = ref('')
 const applied = ref('')
 const range = ref([])
+const failReason = ref('')
 const selected = ref([])
 const viewMode = ref('card')
 const page = ref(1)
@@ -142,6 +151,16 @@ const pageSize = ref(12)
 const playerOpen = ref(false)
 const playerSrc = ref('')
 const playerTitle = ref('')
+
+async function copyChat(work) {
+  if (!work?.doubaoChatUrl) return ElMessage.warning('这条还没有豆包会话')
+  try {
+    await navigator.clipboard.writeText(work.doubaoChatUrl)
+    ElMessage.success('已复制这条作品的豆包会话')
+  } catch {
+    ElMessage.warning(work.doubaoChatUrl)
+  }
+}
 
 async function openDoubao(work) {
   const account = store.doubaoAccounts.find((item) => item.id === work.doubaoAccountId) || store.doubaoAccounts[0]
@@ -173,7 +192,8 @@ function matchStatus(work) {
   if (status.value === '已审核' || status.value === '待发布') return work.status === '审核通过'
   if (status.value === '制作中') return work.status === '待生成' || work.status === '生成中'
   if (status.value === '数据失败') return work.status === '生成失败'
-  if (status.value === '发布失败') return work.status === '审核失败'
+  if (status.value === '审核驳回') return work.status === '审核失败'
+  if (status.value === '发布失败') return Boolean(work.publishFailAt) && work.status !== '已发布'
   return work.status === status.value
 }
 
@@ -187,14 +207,17 @@ const filtered = computed(() => store.works.filter((work) => {
     const day = String(work.createdAt || '').slice(0, 10)
     if (day < range.value[0] || day > range.value[1]) return false
   }
+  if (failReason.value && !String(work.failReason || '').includes(failReason.value)) return false
   return true
 }))
+
+const failReasons = computed(() => [...new Set(store.works.map((work) => String(work.failReason || '').trim()).filter(Boolean))])
 
 const pageRows = computed(() => filtered.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value))
 const allChecked = computed(() => pageRows.value.length > 0 && pageRows.value.every((work) => selected.value.includes(work.id)))
 const someChecked = computed(() => selected.value.length > 0 && !allChecked.value)
 
-watch([kind, status, applied, range, viewMode, pageSize], () => { page.value = 1 })
+watch([kind, status, applied, range, failReason, viewMode, pageSize], () => { page.value = 1 })
 watch(filtered, () => {
   const maxPage = Math.max(1, Math.ceil(filtered.value.length / pageSize.value) || 1)
   if (page.value > maxPage) page.value = maxPage
@@ -206,6 +229,7 @@ function resetFilters() {
   kind.value = '全部'
   status.value = '全部'
   range.value = []
+  failReason.value = ''
   page.value = 1
 }
 
@@ -225,6 +249,16 @@ function toggleAll(checked) {
 
 function onTableSelect(rows) {
   selected.value = rows.map((item) => item.id)
+}
+
+function clearAssign() {
+  store.works.forEach((work) => {
+    if (!selected.value.includes(work.id)) return
+    work.publishAccountId = ''
+    work.publishAccount = ''
+  })
+  store.flush()
+  ElMessage.success('已取消这些作品的发布账号指派')
 }
 
 function markStatus(next) {
@@ -371,8 +405,8 @@ async function removeSelected() {
 }
 .work-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 8px;
   align-items: stretch;
 }
 .work-card {
@@ -418,10 +452,10 @@ async function removeSelected() {
 .player-dialog { width: 100%; max-height: 72vh; background: #000; border-radius: 12px; }
 .badge { position: absolute; right: 6px; top: 6px; z-index: 2; }
 .cover-empty { color: #d0d5dd; font-size: 12px; font-weight: 600; }
-.work-body { display: flex; flex-direction: column; gap: 4px; flex: 1; padding: 8px 9px 10px; }
+.work-body { display: flex; flex-direction: column; gap: 2px; flex: 1; padding: 6px; }
 .work-body .goods-title {
-  font-size: 12px;
-  line-height: 1.4;
+  font-size: 11px;
+  line-height: 1.35;
   font-weight: 600;
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -438,8 +472,9 @@ async function removeSelected() {
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
-.work-actions { display: flex; gap: 6px; margin-top: auto; padding-top: 2px; }
-.work-actions .el-button { flex: 1; margin: 0; }
-.work-actions :deep(.el-button) { --el-button-size: 24px; padding: 4px 8px; font-size: 12px; }
+.work-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-top: auto; padding-top: 2px; }
+.work-actions .el-button { width: 100%; margin: 0; }
+.work-actions :deep(.el-button) { --el-button-size: 22px; padding: 2px 0; font-size: 11px; white-space: normal; height: auto; min-height: 22px; line-height: 1.2; }
+.row-ops { display: flex; flex-wrap: wrap; gap: 4px 8px; }
 .pager { margin-top: 12px; display: flex; justify-content: flex-end; }
 </style>

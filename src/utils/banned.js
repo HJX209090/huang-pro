@@ -12,7 +12,8 @@ export function defaultBannedWords() {
 
 export function bannedWords(extra = []) {
   const custom = Array.isArray(extra) ? extra : String(extra || '').split(/[\n,，]/)
-  return [...new Set([...DEFAULT_BANNED, ...custom].map((item) => String(item || '').trim()).filter(Boolean))]
+  const list = [...new Set(custom.map((item) => String(item || '').trim()).filter(Boolean))]
+  return list.length ? list : [...DEFAULT_BANNED]
 }
 
 export function cleanTitle(title, extra = []) {

@@ -134,6 +134,18 @@ export function videoUrl(filePath) {
   return `local-video://play/?path=${encodeURIComponent(filePath)}`
 }
 
+export function keepProductImage(value) {
+  const url = String(value || '').trim()
+  if (!url) return false
+  if (/^(file:|local-video:)/i.test(url)) return true
+  if (!/^(https?:)?\/\//i.test(url)) return false
+  if (/icon|logo|avatar|sprite|favicon|emoji|badge|qrcode|qr_code|shop_logo|placeholder/i.test(url)) return false
+  const size = url.match(/(?:www|resize|crop|thumb)[^0-9]{0,8}(\d{1,4})[-x_:](\d{1,4})/i)
+    || url.match(/(?:^|[^0-9])(\d{2,4})x(\d{2,4})(?:[^0-9]|$)/i)
+  if (size && Number(size[1]) > 0 && Number(size[1]) < 240 && Number(size[2]) > 0 && Number(size[2]) < 240) return false
+  return true
+}
+
 export function imageUrl(value) {
   const src = String(value || '')
   if (!src) return ''
@@ -166,18 +178,26 @@ export function composePrompt(form, product) {
     if (seconds > 0) text = text.replace(/10\s*秒/, `${seconds} 秒`)
     if (form?.ratio) text = text.replace('9:16', form.ratio)
     if (form?.model && !/mini/i.test(form.model)) text = text.replace(/Seedance\s*2\.0\s*Mini/gi, form.model)
-    return text
+    return withVoice(text, form?.voice)
   }
   let opening = fillTemplate(form?.lockText, product)
   const seconds = Number(form?.duration)
   if (seconds > 0) opening = opening.replace(/10\s*秒/, `${seconds} 秒`)
   if (form?.ratio) opening = opening.replace('9:16', form.ratio)
   if (form?.model && !/mini/i.test(form.model)) opening = opening.replace(/Seedance\s*2\.0\s*Mini/gi, form.model)
-  return [
+  const lines = [
     opening,
     withLabel('画面主线', fillTemplate(form?.storyline, product)),
     withLabel('字幕 & 视觉', fillTemplate(form?.caption, product)),
     withLabel('音频 & 口播', fillTemplate(form?.script || form?.oral, product)),
     withLabel('硬性合规要求', fillTemplate(form?.compliance, product))
   ].filter(Boolean).join('\n\n')
+  return withVoice(lines, form?.voice)
+}
+
+export function withVoice(text, voice) {
+  const body = String(text || '').trim()
+  const name = String(voice || '').trim()
+  if (!body || !name || body.includes(name)) return body
+  return `${body}\n\n配音音色：${name}。口播使用这个音色。`
 }

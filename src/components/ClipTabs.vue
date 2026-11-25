@@ -16,7 +16,7 @@ const router = useRouter()
 
 function go(tab) {
   if (tab === 'doubao') router.push('/doubao')
-  else router.push({ path: '/products', query: { tab: 'cart' } })
+  else router.push('/products')
 }
 </script>
 

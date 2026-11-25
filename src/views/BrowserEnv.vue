@@ -16,7 +16,7 @@
         <el-table-column prop="account" label="绑定账号" width="140" />
         <el-table-column prop="status" label="状态" width="100" />
         <el-table-column prop="remark" label="备注" min-width="140" />
-        <el-table-column label="操作" width="200" fixed="right">
+        <el-table-column label="操作" min-width="180">
           <template #default="{ row }">
             <el-button link type="primary" @click="launch(row)">启动</el-button>
             <el-button link @click="edit(row)">编辑</el-button>

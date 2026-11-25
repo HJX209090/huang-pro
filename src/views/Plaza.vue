@@ -1,89 +1,111 @@
 <template>
-  <div class="page">
-    <div class="page-head">
-      <div>
-        <h1>选品广场</h1>
-        <p>商品按发布账号分开保存。同步失败时，已经入库的商品不会被清掉。</p>
+  <div class="page plaza-page">
+    <div class="plaza-top">
+      <div class="plaza-tabs">
+        <button v-for="item in plazaTabs" :key="item.id" type="button" :class="{ on: plazaTab === item.id }" @click="plazaTab = item.id">{{ item.label }}</button>
       </div>
-      <el-button type="primary" :loading="syncing" @click="syncNow">同步广场</el-button>
+      <div class="plaza-views">
+        <button type="button" :class="{ on: viewMode === 'table' }" @click="viewMode = 'table'">视图</button>
+        <button type="button" :class="{ on: viewMode === 'list' }" @click="viewMode = 'list'">列表</button>
+        <button type="button" :class="{ on: viewMode === 'card' }" @click="viewMode = 'card'">卡片</button>
+        <el-button type="primary" :loading="syncing" @click="syncNow">同步广场</el-button>
+      </div>
     </div>
-    <div class="panel filters">
-      <el-select v-model="accountId" placeholder="发布账号" style="width: 180px">
+    <div class="plaza-filters">
+      <el-select v-model="accountId" placeholder="发布账号" style="width: 150px">
         <el-option v-for="item in store.publishAccounts" :key="item.id" :label="accountLabel(item)" :value="item.id" />
       </el-select>
-      <el-input v-model="keywordInput" clearable placeholder="商品名 / 店铺" style="width: 200px" />
-      <el-select v-model="category" clearable placeholder="类目" style="width: 150px">
+      <el-select v-model="category" clearable placeholder="类目" style="width: 130px">
+        <el-option label="全部类目" value="" />
         <el-option v-for="item in categories" :key="item" :label="item" :value="item" />
       </el-select>
-      <el-select v-model="source" clearable placeholder="类型" style="width: 130px">
-        <el-option v-for="item in sources" :key="item" :label="item" :value="item" />
+      <el-input v-model="keywordInput" clearable placeholder="商品名 / ID / 链接 / 短链" style="width: 240px" @keyup.enter="applySearch" />
+      <el-select v-model="salesBand" style="width: 120px">
+        <el-option label="月销 不限" value="" />
+        <el-option label="月销 1万+" value="1w" />
+        <el-option label="月销 5万+" value="5w" />
       </el-select>
-      <el-date-picker
-        v-model="range"
-        type="daterange"
-        value-format="YYYY-MM-DD"
-        start-placeholder="入库开始"
-        end-placeholder="入库结束"
-        style="width: 250px"
-      />
-    </div>
-    <div class="panel filters">
-      <span class="muted">售价大于</span>
-      <el-input-number v-model="minPrice" :min="0" :precision="2" controls-position="right" />
-      <span class="muted">佣金率</span>
-      <el-select v-model="rateOp" style="width: 90px">
-        <el-option label="大于" value="gt" />
-        <el-option label="小于" value="lt" />
-        <el-option label="等于" value="eq" />
+      <el-select v-model="priceBand" style="width: 120px">
+        <el-option label="售价 不限" value="" />
+        <el-option label="20元以下" value="low" />
+        <el-option label="20-50元" value="mid" />
+        <el-option label="50元以上" value="high" />
       </el-select>
-      <el-input-number v-model="rateValue" :min="0" :max="100" controls-position="right" />
-      <span class="muted">%</span>
-      <el-button @click="clearFilters">清空筛选</el-button>
-      <div class="grow">
-        <el-radio-group v-model="viewMode" size="small">
-          <el-radio-button value="card">卡片</el-radio-button>
-          <el-radio-button value="list">列表</el-radio-button>
-        </el-radio-group>
-        <el-checkbox :model-value="allChecked" :indeterminate="someChecked" @change="toggleAll">全选本页</el-checkbox>
-        <el-button type="primary" :disabled="!selected.length" @click="addSelected">批量入库 {{ selected.length }}</el-button>
-      </div>
+      <el-select v-model="rateBand" style="width: 120px">
+        <el-option label="佣金 不限" value="" />
+        <el-option label="佣金 10%+" value="10" />
+        <el-option label="佣金 20%+" value="20" />
+        <el-option label="佣金 30%+" value="30" />
+      </el-select>
+      <el-select v-model="sortKey" style="width: 140px">
+        <el-option label="近30天销量" value="sales" />
+        <el-option label="售价" value="price" />
+        <el-option label="佣金率" value="rate" />
+        <el-option label="预估佣金" value="earn" />
+      </el-select>
+      <el-select v-model="sortDesc" style="width: 90px">
+        <el-option label="倒序" :value="true" />
+        <el-option label="正序" :value="false" />
+      </el-select>
+      <el-button type="primary" @click="applySearch">搜索</el-button>
     </div>
+    <p class="plaza-hint">月销、售价、佣金和排序按当前账号的广场库计算。可一次取前 50、100 或 200 条加入选品车。点行勾选，点标题打开曲线，按住表头右缘可拖列宽。</p>
     <div v-if="syncing || progress" class="panel" style="padding: 12px 16px">
       <div class="muted" style="margin-bottom: 8px">{{ syncText }}</div>
       <el-progress :percentage="progress" :stroke-width="10" />
     </div>
     <p v-if="!accountRows.length && !syncing" class="muted">这个账号还没有广场商品。换到已经同步过的发布账号，或者再同步一次。之前同步成功的商品还在对应账号下面。</p>
     <p v-else-if="!filtered.length && !syncing" class="muted">没有符合当前筛选的商品。</p>
-    <el-table v-if="viewMode === 'list' && pageRows.length" :data="pageRows" @selection-change="onTableSelect">
-      <el-table-column type="selection" width="42" />
-      <el-table-column label="商品" min-width="280">
-        <template #default="{ row }">
-          <div class="plaza-list-goods">
-            <img v-if="shotList(row)[0]" class="plaza-list-thumb" :src="imageUrl(shotList(row)[0])" alt="" />
-            <div>
-              <div class="goods-title">{{ row.title }}</div>
-              <div class="goods-sub">{{ goodsShop(row) }} · {{ goodsCategory(row) }}</div>
-            </div>
-          </div>
-        </template>
-      </el-table-column>
-      <el-table-column label="售价" width="100">
-        <template #default="{ row }">¥{{ Number(row.price).toFixed(2) }}</template>
-      </el-table-column>
-      <el-table-column label="佣金" width="90">
-        <template #default="{ row }"><span class="commission">{{ row.rate }}%</span></template>
-      </el-table-column>
-      <el-table-column label="预估赚" width="100">
-        <template #default="{ row }">¥{{ earn(row.price, row.rate) }}</template>
-      </el-table-column>
-      <el-table-column prop="createdAt" label="入库" width="150" />
-      <el-table-column label="操作" width="120" fixed="right">
-        <template #default="{ row }">
-          <el-button v-if="row.added" link @click="goLibrary">已在库</el-button>
-          <el-button v-else link type="primary" @click="addOne(row.id)">入库</el-button>
-        </template>
-      </el-table-column>
-    </el-table>
+    <div v-if="viewMode !== 'card' && pageRows.length" class="plaza-table-wrap">
+      <table class="plaza-table" :class="{ compact: viewMode === 'table' }">
+        <colgroup>
+          <col style="width: 42px" />
+          <col :style="{ width: colWidths.info + 'px' }" />
+          <col :style="{ width: colWidths.price + 'px' }" />
+          <col :style="{ width: colWidths.rate + 'px' }" />
+          <col :style="{ width: colWidths.earn + 'px' }" />
+          <col :style="{ width: colWidths.sales + 'px' }" />
+          <col :style="{ width: colWidths.shop + 'px' }" />
+          <col :style="{ width: colWidths.op + 'px' }" />
+        </colgroup>
+        <thead>
+          <tr>
+            <th><el-checkbox :model-value="allChecked" :indeterminate="someChecked" @change="toggleAll" /></th>
+            <th>商品信息<span class="col-resize" @mousedown.prevent="startResize('info', $event)"></span></th>
+            <th>售价<span class="col-resize" @mousedown.prevent="startResize('price', $event)"></span></th>
+            <th>佣金率<span class="col-resize" @mousedown.prevent="startResize('rate', $event)"></span></th>
+            <th>预估佣金<span class="col-resize" @mousedown.prevent="startResize('earn', $event)"></span></th>
+            <th>月销<span class="col-resize" @mousedown.prevent="startResize('sales', $event)"></span></th>
+            <th>店铺<span class="col-resize" @mousedown.prevent="startResize('shop', $event)"></span></th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="row in pageRows" :key="row.id" :class="{ picked: selected.includes(row.id) }" @click="toggle(row.id)">
+            <td @click.stop><el-checkbox :model-value="selected.includes(row.id)" @change="toggle(row.id)" /></td>
+            <td>
+              <div class="plaza-goods">
+                <HoverPreview v-if="shotList(row).length" :images="shotList(row)" block>
+                  <img :src="imageUrl(shotList(row)[0])" alt="" />
+                </HoverPreview>
+                <div>
+                  <button type="button" class="goods-title linkish" @click.stop="openTrend(row)">{{ row.title }}</button>
+                  <div class="goods-sub">ID {{ row.id }} · 达人 {{ Number(row.rate) || 0 }}%</div>
+                </div>
+              </div>
+            </td>
+            <td class="price">¥{{ Number(row.price || 0).toFixed(2) }}</td>
+            <td class="commission">{{ Number(row.rate) || 0 }}%</td>
+            <td class="earn">¥{{ earn(row.price, row.rate) }}</td>
+            <td>{{ Number(row.monthlySales) || 0 }}</td>
+            <td>{{ goodsShop(row) }}</td>
+            <td @click.stop>
+              <el-button link type="primary" @click="copyLink(row)">复制链接</el-button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
     <div v-else-if="viewMode === 'card'" class="plaza-grid plaza-grid-compact">
       <article v-for="item in pageRows" :key="item.id" class="plaza-card plaza-card-compact" :class="{ picked: selected.includes(item.id) }">
         <el-checkbox class="work-pick" :model-value="selected.includes(item.id)" @change="toggle(item.id)" />
@@ -146,11 +168,21 @@
         </el-table>
       </div>
     </el-dialog>
-    <div v-if="filtered.length" class="pager">
+    <div v-if="sorted.length" class="plaza-tray">
+      <el-checkbox :model-value="allChecked" :indeterminate="someChecked" @change="toggleAll">本页全选</el-checkbox>
+      <span>已选 {{ selected.length }}</span>
+      <el-button @click="dropInCart">去掉已在车</el-button>
+      <el-button @click="selected = []">清空</el-button>
+      <el-button type="primary" :disabled="!selected.length" @click="addSelected">加入选品车</el-button>
+      <el-button type="primary" plain @click="takeFirst(50)">取前 50 条加入</el-button>
+      <el-button type="primary" plain @click="takeFirst(100)">取前 100 条加入</el-button>
+      <el-button type="primary" plain @click="takeFirst(200)">取前 200 条加入</el-button>
+    </div>
+    <div v-if="sorted.length" class="pager">
       <el-pagination
         background
         layout="total, sizes, prev, pager, next"
-        :total="filtered.length"
+        :total="sorted.length"
         :page-sizes="[8, 12, 20, 40, 60]"
         v-model:page-size="pageSize"
         v-model:current-page="page"
@@ -165,7 +197,8 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useAppStore } from '@/stores/app'
 import HoverPreview from '@/components/HoverPreview.vue'
-import { coverStyle, earn, imageUrl } from '@/utils/format'
+import { coverStyle, earn, imageUrl, keepProductImage } from '@/utils/format'
+import { cleanTitle } from '@/utils/banned'
 import { goodsCategory, goodsShop } from '@/utils/goods'
 
 const store = useAppStore()
@@ -181,7 +214,22 @@ const minPrice = ref(0)
 const rateOp = ref('gt')
 const rateValue = ref(0)
 const selected = ref([])
-const viewMode = ref('card')
+const viewMode = ref('list')
+const plazaTab = ref('search')
+const salesBand = ref('')
+const priceBand = ref('')
+const rateBand = ref('')
+const sortKey = ref('sales')
+const sortDesc = ref(true)
+const colWidths = ref({ info: 460, price: 90, rate: 90, earn: 110, sales: 110, shop: 180, op: 110 })
+const plazaTabs = [
+  { id: 'search', label: '检索选品' },
+  { id: 'hot', label: '爆品单' },
+  { id: 'share', label: '可分享库' },
+  { id: 'newcat', label: '类目上新' },
+  { id: 'recommend', label: '系统推荐' },
+  { id: 'recent', label: '用户近期发布' }
+]
 const page = ref(1)
 const pageSize = ref(20)
 const trendItem = ref(null)
@@ -202,7 +250,7 @@ if (!accountId.value || !store.plaza.some((item) => item.accountId === accountId
 }
 
 function shotList(item) {
-  return [...new Set([...(item?.images || []), item?.image].map((src) => String(src || '')).filter(Boolean))]
+  return [...new Set([...(item?.images || []), item?.image].map((src) => String(src || '').trim()).filter((src) => keepProductImage(src)))]
 }
 
 function readTrend(values) {
@@ -295,25 +343,43 @@ const categories = computed(() => [...new Set(accountRows.value.map((item) => go
 const sources = computed(() => [...new Set(accountRows.value.map((item) => item.source).filter(Boolean))])
 
 const filtered = computed(() => accountRows.value.filter((item) => {
-  if (keyword.value && !`${item.title}${item.shop}`.includes(keyword.value.trim())) return false
+  const query = keyword.value.trim()
+  if (query && !`${item.title || ''}${item.shop || ''}${item.id || ''}${item.link || ''}`.includes(query)) return false
   if (category.value && goodsCategory(item) !== category.value) return false
-  if (source.value && item.source !== source.value) return false
-  if (Number(item.price) <= Number(minPrice.value || 0) && Number(minPrice.value) > 0) return false
+  const sales = Number(item.monthlySales) || 0
+  const price = Number(item.price) || 0
   const rate = Number(item.rate) || 0
-  const target = Number(rateValue.value)
-  if (target > 0 || rateOp.value === 'eq') {
-    if (rateOp.value === 'gt' && target > 0 && rate <= target) return false
-    if (rateOp.value === 'lt' && rate >= target) return false
-    if (rateOp.value === 'eq' && rate !== target) return false
-  }
-  if (range.value?.length === 2) {
-    const day = String(item.createdAt || '').slice(0, 10)
-    if (day < range.value[0] || day > range.value[1]) return false
-  }
+  if (salesBand.value === '1w' && sales < 10000) return false
+  if (salesBand.value === '5w' && sales < 50000) return false
+  if (priceBand.value === 'low' && price >= 20) return false
+  if (priceBand.value === 'mid' && (price < 20 || price >= 50)) return false
+  if (priceBand.value === 'high' && price < 50) return false
+  if (rateBand.value === '10' && rate < 10) return false
+  if (rateBand.value === '20' && rate < 20) return false
+  if (rateBand.value === '30' && rate < 30) return false
+  const day = String(item.createdAt || '').slice(0, 10)
+  const recent = !day || day >= new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10)
+  const fresh = !day || day >= new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10)
+  if (plazaTab.value === 'hot' && sales < 10000) return false
+  if (plazaTab.value === 'share' && !item.link) return false
+  if (plazaTab.value === 'newcat' && !fresh) return false
+  if (plazaTab.value === 'recommend' && rate < 20) return false
+  if (plazaTab.value === 'recent' && !recent) return false
   return true
 }))
 
-const pageRows = computed(() => filtered.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value))
+const sorted = computed(() => {
+  const dir = sortDesc.value ? -1 : 1
+  const valueOf = (row) => {
+    if (sortKey.value === 'price') return Number(row.price) || 0
+    if (sortKey.value === 'rate') return Number(row.rate) || 0
+    if (sortKey.value === 'earn') return (Number(row.price) || 0) * (Number(row.rate) || 0) / 100
+    return Number(row.monthlySales) || 0
+  }
+  return [...filtered.value].sort((a, b) => (valueOf(a) - valueOf(b)) * dir)
+})
+
+const pageRows = computed(() => sorted.value.slice((page.value - 1) * pageSize.value, page.value * pageSize.value))
 const allChecked = computed(() => pageRows.value.length > 0 && pageRows.value.every((item) => selected.value.includes(item.id)))
 const someChecked = computed(() => pageRows.value.some((item) => selected.value.includes(item.id)) && !allChecked.value)
 
@@ -324,10 +390,66 @@ watch(keywordInput, (value) => {
   }, 200)
 })
 
-watch([accountId, keyword, category, source, range, minPrice, rateOp, rateValue, pageSize], () => {
+watch([accountId, keyword, category, plazaTab, salesBand, priceBand, rateBand, sortKey, sortDesc, pageSize], () => {
   page.value = 1
   selected.value = []
 })
+
+function applySearch() {
+  keyword.value = keywordInput.value
+}
+
+function inCart(item) {
+  return Boolean(item?.added) || store.products.some((row) => row.id === item.id && (row.accountId || '') === (accountId.value || store.activeAccountId || ''))
+}
+
+function startResize(key, event) {
+  const startX = event.clientX
+  const start = colWidths.value[key]
+  const move = (e) => { colWidths.value[key] = Math.max(72, start + e.clientX - startX) }
+  const up = () => {
+    window.removeEventListener('mousemove', move)
+    window.removeEventListener('mouseup', up)
+  }
+  window.addEventListener('mousemove', move)
+  window.addEventListener('mouseup', up)
+}
+
+async function copyLink(row) {
+  const link = row.link || `https://haohuo.jinritemai.com/ecommerce/trade/detail/index.html?id=${row.id}`
+  try {
+    await navigator.clipboard.writeText(link)
+    ElMessage.success('已复制商品链接')
+  } catch {
+    ElMessage.warning(link)
+  }
+}
+
+function dropInCart() {
+  selected.value = selected.value.filter((id) => {
+    const item = store.plaza.find((row) => row.id === id)
+    return item && !inCart(item)
+  })
+}
+
+async function admit(ids) {
+  const rows = ids.map((id) => store.plaza.find((row) => row.id === id)).filter((item) => item && !inCart(item))
+  if (!rows.length) {
+    ElMessage.info('这些商品已经在选品车里')
+    return 0
+  }
+  const risky = rows.filter((item) => cleanTitle(item.title, store.settings.bannedWords).changed).length
+  if (accountId.value) store.activeAccountId = accountId.value
+  let count = 0
+  rows.forEach((item) => {
+    if (store.addFromPlaza(item.id)) count += 1
+  })
+  selected.value = selected.value.filter((id) => !ids.includes(id))
+  if (!count) ElMessage.success('选中的商品已经在车里')
+  else if (risky) ElMessage.success(`已加入选品车 ${count} 件，其中 ${risky} 件标题已去掉违禁词`)
+  else ElMessage.success(`已加入选品车 ${count} 件`)
+  return count
+}
 
 function toggle(id) {
   selected.value = selected.value.includes(id) ? selected.value.filter((item) => item !== id) : selected.value.concat(id)
@@ -361,20 +483,17 @@ function goLibrary() {
 }
 
 function addOne(id) {
-  if (accountId.value) store.activeAccountId = accountId.value
-  const item = store.addFromPlaza(id)
-  if (!item) return ElMessage.info('这件商品已经在选品库里')
-  ElMessage.success(`已入库：${item.title}`)
+  admit([id])
 }
 
 function addSelected() {
-  if (accountId.value) store.activeAccountId = accountId.value
-  let count = 0
-  selected.value.forEach((id) => {
-    if (store.addFromPlaza(id)) count += 1
-  })
-  selected.value = []
-  ElMessage.success(count ? `已批量入库 ${count} 件` : '选中的商品已经在库里')
+  admit([...selected.value])
+}
+
+function takeFirst(count) {
+  const ids = sorted.value.filter((item) => !inCart(item)).slice(0, count).map((item) => item.id)
+  if (!ids.length) return ElMessage.info('当前排序结果里没有还能加入的商品')
+  admit(ids)
 }
 
 function startProgress() {
@@ -421,3 +540,33 @@ async function syncNow() {
   }
 }
 </script>
+
+<style scoped>
+.plaza-top, .plaza-filters, .plaza-views { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.plaza-top { justify-content: space-between; margin-bottom: 12px; }
+.plaza-tabs { display: flex; gap: 18px; border-bottom: 1px solid #eceef3; }
+.plaza-tabs button, .plaza-views button { border: 0; background: transparent; color: #667085; cursor: pointer; padding: 8px 2px 10px; }
+.plaza-tabs button.on { color: #6d4aff; font-weight: 700; box-shadow: inset 0 -2px 0 #6d4aff; }
+.plaza-views button { border-radius: 8px; padding: 6px 12px; background: #f3f4f8; }
+.plaza-views button.on { background: #6d4aff; color: #fff; }
+.plaza-filters { margin-bottom: 8px; }
+.plaza-hint { color: #98a2b3; font-size: 12px; margin: 0 0 10px; }
+.plaza-table-wrap { background: #fff; border: 1px solid #eceef3; border-radius: 12px; overflow: auto; }
+.plaza-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.plaza-table th, .plaza-table td { padding: 12px 10px; border-bottom: 1px solid #f2f4f7; text-align: left; vertical-align: middle; position: relative; }
+.plaza-table th { color: #98a2b3; font-weight: 500; background: #fafbff; }
+.plaza-table tr.picked { background: #f6f3ff; }
+.plaza-table .compact td { padding: 8px; }
+.plaza-goods { display: flex; gap: 10px; align-items: center; }
+.plaza-goods img { width: 72px; height: 72px; object-fit: cover; border-radius: 8px; background: #f3f4f6; cursor: zoom-in; }
+.plaza-goods .linkish { border: 0; background: transparent; padding: 0; text-align: left; cursor: pointer; color: #344054; }
+.price { color: #e11d48; font-weight: 700; }
+.commission, .earn { color: #16a34a; font-weight: 700; }
+.col-resize { position: absolute; top: 0; right: 0; width: 8px; height: 100%; cursor: col-resize; }
+.col-resize:hover { background: #6d4aff; }
+.plaza-tray {
+  position: sticky; bottom: 8px; z-index: 5; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  margin-top: 12px; padding: 10px 12px; background: #fff; border: 1px solid #eceef3; border-radius: 12px;
+  box-shadow: 0 8px 24px rgba(16, 24, 40, .08);
+}
+</style>

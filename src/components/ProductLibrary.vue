@@ -129,7 +129,7 @@
           </template>
         </el-table-column>
         <el-table-column prop="createdAt" label="入库时间" width="150" />
-        <el-table-column label="操作" width="220" fixed="right">
+        <el-table-column label="操作" min-width="200">
           <template #default="{ row }">
             <el-button link type="primary" @click="store.openPrompt([row.id])">确定生成视频</el-button>
             <el-button link @click="openEdit(row)">编辑</el-button>
@@ -216,7 +216,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import MatrixTabs from '@/components/MatrixTabs.vue'
 import { useAppStore } from '@/stores/app'
 import HoverPreview from '@/components/HoverPreview.vue'
-import { coverStyle, earn, formatTime, imageUrl, uid } from '@/utils/format'
+import { coverStyle, earn, formatTime, imageUrl, keepProductImage, uid } from '@/utils/format'
 import { sanitizeProductTitle } from '@/utils/banned'
 import { couponTags, goodsCategory, goodsTags, isFreeShipping } from '@/utils/goods'
 import { defaultPromptSettings, upgradePromptSettings } from '@/mock/data'
@@ -519,7 +519,7 @@ async function addLinks() {
       }
       const images = [...new Set([...(remote?.images || []), remote?.image]
         .map((item) => String(item || '').trim())
-        .filter((item) => /^https?:\/\//.test(item)))].slice(0, 6)
+        .filter((item) => keepProductImage(item)))]
       store.products.unshift({
         id,
         title: sanitized.title,

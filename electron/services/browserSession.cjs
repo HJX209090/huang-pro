@@ -147,11 +147,40 @@ function isSessionCookie(name = '') {
     || /sessionid|sid_guard|uid_tt|sid_tt|passport_auth|odin_tt/i.test(String(name || ''))
 }
 
+function doubaoLoggedIn(cookies) {
+  return (cookies || []).some((item) => {
+    const domain = String(item.domain || '').replace(/^\./, '')
+    const name = String(item.name || '')
+    const value = String(item.value || '')
+    if (!/(^|\.)doubao\.com$/i.test(domain)) return false
+    if (value.length < 8) return false
+    return /^(sessionid|sessionid_ss|sid_guard|uid_tt|uid_tt_ss|sid_tt|passport_auth_status|passport_auth_status_ss)$/i.test(name)
+  })
+}
+
+function doubaoPageLoginScript() {
+  return `(() => {
+    const href = String(location.href || '')
+    if (!/doubao\\.com/i.test(href)) return 'unknown'
+    if (/passport|\\/login/i.test(href)) return 'wall'
+    const text = String(document.body?.innerText || '').slice(0, 3000)
+    const labels = [...document.querySelectorAll('button,a,[role="button"]')]
+      .map((el) => String(el.innerText || '').replace(/\\s+/g, '').trim())
+      .filter((item) => item && item.length <= 6)
+    const hasLogin = labels.some((item) => item === '登录' || item === '立即登录')
+    const hasComposer = Boolean(document.querySelector('textarea,[contenteditable="true"]'))
+    if (/扫码登录|手机号登录|验证码登录/.test(text) && hasLogin) return 'wall'
+    if (hasLogin && !hasComposer) return 'wall'
+    if (hasComposer && !hasLogin) return 'ok'
+    return 'unknown'
+  })()`
+}
+
 function loggedIn(cookies, kind) {
+  if (kind === 'doubao') return doubaoLoggedIn(cookies)
   return cookies.some((item) => {
     const domain = item.domain || ''
     const name = item.name || ''
-    if (kind === 'doubao') return /doubao|volces|bytedance|douyin/.test(domain) && isSessionCookie(name)
     return /douyin|jinritemai|bytedance|buyin/.test(domain) && isSessionCookie(name)
   })
 }
@@ -298,6 +327,19 @@ async function bridgeBuyinToCreator(win, targetUrl, { quiet = false, forceNav = 
   }
 }
 
+async function probeDoubaoPage(id) {
+  let verdict = 'unknown'
+  for (const [key, win] of windows) {
+    if (!String(key).startsWith(`doubao:${id}`) || !win || win.isDestroyed()) continue
+    const url = String(win.webContents.getURL() || '')
+    if (!/doubao\.com/i.test(url)) continue
+    const hit = await runInFrames(win, doubaoPageLoginScript()).catch(() => 'unknown')
+    if (hit === 'ok' || hit === 'wall') return hit
+    if (hit) verdict = hit
+  }
+  return verdict
+}
+
 async function accountStatus({ kind, id }) {
   const ses = session.fromPartition(`persist:huang-${kind}-${id}`)
   const cookies = await ses.cookies.get({}).catch(() => [])
@@ -309,6 +351,19 @@ async function accountStatus({ kind, id }) {
       buyinLoginStatus: buyin ? '已登录' : '待登录',
       creatorLoginStatus: creator ? '已登录' : '待登录',
       cookieCount: cookies.length
+    }
+  }
+  if (kind === 'doubao') {
+    const page = await probeDoubaoPage(id)
+    const cookieOk = doubaoLoggedIn(cookies)
+    const ok = page === 'ok' || (page !== 'wall' && cookieOk)
+    return {
+      loginStatus: ok ? '已登录' : '待登录',
+      cookieCount: cookies.length,
+      probed: page,
+      message: page === 'wall'
+        ? '豆包页面还停在登录，请先扫码'
+        : (ok ? '豆包登录态有效' : '豆包未登录，没有 doubao.com 的登录 cookie')
     }
   }
   const ok = loggedIn(cookies, kind)
@@ -3282,13 +3337,74 @@ function setScheduleDateScript(days) {
   })()`
 }
 
-async function applyPublishOptions(win, options = {}, productLink = '') {
+function selectProductByIdScript(productId) {
+  const id = String(productId || '').replace(/[^\d]/g, '')
+  return `(() => {
+    const id = ${JSON.stringify(id)}
+    if (!id) return 'miss'
+    const nodes = Array.from(document.querySelectorAll('label, li, tr, div, button, span, [role="checkbox"], input[type="checkbox"]'))
+    const row = nodes.find((el) => {
+      const text = String(el.innerText || el.getAttribute('aria-label') || '')
+      if (!text.includes(id)) return false
+      const rect = el.getBoundingClientRect()
+      return rect.width > 40 && rect.height > 18 && rect.bottom > 0 && rect.top < window.innerHeight + 40
+    })
+    if (!row) return 'miss'
+    const box = row.querySelector?.('input[type="checkbox"], [role="checkbox"]')
+      || row.closest('label, li, tr, div')?.querySelector('input[type="checkbox"], [role="checkbox"]')
+    const target = box || row
+    target.click()
+    return 'picked'
+  })()`
+}
+
+function selectAiDeclareScript() {
+  return `(() => {
+    const scroller = document.scrollingElement || document.documentElement
+    const panels = Array.from(document.querySelectorAll('main, [class*="content"], [class*="scroll"], [class*="form"]'))
+    panels.forEach((el) => { try { el.scrollTop = el.scrollHeight } catch { /* ignore */ } })
+    window.scrollTo(0, document.body.scrollHeight || scroller.scrollHeight || 0)
+    const compact = (value) => String(value || '').replace(/\\s+/g, '')
+    const nodes = []
+    const walk = (root) => {
+      if (!root || !root.querySelectorAll) return
+      root.querySelectorAll('label, span, div, p, li, button, [role="radio"], [role="checkbox"]').forEach((el) => nodes.push(el))
+      root.querySelectorAll('*').forEach((el) => { if (el.shadowRoot) walk(el.shadowRoot) })
+    }
+    walk(document)
+    const visible = (el) => {
+      const rect = el.getBoundingClientRect()
+      return rect.width > 16 && rect.height > 10 && rect.bottom > 0 && rect.top < window.innerHeight + 80
+    }
+    const option = nodes.find((el) => {
+      const text = compact(el.innerText || el.getAttribute('aria-label') || '')
+      if (!text || text.length > 18 || /AI分身/.test(text)) return false
+      if (!visible(el)) return false
+      return text === 'AI自主声明' || text === '内容由AI生成' || text === '由AI生成' || text.includes('AI自主声明')
+    })
+    if (!option) {
+      const opener = nodes.find((el) => {
+        const text = compact(el.innerText || '')
+        return visible(el) && text.length < 12 && (text === '自主声明' || text === '添加声明' || text === '内容声明')
+      })
+      if (opener) {
+        opener.click()
+        return 'opened'
+      }
+      return 'miss'
+    }
+    option.click()
+    const input = option.querySelector?.('input') || option.closest('label')?.querySelector('input')
+    if (input && input.checked === false) input.click()
+    return 'clicked'
+  })()`
+}
+
+async function applyPublishOptions(win, options = {}, productLink = '', productId = '') {
   const notes = []
-  if (options.dyDeclare) {
-    // 绝不能用短词「AI」，会点到左侧「AI分身」
-    const clicked = await runInFrames(win, clickByLabelsScript(['AI自主声明', '内容由AI生成', '自主声明', '内容声明', '声明原创'], 28))
-    if (clicked === 'clicked') notes.push('declare')
-  }
+  const goodsId = String(productId || '').replace(/[^\d]/g, '')
+    || (String(productLink || '').match(/(?:id|product_id|goods_id)=(\d{6,})/i) || [])[1]
+    || ''
   if (options.dyPrivate) {
     await runInFrames(win, clickByLabelsScript(['谁可以看', '可见范围', '权限设置']))
     await wait(400)
@@ -3296,44 +3412,49 @@ async function applyPublishOptions(win, options = {}, productLink = '') {
     if (clicked === 'clicked') notes.push('private')
   }
   if (options.dyCart) {
-    if (!productLink) {
+    if (!goodsId && !productLink) {
       notes.push('cart-no-link')
     } else {
       let cartOk = false
       for (let attempt = 0; attempt < 5 && !cartOk; attempt += 1) {
-        // 结构改版时入口文案会变，多轮点开再填链接
         await runInFrames(win, clickByLabelsScript([
-          '添加标签和商品', '添加商品', '挂载购物车', '商品链接', '添加链接',
-          '关联商品', '选择商品', '挂载购物车', '带货'
+          '添加标签和商品', '添加商品', '挂载购物车', '购物车', '商品链接', '添加链接',
+          '关联商品', '选择商品', '带货'
         ], 32))
-        await wait(650 + attempt * 120)
-        const filled = await runInFrames(win, fillVisibleInputScript(productLink, ['商品链接', '粘贴商品', '粘贴链接', 'http', 'https', 'goods', 'url', '请输入链接', '商品id']))
-        if (filled === 'filled') {
-          await wait(350)
-          await runInFrames(win, clickByLabelsScript(['添加', '确定', '完成', '确认', '挂载', '保存']))
-          await wait(550)
-          // 二次确认：有的改版要再点一次「添加」才真正挂上
-          await runInFrames(win, clickByLabelsScript(['添加', '确定', '完成']))
-          await wait(400)
-          // 挂上车后勾选对应商品（页面改版时按链接/商品字样找复选框）
-          await runInFrames(win, `(() => {
-            const link = ${JSON.stringify(String(productLink || ''))}
-            const boxes = Array.from(document.querySelectorAll('input[type="checkbox"], [role="checkbox"]'))
-            const hit = boxes.find((box) => {
-              const wrap = box.closest('label,li,div,tr,section') || box
-              const text = String(wrap.innerText || '')
-              return text.includes(link) || /已添加|购物车|商品/.test(text)
-            })
-            if (!hit) return 'miss'
-            const checked = hit.checked === true || hit.getAttribute('aria-checked') === 'true'
-            if (!checked) hit.click()
-            return 'clicked'
-          })()`)
-          cartOk = true
-          notes.push('cart')
-        } else {
-          await wait(450)
+        await wait(700 + attempt * 150)
+        if (goodsId) {
+          const searched = await runInFrames(win, fillVisibleInputScript(goodsId, ['搜索', '商品', '编号', 'ID', 'id', '关键词', '请输入']))
+          if (searched === 'filled') {
+            await runInFrames(win, `(() => {
+              const el = document.activeElement
+              if (el) el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }))
+              return 'ok'
+            })()`)
+            await wait(800)
+          }
+          const picked = await runInFrames(win, selectProductByIdScript(goodsId))
+          if (picked === 'picked') {
+            await wait(300)
+            await runInFrames(win, clickByLabelsScript(['确定', '完成', '确认添加', '添加', '保存', '确认']))
+            await wait(500)
+            cartOk = true
+            notes.push('cart')
+            notes.push(`cart-id:${goodsId}`)
+            continue
+          }
         }
+        if (productLink) {
+          const filled = await runInFrames(win, fillVisibleInputScript(productLink, ['商品链接', '粘贴商品', '粘贴链接', 'http', 'https', 'goods', 'url', '请输入链接', '商品id']))
+          if (filled === 'filled') {
+            await wait(350)
+            await runInFrames(win, clickByLabelsScript(['添加', '确定', '完成', '确认', '挂载', '保存']))
+            await wait(500)
+            if (goodsId) await runInFrames(win, selectProductByIdScript(goodsId))
+            cartOk = true
+            notes.push('cart')
+          }
+        }
+        if (!cartOk) await wait(450)
       }
       if (!cartOk) notes.push('cart-miss')
     }
@@ -3360,6 +3481,22 @@ async function applyPublishOptions(win, options = {}, productLink = '') {
       }
     }
     if (!scheduleOk) notes.push('schedule-miss')
+  }
+  if (options.dyDeclare !== false) {
+    let declared = false
+    for (let attempt = 0; attempt < 3 && !declared; attempt += 1) {
+      const clicked = await runInFrames(win, selectAiDeclareScript())
+      if (clicked === 'opened') {
+        await wait(500)
+        const again = await runInFrames(win, selectAiDeclareScript())
+        if (again === 'clicked') declared = true
+      } else if (clicked === 'clicked') {
+        declared = true
+      } else {
+        await wait(400)
+      }
+    }
+    notes.push(declared ? 'declare' : 'declare-miss')
   }
   return notes
 }
@@ -3457,7 +3594,7 @@ async function publishOnCreator(payload) {
   }
 }
 
-async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, tags, options, productLink, workId, notify }) {
+async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, tags, options, productLink, productId, workId, notify }) {
   const page = 'https://creator.douyin.com/creator-micro/content/upload'
   const opts = options && typeof options === 'object' ? options : {}
   // 先静默看 cookie，避免定时任务先 ensure 再 open 导致连刷两轮
@@ -3564,7 +3701,7 @@ async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, 
     notify?.({ workId, progress: 86, status: '发布中', confirmNote: `正在填写作品标题：${shortTitle}` })
     titled = await fillCreatorTitle(win, shortTitle)
   }
-  const optionNotes = await applyPublishOptions(win, opts, productLink)
+  const optionNotes = await applyPublishOptions(win, { ...opts, dyDeclare: opts.dyDeclare !== false, dyCart: opts.dyCart !== false && Boolean(productId || productLink) }, productLink, productId)
   await wait(600)
   await waitCreatorEditor(win, notify, workId)
   if (shortTitle) {
@@ -3653,10 +3790,10 @@ async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, 
     ? (shortTitle ? `标题「${shortTitle}」` : '未写入标题')
     : `标题还没写进页面，准备的是「${shortTitle}」`
   const extras = [
-    optionNotes.includes('cart') ? '已挂商品链接' : '',
+    optionNotes.includes('cart') ? '已按商品编号挂上购物车' : '',
     optionNotes.includes('cart-no-link') ? '挂车跳过：商品没有链接' : '',
     optionNotes.includes('cart-miss') ? '挂车未点全，请在窗口里补挂' : '',
-    opts.dyDeclare ? (optionNotes.includes('declare') ? '已勾 AI 声明' : 'AI 声明可能未勾上') : '',
+    opts.dyDeclare !== false ? (optionNotes.includes('declare') ? '已勾 AI 自主声明' : 'AI 自主声明可能未勾上') : '',
     opts.dyPrivate ? (optionNotes.includes('private') ? '已选私密' : '私密可能未选上') : '',
     optionNotes.includes('schedule') ? `已设定时${opts.dyDelay || 0}天` : '',
     optionNotes.includes('schedule-miss') ? '定时日历可能要在窗口里再点一次' : '',
@@ -3669,6 +3806,11 @@ async function publishOnCreatorInner({ id, name, login, mode, videoPath, title, 
         fs.unlinkSync(videoPath)
         deleted = true
       } catch { deleted = false }
+    }
+    if (opts.dyManage && !win.isDestroyed()) {
+      try {
+        await win.loadURL('https://creator.douyin.com/creator-micro/content/manage')
+      } catch { /* 内容管理页打不开时发布结果仍然有效 */ }
     }
     return {
       ok: true,
@@ -3903,11 +4045,14 @@ function scrapeDetailDomScript(productId) {
     const pushImg = (src) => {
       const url = String(src || '').trim()
       if (!/^https?:/.test(url)) return
-      if (/avatar|logo|icon|qrcode|sprite|blank|placeholder/i.test(url)) return
+      if (/avatar|logo|icon|qrcode|sprite|blank|placeholder|favicon|badge|emoji/i.test(url)) return
+    const size = url.match(/(?:www|resize|crop|thumb)[^0-9]{0,8}(\\d{1,4})[-x_:](\\d{1,4})/i)
+      || url.match(/(?:^|[^0-9])(\\d{2,4})x(\\d{2,4})(?:[^0-9]|$)/i)
+    if (size && Number(size[1]) > 0 && Number(size[1]) < 240 && Number(size[2]) > 0 && Number(size[2]) < 240) return
       if (!imgs.includes(url)) imgs.push(url)
     }
     document.querySelectorAll('img').forEach((img) => {
-      if (img.naturalWidth && img.naturalWidth < 80) return
+      if (img.naturalWidth && img.naturalWidth < 200) return
       pushImg(img.currentSrc || img.src)
       const srcset = String(img.getAttribute('srcset') || '')
       srcset.split(',').forEach((part) => pushImg(part.trim().split(/\\s+/)[0]))
@@ -3934,7 +4079,7 @@ function scrapeDetailDomScript(productId) {
       id,
       title,
       image: imgs[0] || '',
-      images: imgs.slice(0, 6),
+      images: imgs.slice(0, 30),
       price: Number(priceText) || 0,
       rate: Number(rateText) || 0,
       monthlySales: salesWan ? Math.round(Number(salesWan[1]) * 10000) : (Number(salesText) || 0),
@@ -3982,7 +4127,10 @@ function collectImageUrls(node, list = [], seen = new Set(), depth = 0) {
     url = url.replace(/\\\//g, '/')
     if (!/^https?:\/\//.test(url)) return list
     if (!/ecombdimg|byteimg|pstatp|bytecdn|alicdn|\/obj\/|\.(jpg|jpeg|png|webp)(\?|$)/i.test(url)) return list
-    if (/avatar|logo|icon|qrcode|sprite/i.test(url)) return list
+    if (/avatar|logo|icon|qrcode|sprite|favicon|badge|emoji|placeholder/i.test(url)) return list
+    const size = url.match(/(?:www|resize|crop|thumb)[^0-9]{0,8}(\d{1,4})[-x_:](\d{1,4})/i)
+      || url.match(/(?:^|[^0-9])(\d{2,4})x(\d{2,4})(?:[^0-9]|$)/i)
+    if (size && Number(size[1]) > 0 && Number(size[1]) < 240 && Number(size[2]) > 0 && Number(size[2]) < 240) return list
     const key = url.split('?')[0]
     if (seen.has(key)) return list
     seen.add(key)
@@ -4060,7 +4208,7 @@ function mergeLookedProduct(base, extra) {
   if (!extra) return base
   const images = [...new Set([...(base.images || []), base.image, ...(extra.images || []), extra.image]
     .map((item) => String(item || '').trim())
-    .filter((item) => /^https?:\/\//.test(item)))].slice(0, 6)
+    .filter((item) => /^https?:\/\//.test(item)))].slice(0, 30)
   const category = [extra.category, base.category].find((item) => item && !['链接导入', '未分类', '选品广场'].includes(item))
     || extra.category || base.category || '链接导入'
   return {
@@ -4122,7 +4270,7 @@ function productFromJsonBlob(json, pid) {
           ]) || pickDeepNumber(node, ['monthly_sale', 'sell_num', 'sell_num_30d', 'sales']) || 0,
           category: pickDeepText(node, ['category_name', 'first_cname', 'cate_name', 'first_category_name', 'industry_name', 'leaf_cname']) || '链接导入',
           shop: shop.shop_name || pickDeepText(node, ['shop_name', 'shopName']) || '抖音',
-          images: collectImageUrls(node).slice(0, 6)
+          images: collectImageUrls(node).slice(0, 30)
         })
       }
     }
@@ -4156,7 +4304,7 @@ function productFromJsonBlob(json, pid) {
         ]),
         category: pickDeepText(node, ['category_name', 'first_cname', 'second_cname', 'leaf_cname', 'cate_name', 'first_category_name', 'industry_name', 'cid_name']) || '',
         shop: pickDeepText(node, ['shop_name', 'shopName']) || '',
-        images: collectImageUrls(node).slice(0, 6)
+        images: collectImageUrls(node).slice(0, 30)
       })
     }
     Object.values(node).forEach((value) => walk(value, depth + 1))
@@ -4176,7 +4324,7 @@ function productFromJsonBlob(json, pid) {
     .sort((a, b) => b._score - a._score)
   const hit = scored.find((item) => item.id === pid) || scored[0]
   if (!hit) return null
-  const allImages = [...new Set([...(hit.images || []), ...collectImageUrls(json)])].slice(0, 6)
+  const allImages = [...new Set([...(hit.images || []), ...collectImageUrls(json)])].slice(0, 30)
   return {
     id: pid,
     title: hit.title,
@@ -4547,8 +4695,8 @@ async function scrapeProductById({ id, name, login, mode, productId }) {
       if (win && !win.isDestroyed()) win.close()
     } catch { /* ignore */ }
   }
-  if (best?.images?.length > 6) {
-    best.images = best.images.slice(0, 6)
+  if (best?.images?.length > 30) {
+    best.images = best.images.slice(0, 30)
     best.image = best.images[0] || ''
   }
   return best

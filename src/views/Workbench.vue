@@ -1,10 +1,23 @@
 <template>
-  <div class="workbench review-bench">
+  <div ref="benchRef" class="workbench review-bench">
+    <div class="bench-head">
+      <div class="bench-title">
+        <h1>审片工作台</h1>
+        <span v-if="benchId" class="bench-id">{{ benchId }}</span>
+      </div>
+      <div class="bench-stats">
+        <span>待审核 <b>{{ queue.length }}</b></span>
+        <span>本次通过 <b class="ok">{{ passed }}</b></span>
+        <span>本次驳回 <b class="bad">{{ rejected }}</b></span>
+        <el-button @click="refreshBench">刷新</el-button>
+        <el-button @click="toggleFull">全屏</el-button>
+      </div>
+    </div>
     <section class="panel queue-pane">
-      <strong>队列</strong>
-      <p v-if="!sideWorks.length" class="muted">暂无相关作品。生成成功后会出现在这里，可审核；审核通过后进入定时发布。</p>
+      <div class="queue-head"><strong>队列</strong><b>{{ queue.length }}</b></div>
+      <p v-if="!queue.length" class="queue-empty">暂无待审核任务</p>
       <button
-        v-for="work in sideWorks"
+        v-for="work in queue"
         :key="work.id"
         type="button"
         class="script-item"
@@ -12,79 +25,87 @@
         @click="router.replace({ path: '/workbench', query: { id: work.id } })"
       >
         <div class="goods-title">{{ work.no ? `编号${work.no} ` : '' }}{{ work.title }}</div>
-        <div class="goods-sub"><span class="q-status" :class="queueTone(work)">{{ queueLabel(work) }}</span> · {{ displayWorkStatus(work.status) }}</div>
+        <div class="goods-sub">待审核</div>
       </button>
     </section>
 
     <section class="stage">
-      <div class="player-frame">
-        <video v-if="current?.videoPath" :key="current.videoPath" ref="player" :src="videoUrl(current.videoPath)" preload="auto" playsinline @click="playCurrent"></video>
-        <p v-else>暂无待审核任务，请等待新任务</p>
-        <p v-if="captionOn && current?.script" class="caption-line">{{ current.script }}</p>
+      <div class="player-slot">
+        <div class="player-frame">
+          <video
+            v-if="current?.videoPath"
+            :key="current.videoPath"
+            ref="player"
+            :src="videoUrl(current.videoPath)"
+            preload="metadata"
+            playsinline
+            @click="playCurrent"
+            @ended="onEnded"
+          ></video>
+          <p v-else>暂无待审核任务，请等待新任务</p>
+        </div>
       </div>
       <div class="stage-bar">
-        <el-button size="small" @click="moveQueue(-1)">上一条</el-button>
-        <el-button size="small" @click="moveQueue(1)">下一条</el-button>
-        <el-button size="small" @click="cycleRate">{{ rateLabel }}</el-button>
-        <el-button size="small" @click="toggleMute">{{ muted ? '打开声音' : '静音' }}</el-button>
-        <el-checkbox v-model="leavePass">离开自动通过</el-checkbox>
+        <el-button @click="moveQueue(-1)">↑ 上一条</el-button>
+        <el-button @click="moveQueue(1)">↓ 下一条</el-button>
+        <el-select v-model="rateValue" class="rate-select" @change="applyRate">
+          <el-option v-for="item in rates" :key="item" :label="`${item}x`" :value="item" />
+        </el-select>
+        <el-button @click="toggleMute">{{ muted ? '打开声音' : '静音' }}</el-button>
+        <el-checkbox v-model="endPass">播完自动通过</el-checkbox>
+      </div>
+      <p class="stage-hint">打开后先停住，空格或点画面再播放。鼠标放在商品图上，左右键换图。</p>
+    </section>
+
+    <section
+      class="image-board"
+      @mouseenter="galleryHot = true"
+      @mouseleave="galleryHot = false"
+    >
+      <div class="board-head">
+        <b>商品图</b>
+        <span v-if="shotUrls.length">{{ shotUrls.length }} 张</span>
+      </div>
+      <p v-if="!shotUrls.length" class="board-empty">这条还没有商品图</p>
+      <div v-else class="filmstrip">
+        <button
+          v-for="(src, index) in shotUrls"
+          :key="`${src}-${index}`"
+          type="button"
+          class="shot"
+          :class="{ on: index === shotIndex }"
+          @click="shotIndex = index"
+        >
+          <HoverPreview :images="shotUrls" :start="index">
+            <img :src="src" alt="商品图" />
+          </HoverPreview>
+        </button>
       </div>
     </section>
 
-    <section class="panel review-side" style="overflow: auto">
-      <h1 style="font-size: 16px; margin: 0 0 8px">{{ current ? displayWorkStatus(current.status) : '等待任务' }}</h1>
+    <section class="panel review-side">
+      <div class="muted">本条审核</div>
+      <h2>{{ current ? (current.no ? `编号${current.no}` : '待审核') : '等待任务' }}</h2>
       <p v-if="current" class="goods-title">{{ current.title }}</p>
-      <p v-if="feedback" class="review-note">{{ feedback }}</p>
-      <div class="muted">本条成片</div>
-      <div v-if="current?.status === '已生成'" class="review-actions">
-        <el-button type="success" @click="approve">审核通过</el-button>
-        <el-button type="danger" plain @click="reject">驳回</el-button>
-      </div>
-      <p v-else-if="current?.status === '审核通过'" class="review-note">已审核。可直接发布到抖音，或等定时任务自动发。</p>
-      <p v-else-if="current?.status === '已发布'" class="review-note">软件已点过发布。若抖音上没有这条，可再点下面的「再发布」。</p>
-      <el-input v-if="current?.status === '已生成'" v-model="reason" placeholder="驳回原因，不填则记为画面不通过" />
-      <el-button style="width: 100%; margin: 10px 0" @click="playCurrent">直接播放</el-button>
+      <p v-else class="muted">队列里没有待审核成片。</p>
+      <el-button class="side-btn pass" type="success" :disabled="current?.status !== '已生成'" @click="approve">审核通过 <kbd>Enter</kbd></el-button>
+      <el-button class="side-btn" :disabled="current?.status !== '已生成'" @click="reject">审核驳回 <kbd>X</kbd></el-button>
+      <el-input v-if="current" v-model="reason" placeholder="驳回原因，不填则记为画面不通过" />
+      <el-button class="side-btn" :disabled="!current" @click="removeCurrent">直接删除 <kbd>Delete</kbd></el-button>
       <div class="hotkeys">
-        <div><b>快捷键</b></div>
+        <b>快捷键</b>
         <div><kbd>Enter</kbd> 审核通过</div>
         <div><kbd>X</kbd> 审核驳回，作品仍保留</div>
         <div><kbd>Delete</kbd> 直接删除，Enter 确认</div>
-        <div><kbd>↑</kbd> <kbd>↓</kbd> 上一条 / 下一条，离开时记通过</div>
+        <div><kbd>↑</kbd> <kbd>↓</kbd> 上一条 / 下一条</div>
         <div><kbd>空格</kbd> 播放 / 暂停</div>
-        <div><kbd>←</kbd> <kbd>→</kbd> 后退 / 前进 5 秒</div>
+        <div><kbd>←</kbd> <kbd>→</kbd> 商品图区域换图，视频上快进快退 5 秒</div>
         <div><kbd>M</kbd> 静音 / 开声</div>
-        <div><kbd>T</kbd> 隐藏或一句 / 加一句</div>
         <div><kbd>F</kbd> 全屏，Esc 退出</div>
         <div><kbd>0</kbd> 从头再播</div>
       </div>
-      <p class="muted" style="margin-top: 12px">打开任务并停在某一条，开始播放后，离开会自动通过并播下一条。也可以在生成时查看，作品仍保留，直接删除不能恢复。</p>
-      <template v-if="current">
-        <p v-if="current.failReason" style="color: #cf1322">{{ current.failReason }}</p>
-        <div class="filters" style="margin: 8px 0">
-          <el-button size="small" @click="chooseVideo">选择成片</el-button>
-          <el-button size="small" :loading="stripping" @click="stripMark">拉取无水印</el-button>
-        </div>
-        <div v-if="current.videoPath" style="margin-top: 8px">
-          <div class="muted" style="margin-bottom: 6px">发布预览 · {{ previewPublishTitle }} · {{ previewTopics.map((item) => '#' + item).join(' ') || '暂无话题' }}</div>
-          <el-select v-model="accountId" placeholder="选择发布账号" style="width: 100%" @change="rememberAccount">
-            <el-option
-              v-for="item in store.publishAccounts"
-              :key="item.id"
-              :label="`${item.name}（${item.loginStatus || '未登录'}）`"
-              :value="item.id"
-            />
-          </el-select>
-        </div>
-        <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px">
-          <el-button v-if="current.status === '待生成' || current.status === '生成中'" type="primary" @click="store.kickGenerate(current.id)">用豆包生成 10 秒</el-button>
-          <el-button v-if="current.videoPath" type="primary" :loading="publishing" @click="publish">{{ current.status === '已发布' || current.status === '发布中' ? '再发布到抖音' : '发布到抖音' }}</el-button>
-          <el-button v-if="current.productId" @click="store.openPrompt([current.productId])">按原商品再生成</el-button>
-        </div>
-      </template>
+      <p class="side-note">打开后先停在某一条。勾选播完自动通过后，这条片播完会通过并切到下一条。也可以先看商品图。直接删除不能恢复。</p>
     </section>
-    <div v-if="shotUrls.length" class="filmstrip">
-      <img v-for="(src, index) in shotUrls" :key="`${src}-${index}`" :src="src" alt="" />
-    </div>
   </div>
 </template>
 
@@ -95,6 +116,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAppStore } from '@/stores/app'
 import { displayWorkStatus, imageUrl, publishTitleFromGoods, topicsFromGoods, videoUrl } from '@/utils/format'
 import AppIcon from '@/components/AppIcon.vue'
+import HoverPreview from '@/components/HoverPreview.vue'
 
 const store = useAppStore()
 const route = useRoute()
@@ -128,18 +150,47 @@ const shotUrls = computed(() => {
 })
 const accountId = ref('')
 const player = ref(null)
+const benchRef = ref(null)
 const reason = ref('')
-const feedback = ref('')
-const leavePass = ref(true)
+const endPass = ref(false)
 const muted = ref(false)
-const rateLabel = ref('1x')
-const captionOn = ref(false)
+const rateValue = ref(1)
+const rates = [0.75, 1, 1.25, 1.5, 2]
+const passed = ref(0)
+const rejected = ref(0)
+const benchId = computed(() => store.user?.id || store.user?.phone || '')
 // 待审核进队；已审核仍留在侧栏方便发布，直到已发布或删掉
 const queue = computed(() => store.works.filter((item) => item.status === '已生成' && item.videoPath))
-const sideWorks = computed(() => store.works.filter((item) => ['已生成', '审核通过', '生成中', '生成失败', '发布中'].includes(item.status)))
 onDeactivated(() => player.value?.pause())
 const publishing = ref(false)
 const stripping = ref(false)
+const regenId = ref('')
+const shotIndex = ref(0)
+const galleryHot = ref(false)
+watch(shotUrls, () => {
+  if (shotIndex.value >= shotUrls.value.length) shotIndex.value = 0
+})
+
+function stepShot(delta) {
+  const count = shotUrls.value.length
+  if (!count) return
+  shotIndex.value = (shotIndex.value + delta + count) % count
+}
+
+async function regenerateCurrent() {
+  const work = current.value
+  if (!work || regenId.value) return
+  regenId.value = work.id
+  try {
+    const message = await store.regenerateWork(work.id)
+    if (message) ElMessage.warning(message)
+    else ElMessage.success('已按这条商品重新生成')
+  } catch (error) {
+    ElMessage.error(error.message || '重新生成失败')
+  } finally {
+    regenId.value = ''
+  }
+}
 
 watch(queue, (list) => {
   if (!current.value && list[0]) router.replace({ path: '/workbench', query: { id: list[0].id } })
@@ -237,27 +288,20 @@ function nextReview(currentWork) {
 
 async function approve() {
   const work = current.value || queue.value[0]
-  if (!work) {
-    feedback.value = '左边队列里没有待审核的成片'
-    return ElMessage.warning(feedback.value)
-  }
-  if (!work.videoPath) {
-    feedback.value = '这条还没有成片，不能通过'
-    return ElMessage.warning(feedback.value)
-  }
+  if (!work) return ElMessage.warning('左边队列里没有待审核的成片')
+  if (!work.videoPath) return ElMessage.warning('这条还没有成片，不能通过')
   if (work.status !== '已生成') {
-    feedback.value = work.status === '审核通过'
+    return ElMessage.warning(work.status === '审核通过'
       ? '这条已经是「已审核」，可直接发布或等定时任务'
-      : '只有「待审核」成片可以审核通过。生成中请等成片，或点重新生成。'
-    return ElMessage.warning(feedback.value)
+      : '只有「待审核」成片可以审核通过。生成中请等成片，或点重新生成。')
   }
   const target = store.works.find((item) => item.id === work.id) || work
   target.status = '审核通过'
   target.reviewReason = reason.value.trim()
   target.reviewedAt = formatNow()
   store.addLog('success', '审核', `${target.title} 审核通过，可以发布或等到定时任务`)
-  feedback.value = `「${target.title}」已审核通过`
-  ElMessage.success(feedback.value)
+  passed.value += 1
+  ElMessage.success(`「${target.title}」已审核通过`)
   reason.value = ''
   await store.flush()
   nextReview(target)
@@ -265,17 +309,15 @@ async function approve() {
 
 async function reject() {
   const work = current.value || queue.value[0]
-  if (!work) {
-    feedback.value = '左边队列里没有可驳回的成片'
-    return ElMessage.warning(feedback.value)
-  }
+  if (!work) return ElMessage.warning('左边队列里没有可驳回的成片')
   const text = reason.value.trim() || '画面不通过'
   const target = store.works.find((item) => item.id === work.id) || work
   target.status = '审核失败'
   target.failReason = text
+  target.rejectedAt = formatNow()
   store.addLog('warning', '审核', `${target.title} 已驳回：${text}`)
-  feedback.value = `「${target.title}」已驳回：${text}`
-  ElMessage.warning(feedback.value)
+  rejected.value += 1
+  ElMessage.warning(`「${target.title}」已驳回：${text}`)
   reason.value = ''
   await store.flush()
   nextReview(target)
@@ -336,19 +378,36 @@ function playCurrent() {
 }
 
 function moveQueue(step) {
-  const list = (sideWorks.value.length ? sideWorks.value : queue.value).slice()
+  const list = queue.value.slice()
   if (!list.length) return
-  const work = current.value
-  if (leavePass.value && work?.status === '已生成' && work.videoPath) {
-    const target = store.works.find((item) => item.id === work.id) || work
-    target.status = '审核通过'
-    target.reviewedAt = formatNow()
-    store.flush()
-    feedback.value = `「${target.title}」离开时已审核通过`
-  }
   const index = Math.max(0, list.findIndex((item) => item.id === currentId.value))
   const next = list[(index + step + list.length) % list.length]
-  if (next && next.id !== work?.id) router.replace({ path: '/workbench', query: { id: next.id } })
+  if (next && next.id !== current.value?.id) router.replace({ path: '/workbench', query: { id: next.id } })
+}
+
+function onEnded() {
+  if (!endPass.value) return
+  if (current.value?.status === '已生成' && current.value.videoPath) approve()
+}
+
+function applyRate() {
+  if (player.value) player.value.playbackRate = Number(rateValue.value) || 1
+}
+
+function refreshBench() {
+  const still = queue.value.some((item) => item.id === currentId.value)
+  if (!still) {
+    const next = queue.value[0]
+    router.replace(next ? { path: '/workbench', query: { id: next.id } } : '/workbench')
+  }
+  ElMessage.success(`待审核 ${queue.value.length} 条`)
+}
+
+function toggleFull() {
+  const node = benchRef.value
+  if (!node) return
+  if (document.fullscreenElement) document.exitFullscreen?.()
+  else node.requestFullscreen?.()
 }
 
 function seekBy(seconds) {
@@ -361,17 +420,6 @@ function toggleMute() {
   const video = player.value
   muted.value = !muted.value
   if (video) video.muted = muted.value
-}
-
-function cycleRate() {
-  const video = player.value
-  const next = !video || video.playbackRate === 1 ? 1.5 : video.playbackRate === 1.5 ? 2 : 1
-  if (video) video.playbackRate = next
-  rateLabel.value = `${next}x`
-}
-
-function toggleCaption() {
-  captionOn.value = !captionOn.value
 }
 
 async function removeCurrent() {
@@ -392,14 +440,20 @@ function onKey(event) {
   else if (event.key === 'Delete') removeCurrent()
   else if (event.key === 'ArrowDown') moveQueue(1)
   else if (event.key === 'ArrowUp') moveQueue(-1)
-  else if (event.key === 'ArrowRight') seekBy(5)
-  else if (event.key === 'ArrowLeft') seekBy(-5)
+  else if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
+    if (document.querySelector('.el-image-viewer__wrapper')) return
+    if (galleryHot.value && shotUrls.value.length) {
+      event.preventDefault()
+      stepShot(event.key === 'ArrowLeft' ? -1 : 1)
+      return
+    }
+    seekBy(event.key === 'ArrowLeft' ? -5 : 5)
+  }
   else if (event.key === ' ') {
     event.preventDefault()
     playCurrent()
-  } else if (event.key === 'm' || event.key === 'M') toggleMute()
-  else if (event.key === 't' || event.key === 'T') toggleCaption()
-  else if (event.key === 'f' || event.key === 'F') player.value?.requestFullscreen?.()
+  }   else if (event.key === 'm' || event.key === 'M') toggleMute()
+  else if (event.key === 'f' || event.key === 'F') toggleFull()
   else if (event.key === '0' && player.value) player.value.currentTime = 0
 }
 
@@ -419,31 +473,79 @@ function waitTask() {
 
 <style scoped>
 .review-bench {
-  height: calc(100dvh - 88px);
+  height: 100%;
+  max-height: 100%;
   min-height: 0;
-  grid-template-columns: minmax(150px, 18%) minmax(240px, 1fr) minmax(200px, 26%);
-  grid-template-rows: minmax(0, 1fr) auto;
+  overflow: hidden;
+  grid-template-columns: minmax(180px, 240px) minmax(0, 1fr) minmax(220px, 280px);
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  align-items: stretch;
   background: transparent;
+  gap: 12px;
 }
-.queue-pane { background: #fff; overflow: auto; }
-.stage { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; min-width: 0; min-height: 0; }
-.player-frame { width: min(360px, 100%); max-height: calc(100dvh - 280px); aspect-ratio: 9 / 16; background: #111; color: #fff; border-radius: 28px; display: grid; place-items: center; position: relative; overflow: hidden; }
-.filmstrip { grid-column: 1 / -1; display: flex; gap: 8px; overflow-x: auto; padding: 8px; background: #fff; border: 1px solid var(--tj-line); border-radius: 12px; }
-.filmstrip img { width: 72px; height: 96px; object-fit: cover; border-radius: 8px; background: #111; flex: none; }
+.bench-head { grid-column: 1 / -1; grid-row: 1; display: flex; justify-content: space-between; gap: 12px; align-items: center; flex-wrap: wrap; }
+.bench-title { display: flex; align-items: baseline; gap: 10px; }
+.bench-title h1 { margin: 0; font-size: 22px; }
+.bench-id { color: #98a2b3; font-size: 14px; }
+.bench-stats { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; color: #475467; }
+.bench-stats b { font-size: 18px; margin-left: 4px; }
+.bench-stats .ok { color: #12b76a; }
+.bench-stats .bad { color: #f04438; }
+.queue-pane { grid-column: 1; grid-row: 2; background: #fff; overflow: auto; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 8px; }
+.stage { grid-column: 2; grid-row: 2; display: flex; flex-direction: column; align-items: stretch; justify-content: flex-start; gap: 8px; min-width: 0; min-height: 0; height: 100%; overflow: hidden; }
+.review-side { grid-column: 3; grid-row: 2 / 4; overflow: auto; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 10px; }
+.image-board {
+  grid-column: 1 / 3;
+  grid-row: 3;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  background: #fff;
+  border: 1px solid #eaecf0;
+  border-radius: 12px;
+  overflow: hidden;
+}
+.board-head { display: flex; justify-content: space-between; align-items: center; color: #475467; }
+.board-empty { margin: 0; color: #98a2b3; }
+.queue-head { display: flex; justify-content: space-between; align-items: center; }
+.queue-empty { margin: 24px 0; text-align: center; color: #98a2b3; }
+.queue-pane .script-item { width: 100%; text-align: left; }
+.queue-pane .goods-title { word-break: break-word; line-height: 1.4; }
+.player-slot { flex: 1 1 auto; min-height: 0; width: 100%; display: flex; align-items: center; justify-content: center; container-type: size; }
+.player-frame { width: min(100cqw, calc(100cqh * 9 / 16)); height: min(100cqh, calc(100cqw * 16 / 9)); max-width: 100%; max-height: 100%; aspect-ratio: 9 / 16; background: #111; color: #d0d5dd; border-radius: 16px; display: grid; place-items: center; position: relative; overflow: hidden; }
+.stage-bar, .stage-hint, .filmstrip { flex: none; }
+.stage-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: center; }
+.rate-select { width: 88px; }
+.stage-hint { margin: 0; color: #98a2b3; font-size: 13px; text-align: center; }
+.filmstrip { width: 100%; display: flex; gap: 8px; overflow-x: auto; flex: none; }
+.shot { border: 1px solid transparent; padding: 0; background: transparent; cursor: zoom-in; flex: none; border-radius: 8px; }
+.shot.on { border-color: #6d4aff; }
+.filmstrip img { width: 264px; height: 264px; object-fit: cover; border-radius: 10px; background: #111; display: block; }
+.shot-preview { width: 100%; max-height: 78vh; object-fit: contain; background: #111; border-radius: 12px; }
+.review-side h2 { margin: 0; font-size: 22px; }
+.side-btn { width: 100%; margin: 0; min-height: 44px; justify-content: space-between; }
+.side-btn kbd, .hotkeys kbd { display: inline-block; min-width: 18px; margin-left: 6px; padding: 0 4px; border: 1px solid #d0d5dd; border-radius: 4px; background: #f8fafc; font-size: 12px; }
+.hotkeys { display: flex; flex-direction: column; gap: 8px; color: #475467; font-size: 13px; line-height: 1.5; }
+.side-note { margin: 0; color: #98a2b3; line-height: 1.6; font-size: 13px; }
 .q-status { display: inline-block; padding: 0 6px; border-radius: 999px; font-size: 12px; }
 .q-status.viewing { background: #e8f0ff; color: #2f5bff; }
 .q-status.done { background: #e8f8ef; color: #067647; }
 .q-status.pending { background: #fff4e8; color: #d46b08; }
 .player-frame video { width: 100%; height: 100%; object-fit: contain; background: #000; }
-.caption-line { position: absolute; left: 16px; right: 16px; bottom: 28px; text-align: center; font-size: 14px; }
-.stage-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: center; }
-.hotkeys { display: flex; flex-direction: column; gap: 8px; color: #475467; font-size: 13px; line-height: 1.5; }
-.hotkeys kbd { display: inline-block; min-width: 18px; padding: 0 4px; border: 1px solid #d0d5dd; border-radius: 4px; background: #f8fafc; }
-.review-actions { display: flex; gap: 8px; margin: 8px 0; }
-.review-actions .el-button { flex: 1; }
-.review-note { margin: 0 0 8px; color: #7c5cfc; }
+.review-note { margin: 0; color: #7c5cfc; }
 @media (max-width: 1100px) {
-  .review-bench { grid-template-columns: 1fr; grid-template-rows: auto; height: auto; }
-  .player-frame { max-height: 70dvh; }
+  .review-bench {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(72px, 16%) minmax(0, 1fr) auto minmax(160px, 28%);
+    height: 100%;
+    max-height: 100%;
+  }
+  .queue-pane { grid-column: 1; grid-row: 2; max-height: none; }
+  .stage { grid-column: 1; grid-row: 3; }
+  .image-board { grid-column: 1; grid-row: 4; }
+  .review-side { grid-column: 1; grid-row: 5; }
 }
 </style>

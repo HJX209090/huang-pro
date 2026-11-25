@@ -5,7 +5,7 @@ export const navGroups = [
       { path: '/dashboard', title: '仪表盘', icon: 'dashboard' },
       { path: '/messages', title: '消息', icon: 'bell', badge: 'inbox' },
       { path: '/works', title: '我的作品', icon: 'works', badge: 'works' },
-      { path: '/workbench', title: '单片工作台', icon: 'bench' },
+      { path: '/workbench', title: '审片工作台', icon: 'bench' },
       { path: '/plaza', title: '选品广场', icon: 'plaza' }
     ]
   },
@@ -13,14 +13,14 @@ export const navGroups = [
     label: '豆包管理',
     items: [
       { path: '/doubao', title: '豆包管理', icon: 'chat' },
-      { path: '/products', title: '选品库', icon: 'box' }
+      { path: '/products', title: '选品车', icon: 'box' }
     ]
   },
   {
     label: '发布中心',
     items: [
       { path: '/publish', title: '发布账号', icon: 'send' },
-      { path: '/rpa', title: 'RPA流程', icon: 'flow', admin: true },
+      { path: '/rpa', title: 'RPA流程', icon: 'flow' },
       { path: '/schedules', title: '定时任务', icon: 'clock' }
     ]
   },

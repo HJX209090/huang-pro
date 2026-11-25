@@ -110,17 +110,27 @@ function namedText(node, keys, depth = 0) {
   return ''
 }
 
+function isJunkImage(url) {
+  const text = String(url || '').toLowerCase()
+  if (/icon|logo|avatar|sprite|favicon|emoji|badge|qrcode|qr_code|shop_logo|brand_logo|default_img|placeholder/.test(text)) return true
+  const size = text.match(/(?:www|resize|crop|thumb)[^0-9]{0,8}(\d{1,4})[-x_:](\d{1,4})/)
+    || text.match(/(?:^|[^0-9])(\d{2,4})x(\d{2,4})(?:[^0-9]|$)/)
+  if (size && Number(size[1]) > 0 && Number(size[1]) < 240 && Number(size[2]) > 0 && Number(size[2]) < 240) return true
+  return false
+}
+
 function imageUrl(value) {
   if (typeof value !== 'string') return ''
   const url = value.startsWith('//') ? `https:${value}` : value
   if (!/^https?:\/\//.test(url) || !/ecombdimg|byteimg|pstatp|bytecdn|alicdn|\/obj\/|\.(jpg|jpeg|png|webp)(\?|$)/i.test(url)) return ''
+  if (isJunkImage(url)) return ''
   const size = url.match(/www(\d+)-(\d+)/i)
-  if (size && Number(size[1]) < 200 && Number(size[2]) < 200) return ''
+  if (size && Number(size[1]) < 240 && Number(size[2]) < 240) return ''
   return url.slice(0, 800)
 }
 
 function collectImages(node, depth = 0, list = [], seen = new Set()) {
-  if (!node || depth > 6 || list.length >= 6) return list
+  if (!node || depth > 7 || list.length >= 30) return list
   if (typeof node === 'string') {
     const url = imageUrl(node)
     const key = url.split('?')[0]
@@ -140,10 +150,7 @@ function collectImages(node, depth = 0, list = [], seen = new Set()) {
 
 function namedImage(node, depth = 0) {
   if (!node || depth > 5) return ''
-  if (typeof node === 'string') {
-    const url = node.startsWith('//') ? `https:${node}` : node
-    return /^https?:\/\//.test(url) && /ecombdimg|byteimg|pstatp|bytecdn|alicdn|\/obj\/|\.(jpg|jpeg|png|webp)(\?|$)/i.test(url) ? url.slice(0, 800) : ''
-  }
+  if (typeof node === 'string') return imageUrl(node)
   if (Array.isArray(node)) {
     for (const item of node) {
       const found = namedImage(item, depth + 1)
@@ -352,7 +359,7 @@ function mapCartCard(card, index) {
     || namedImage(card)
   const extra = collectImages(card)
   const fromBase = collectImages(base)
-  const images = [...new Set([cover, ...extra, ...fromBase].filter(Boolean))].slice(0, 6)
+  const images = [...new Set([cover, ...extra, ...fromBase].filter(Boolean))].slice(0, 30)
   const title = base.title || base.product_name || base.elastic_title || base.name
     || card.title || card.product_name || card.name || '未命名商品'
   const category = namedText(card, ['category_name', 'first_cname', 'second_cname', 'leaf_cname', 'cate_name', 'first_category_name'])
@@ -689,8 +696,8 @@ function isRealTitle(product) {
 function normalizeLooked(product, id, link) {
   if (!product) return null
   const images = [...new Set([...(product.images || []), product.image]
-    .map((item) => imageUrl(String(item || '')) || String(item || '').trim())
-    .filter((item) => /^https?:\/\//.test(item)))]
+    .map((item) => imageUrl(String(item || '')))
+    .filter(Boolean))]
   const title = String(product.title || '').trim()
   if (!title || title === '未命名商品') return null
   const priceRaw = Number(product.price) || 0
@@ -701,7 +708,7 @@ function normalizeLooked(product, id, link) {
     id: String(product.id || id),
     title,
     image: images[0] || '',
-    images: images.slice(0, 6),
+    images: images.slice(0, 30),
     price: priceRaw >= 1000 ? Math.round(priceRaw) / 100 : priceRaw,
     rate: rateRaw >= 1000 ? Math.round(rateRaw) / 100 : (rateRaw > 0 && rateRaw < 1 ? Math.round(rateRaw * 10000) / 100 : (rateRaw > 100 ? rateRaw / 100 : rateRaw)),
     category: product.category || '链接导入',
@@ -716,7 +723,7 @@ function mergeNormalized(base, extra) {
   if (!extra) return base
   const images = [...new Set([...(base.images || []), base.image, ...(extra.images || []), extra.image]
     .map((item) => String(item || '').trim())
-    .filter((item) => /^https?:\/\//.test(item)))].slice(0, 6)
+    .filter((item) => /^https?:\/\//.test(item) && !isJunkImage(item)))].slice(0, 30)
   const category = [extra.category, base.category].find((item) => item && !['链接导入', '未分类', '选品广场'].includes(item))
     || extra.category || base.category || '链接导入'
   return {

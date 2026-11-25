@@ -1,9 +1,10 @@
 import { defineStore } from 'pinia'
 import { createSeed, defaultPromptSettings, upgradePromptSettings } from '@/mock/data'
-import { composePrompt, formatTime, uid, fillTemplate, publishTitleFromGoods, topicsFromGoods } from '@/utils/format'
+import { composePrompt, fillTemplate, formatTime, keepProductImage, publishTitleFromGoods, topicsFromGoods, uid, withVoice } from '@/utils/format'
 import { cleanTitle, defaultBannedWords, sanitizeProductTitle } from '@/utils/banned'
 import { ensureDoubaoRules } from '@/utils/doubaoRules'
 import { BUILTIN_SCHEDULE_DEFS, isBuiltinSchedule } from '@/utils/builtinSchedules'
+import { blankPublishPage } from '@/utils/rpa'
 import { api, getToken, setToken } from '@/services/api'
 import { couponTags, goodsCategory, goodsTags, isFreeShipping } from '@/utils/goods'
 
@@ -93,12 +94,50 @@ function quotaLimit(account) {
   return 5
 }
 
-/** 成功成片才占额度；正在发给豆包的算暂扣，失败后释放 */
+function todayKey() {
+  const date = new Date()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${date.getFullYear()}-${month}-${day}`
+}
+
+function stampDay(value) {
+  const matched = String(value || '').match(/(\d{4})[-/](\d{1,2})[-/](\d{1,2})/)
+  if (!matched) return ''
+  return `${matched[1]}-${String(matched[2]).padStart(2, '0')}-${String(matched[3]).padStart(2, '0')}`
+}
+
+function chargeWorkQuota(work) {
+  work.quotaChargedAt = formatTime(new Date())
+  work.quotaCharged = true
+  work.quotaRefunded = false
+  work.quotaPending = true
+}
+
+function releaseWorkQuota(work) {
+  work.quotaPending = false
+  work.quotaCharged = false
+  work.quotaRefunded = true
+}
+
+function keepWorkQuota(work) {
+  work.quotaPending = false
+  work.quotaCharged = true
+  work.quotaRefunded = false
+  if (!work.quotaChargedAt) work.quotaChargedAt = work.finishedAt || formatTime(new Date())
+}
+
+/** 只算今天扣下的额度。昨天的成片、昨天还在生成的任务，过了零点不再占今天的 5 个。 */
 function doubaoQuotaUsed(works, account, today) {
-  const mine = (works || []).filter((work) => work.doubaoAccountId === account.id || work.doubaoAccount === account.name)
-  const success = mine.filter((work) => work.videoPath && String(work.finishedAt || '').slice(0, 10) === today)
-  const holding = mine.filter((work) => work.quotaPending && work.status === '生成中')
-  return success.length + holding.length
+  const day = today || todayKey()
+  return (works || []).filter((work) => {
+    const mine = work.doubaoAccountId === account.id || (account.name && work.doubaoAccount === account.name)
+    if (!mine || work.quotaRefunded) return false
+    const chargedDay = stampDay(work.quotaChargedAt)
+    if (chargedDay) return chargedDay === day && (work.quotaCharged || work.quotaPending || work.videoPath)
+    if (work.videoPath && stampDay(work.finishedAt) === day) return true
+    return work.quotaPending && work.status === '生成中' && stampDay(work.createdAt) === day
+  }).length
 }
 
 export const useAppStore = defineStore('app', {
@@ -133,6 +172,15 @@ export const useAppStore = defineStore('app', {
       if (!license || !state.systemNow) return false
       if (license.permanent) return true
       return Boolean(license.expiresAt) && new Date(license.expiresAt).getTime() > new Date(state.systemNow).getTime()
+    },
+    doubaoToday(state) {
+      const today = todayKey()
+      const accounts = state.doubaoAccounts || []
+      return {
+        used: accounts.reduce((sum, account) => sum + doubaoQuotaUsed(state.works, account, today), 0),
+        limit: accounts.reduce((sum, account) => sum + quotaLimit(account), 0),
+        accounts: accounts.length
+      }
     }
   },
   actions: {
@@ -278,12 +326,11 @@ export const useAppStore = defineStore('app', {
         this.addLog('warning', '通知', `Webhook 没有发出：${error.message || '请求失败'}`)
       })
     },
-    workMatchesClaim(work) {
-      const page = this.settings.publishPage || {}
+    workMatchesClaim(work, pageOverride) {
+      const page = pageOverride || this.settings.publishPage || {}
       const kind = work?.kind || (work?.model ? 'AI' : 'AI')
       if (kind === '混剪') return Boolean(page.claimMix)
       if (kind === '直播切片') return Boolean(page.claimLive)
-      // 默认豆包 AI 成片可领取；只有明确关掉才排除
       return page.claimDoubao !== false
     },
     // 定时/队列可发：已审核，或上次只打开了上传页卡在「发布中」的成片
@@ -298,10 +345,10 @@ export const useAppStore = defineStore('app', {
       const publishing = withVideo.filter((item) => item.status === '发布中').length
       const pending = withVideo.filter((item) => item.status === '已生成').length
       const claimedOut = withVideo.filter((item) => ['审核通过', '发布中'].includes(item.status) && !this.workMatchesClaim(item)).length
-      if (pending) return `还有 ${pending} 条「待审核」，请到单片工作台或我的作品点审核通过`
+      if (pending) return `还有 ${pending} 条「待审核」，请到审片工作台或我的作品点审核通过`
       if (claimedOut) return `有 ${claimedOut} 条已审核，但被设置里的「领取过滤」排除了（检查豆包AI生成是否勾选）`
       if (approved || publishing) return `有可发成片，请再点一次立即执行`
-      return '没有审核通过的成片。请到「我的作品」把「待审核」点审核通过，或打开「单片工作台」审核'
+      return '没有审核通过的成片。请到「我的作品」把「待审核」点审核通过，或打开「审片工作台」审核'
     },
     fakeTitle(title, product) {
       return publishTitleFromGoods(title, product)
@@ -388,33 +435,36 @@ export const useAppStore = defineStore('app', {
       }
       return running.length
     },
-    buildPublishPayload(item, account) {
-      const page = this.settings.publishPage || {}
+    buildPublishPayload(item, account, pageOverride) {
+      const page = pageOverride || this.settings.publishPage || {}
+      const usingOverride = Boolean(pageOverride)
       const product = this.products.find((row) => row.id === item.productId)
         || this.plaza.find((row) => row.id === item.productId)
         || null
-      // 根据商品标题智能生成作品短标题；设置里两项都关才跳过
-      const wantTitle = !(page.dyTitle === false && page.dyFakeTitle === false)
+      const wantTitle = usingOverride
+        ? Boolean(page.dyTitle || page.dyFakeTitle)
+        : !(page.dyTitle === false && page.dyFakeTitle === false)
       const goodsTitle = String(product?.title || item.title || '').trim()
       const title = wantTitle
         ? publishTitleFromGoods(goodsTitle, product || { title: goodsTitle, category: product?.category || item.category, shop: product?.shop || item.shop })
         : ''
       const optimizedTitle = String(item.optimizedTitle || '').trim()
-      // 兜底：生成结果为空时仍给一个可填短标题，避免发布页标题空白
       const publishTitle = optimizedTitle || String(title || '').trim() || (wantTitle ? publishTitleFromGoods(goodsTitle || '今日好物分享', { title: goodsTitle || '今日好物分享' }) : '')
+      const productId = String(product?.id || item.productId || '').replace(/[^\d]/g, '')
       const productLink = String(product?.link || product?.goodsUrl || item.productLink || '').trim()
-      // 有商品链接时默认挂购物车；设置里关掉 dyCart 才跳过
-      const wantCart = page.dyCart !== false && Boolean(productLink)
+        || (productId ? `https://haohuo.jinritemai.com/ecommerce/trade/detail/index.html?id=${productId}` : '')
+      const wantCart = (usingOverride ? page.dyCart !== false : page.dyCart !== false) && Boolean(productId || productLink)
+      const wantTags = usingOverride ? Boolean(page.dyTags) : page.dyTags !== false
       const optimizedTags = Array.isArray(item.optimizedTags)
         ? item.optimizedTags.map((tag) => String(tag || '').replace(/^#/, '').trim()).filter((tag) => tag && tag.length <= 12).slice(0, 5)
         : []
-      const tags = page.dyTags === false
-        ? []
-        : (optimizedTags.length
+      const tags = wantTags
+        ? (optimizedTags.length
           ? optimizedTags
           : topicsFromGoods(goodsTitle || item.title, product || { title: goodsTitle || item.title })
             .map((tag) => String(tag || '').replace(/^#/, '').trim())
             .filter((tag) => tag && tag.length <= 12 && !/^https?:/i.test(tag) && !/haohuo|jinritemai/i.test(tag)))
+        : []
       return {
         id: String(account.id || ''),
         name: String(account.name || ''),
@@ -424,21 +474,23 @@ export const useAppStore = defineStore('app', {
         title: String(publishTitle || ''),
         tags,
         productLink,
+        productId,
         options: {
-          dyTitle: true,
-          dyFakeTitle: true,
-          dyTags: page.dyTags !== false,
+          dyTitle: wantTitle,
+          dyFakeTitle: usingOverride ? Boolean(page.dyFakeTitle) : page.dyFakeTitle !== false,
+          dyTags: wantTags,
           dyCart: wantCart,
-          dyDeclare: page.dyDeclare !== false,
+          dyDeclare: usingOverride ? page.dyDeclare !== false : page.dyDeclare !== false,
           dySchedule: Boolean(page.dySchedule),
           dyDelay: Number(page.dyDelay) || 0,
           dyPrivate: Boolean(page.dyPrivate),
+          dyManage: page.dyManage === true,
           deleteSources: page.deleteSources === true
         },
         workId: String(item.id || '')
       }
     },
-    async publishWorksBatch(works, account) {
+    async publishWorksBatch(works, account, pageOverride) {
       if (!account || !window.tujian?.publishWork) return 0
       const limit = Math.max(1, Math.min(10, Number(this.settings.publishOpen) || 1))
       const batch = works.slice(0, limit)
@@ -451,7 +503,7 @@ export const useAppStore = defineStore('app', {
           continue
         }
         if (index > 0 && gap) await new Promise((resolve) => setTimeout(resolve, gap * 1000))
-        const payload = this.buildPublishPayload(item, account)
+        const payload = this.buildPublishPayload(item, account, pageOverride)
         item.publishTitle = payload.title
         item.publishTags = payload.tags
         const statusBefore = item.status
@@ -479,15 +531,19 @@ export const useAppStore = defineStore('app', {
           if (result?.loginStatus) account.loginStatus = result.loginStatus
           if (!result?.ok || !result.attached) {
             item.status = statusBefore === '已发布' ? '已发布' : '审核通过'
-            this.endTask(taskId, result?.message || '没有放进上传页', 'failed')
-            this.addLog('warning', '发布', `${item.title}：${result?.message || '没有放进上传页'}`)
+            item.publishFailAt = formatTime(new Date())
+            item.publishFailReason = result?.message || '没有放进上传页'
+            this.noteCartFull(account, item.publishFailReason)
+            this.endTask(taskId, item.publishFailReason, 'failed')
+            this.addLog('warning', '发布', `${item.title}：${item.publishFailReason}`)
             continue
           }
           item.lastPublishClicked = Boolean(result.published)
           if (result.published) posted += 1
           if (result.published) {
             item.status = '已发布'
-            item.finishedAt = formatTime(new Date())
+            item.publishedAt = formatTime(new Date())
+            item.finishedAt = item.publishedAt
             // 即使勾了删原片，也保留 videoPath，避免「我的作品」变成暂无成片
             if (result.deleted) item.sourceDeleted = true
             this.notifyWebhook(`【huang++pro】已发布：${item.title}`)
@@ -502,6 +558,9 @@ export const useAppStore = defineStore('app', {
           const message = /could not be cloned|An object could not be cloned/i.test(String(error?.message || error))
             ? '发布参数序列化失败，已重试修复；请再点一次立即执行'
             : (error.message || '发布中断')
+          item.publishFailAt = formatTime(new Date())
+          item.publishFailReason = message
+          this.noteCartFull(account, message)
           this.endTask(taskId, message, 'failed')
           this.addLog('error', '发布', `${item.title}：${message}`)
         }
@@ -605,7 +664,9 @@ export const useAppStore = defineStore('app', {
       // 关掉再打开：只续上还在生成的原对话，不重新发送提示词
       const interrupted = this.works.filter((item) => item.status === '生成中' && !item.videoPath)
       interrupted.forEach((work) => {
-        work.quotaPending = true
+        const chargedDay = stampDay(work.quotaChargedAt || work.createdAt)
+        work.quotaPending = chargedDay === todayKey()
+        work.quotaCharged = work.quotaPending
         if (!work.doubaoChatUrl) {
           this.addLog('info', '豆包', `「${work.title}」仍是生成中，没有对话链接，不会重新发送`)
           return
@@ -877,7 +938,108 @@ export const useAppStore = defineStore('app', {
       const proxy = (this.proxies || []).find((item) => item.enabled && item.host && item.port)
       if (window.tujian?.useProxy) window.tujian.useProxy(proxy || null).catch(() => {})
     },
+    resolveSchedulePage(task) {
+      if (!Array.isArray(task?.picks)) return null
+      const page = blankPublishPage(this.settings.publishPage?.dyDelay)
+      let claimSpecified = false
+      const turnOn = (key) => {
+        if (!key) return
+        page[key] = true
+        if (String(key).startsWith('claim')) claimSpecified = true
+      }
+      task.picks.forEach((pick) => {
+        const text = String(pick || '')
+        if (text.startsWith('opt:')) turnOn(text.slice(4))
+        if (text.startsWith('flow:')) {
+          const flow = (this.rpaFlows || []).find((item) => item.id === text.slice(5))
+          ;(flow?.options || []).forEach((key) => turnOn(key))
+        }
+      })
+      if (!claimSpecified) page.claimDoubao = true
+      return page
+    },
+    scheduleFlows(task) {
+      return (Array.isArray(task?.picks) ? task.picks : [])
+        .map((pick) => (this.rpaFlows || []).find((item) => item.id === String(pick || '').replace(/^flow:/, '') && String(pick).startsWith('flow:')))
+        .filter(Boolean)
+    },
+    async runRpaFlow(flow, { account, work, page } = {}) {
+      const acc = account || this.publishAccounts.find((item) => item.enabled !== false) || this.publishAccounts[0]
+      if (!flow) return { ok: false, message: '没有找到这条流程' }
+      if (!acc) return { ok: false, message: '先添加一个发布账号' }
+      if (!window.tujian?.openAccount) return { ok: false, message: '请在桌面窗口里执行' }
+      const target = work || this.works.find((item) => item.status === '审核通过' && item.videoPath)
+        || this.works.find((item) => item.videoPath && ['已生成', '发布中'].includes(item.status))
+      let stopped = ''
+      let didPublish = false
+      for (const step of flow.steps || []) {
+        this.addLog('info', 'RPA', `${flow.name} · ${step}`)
+        if (/打开|环境/.test(step)) {
+          const opened = await window.tujian.openAccount({
+            kind: 'publish',
+            id: acc.id,
+            name: acc.name,
+            login: acc.login,
+            mode: acc.loginMode || 'password',
+            url: 'https://creator.douyin.com/creator-micro/content/upload'
+          })
+          acc.loginStatus = opened?.loginStatus || acc.loginStatus
+          if (!opened?.ok) {
+            stopped = opened?.message || '发布页没有打开'
+            break
+          }
+        } else if (/登录/.test(step)) {
+          const status = await window.tujian.accountStatus?.({ kind: 'publish', id: acc.id })
+          acc.loginStatus = status?.loginStatus || acc.loginStatus
+          if (acc.loginStatus !== '已登录') {
+            stopped = '这个账号还没登录。请在打开的窗口里登录后再执行。'
+            break
+          }
+        } else if (/上传|文案|挂购物车|提交发布|发布/.test(step)) {
+          if (didPublish) continue
+          if (!target?.videoPath) {
+            stopped = '没有审核通过的成片'
+            break
+          }
+          const payload = this.buildPublishPayload(target, acc, page)
+          const published = await window.tujian.publishWork(payload)
+          didPublish = true
+          if (published?.loginStatus) acc.loginStatus = published.loginStatus
+          if (!published?.ok) {
+            stopped = published?.message || '成片没有放进上传页'
+            break
+          }
+          target.publishAccount = acc.name
+          target.publishAccountId = acc.id
+          target.publishTitle = payload.title
+          target.publishTags = payload.tags
+          if (published.published) {
+            target.status = '已发布'
+            target.publishedAt = formatTime(new Date())
+            if (published.deleted) target.sourceDeleted = true
+            this.notifyWebhook(`【huang++pro】已发布：${target.title}`)
+          } else if (/提交发布|挂购物车/.test(step)) {
+            target.status = '发布中'
+            stopped = published.message || '成片已放进上传页，发布按钮没有点成功'
+            break
+          } else {
+            target.status = '发布中'
+          }
+        } else {
+          this.addLog('info', 'RPA', `${flow.name}：步骤「${step}」没有内置动作，已跳过`)
+        }
+      }
+      flow.lastRun = formatTime(new Date())
+      this.persist()
+      if (stopped) {
+        this.addLog('warning', 'RPA', `${flow.name} 停在：${stopped}`)
+        return { ok: false, message: stopped, published: false }
+      }
+      this.addLog('success', 'RPA', `${flow.name} 已在发布账号窗口里执行`)
+      return { ok: true, message: `${flow.name} 已执行`, published: target?.status === '已发布' }
+    },
     runDueSchedules() {
+      if (this.settings.localScheduleOn === false) return
       const now = this.systemNow ? new Date(this.systemNow) : new Date()
       if (Number.isNaN(now.getTime())) return
       const clock = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
@@ -894,7 +1056,18 @@ export const useAppStore = defineStore('app', {
           return
         }
         if (!task.time) return
-        if (task.date && task.date !== day) return
+        if (task.mode === '单次' && task.date && task.date !== day) return
+        if (task.mode !== '单次' && task.date && task.date !== day) return
+        const cycle = task.cycle || 'day'
+        if (task.mode !== '单次' && cycle === 'week') {
+          const today = now.getDay() === 0 ? 7 : now.getDay()
+          const days = (Array.isArray(task.weekdays) ? task.weekdays : []).map((item) => Number(item))
+          if (!days.includes(today)) return
+        }
+        if (task.mode !== '单次' && cycle === 'month') {
+          const monthDay = Number(task.monthDay) || 0
+          if (!monthDay || now.getDate() !== monthDay) return
+        }
         // 当天已成功发出则不再跑；空队列不算成功，到点后每 5 分钟再试
         if (task.lastSuccessDay === day) return
         const [th, tm] = String(task.time).split(':').map((item) => Number(item))
@@ -941,8 +1114,13 @@ export const useAppStore = defineStore('app', {
         return message
       }
       if (task.type === '审核通过后发布' || task.type === '发布队列' || !task.type) {
-        const ready = this.works.filter((item) => this.isPublishReady(item))
+        const pageOverride = this.resolveSchedulePage(task)
+        const ready = this.works.filter((item) => {
+          if (!item?.videoPath || !['审核通过', '发布中'].includes(item.status)) return false
+          return this.workMatchesClaim(item, pageOverride || undefined)
+        })
         const accounts = this.schedulePublishAccounts(task)
+        const namedFlows = this.scheduleFlows(task)
         task.lastRun = stamp
         this.persist()
         if (!ready.length) {
@@ -997,7 +1175,14 @@ export const useAppStore = defineStore('app', {
             this.addLog('warning', '定时', `${account.name}：检查登录态失败 ${error.message || ''}`)
             continue
           }
-          posted += await this.publishWorksBatch(batch, account)
+          if (namedFlows.length) {
+            for (const item of batch) {
+              const result = await this.runRpaFlow(namedFlows[0], { account, work: item, page: pageOverride })
+              if (result?.published || item.status === '已发布' || item.status === '发布中') posted += result?.ok ? 1 : 0
+            }
+          } else {
+            posted += await this.publishWorksBatch(batch, account, pageOverride)
+          }
         }
         if (posted > 0) {
           task.lastSuccessDay = stamp.slice(0, 10)
@@ -1124,9 +1309,15 @@ export const useAppStore = defineStore('app', {
       if (mine) this.userStatus = mine.status
       this.addLog('info', '管理', `账号状态已改为${status}`)
     },
+    noteCartFull(account, message) {
+      if (!account || !/购物车已满|挂车已满|商品数量已达上限/.test(String(message || ''))) return
+      account.cartFull = true
+      account.cartFullAt = formatTime(new Date())
+    },
     syncDoubaoStats() {
-      const today = String(this.systemNow || formatTime(new Date())).slice(0, 10)
+      const today = todayKey()
       this.doubaoAccounts.forEach((account) => {
+        if (account.quotaDate && account.quotaDate !== today) account.quotaDate = ''
         const limit = quotaLimit(account)
         account.quotaLimit = limit
         const mine = this.works.filter((work) => work.doubaoAccountId === account.id || work.doubaoAccount === account.name)
@@ -1138,6 +1329,12 @@ export const useAppStore = defineStore('app', {
         account.recent = latest ? `${latest.title} · ${latest.finishedAt}` : `成功 ${done.length} · 失败 ${failed.length}`
         account.successCount = done.length
         account.failCount = failed.length
+      })
+      this.publishAccounts.forEach((account) => {
+        if (account.cartFull && stampDay(account.cartFullAt) !== today) account.cartFull = false
+        const publishedToday = this.works.filter((work) => work.publishAccountId === account.id && work.status === '已发布' && stampDay(work.publishedAt || work.finishedAt) === today).length
+        account.todayPublishDay = today
+        account.todayPublish = publishedToday
       })
     },
     async generateLicenseCode(plan) {
@@ -1229,6 +1426,7 @@ export const useAppStore = defineStore('app', {
       }
       const rebuilt = composePrompt({
         ...form,
+        voice: form?.voice || this.settings.voice,
         promptText: '',
         lockText: form?.lockText || this.settings.productLock,
         storyline: form?.storyline || this.settings.storyline,
@@ -1241,7 +1439,8 @@ export const useAppStore = defineStore('app', {
         promptText: '围绕商品「商品标题」生成一条 9:16 抖音带货视频。只按上传的这件商品原图实拍口播，不要换成其他商品。直接生成视频。',
         duration: form?.duration,
         ratio: form?.ratio || '9:16',
-        model: form?.model
+        model: form?.model,
+        voice: form?.voice || this.settings.voice
       }, product)
     },
     productShots(work) {
@@ -1252,10 +1451,10 @@ export const useAppStore = defineStore('app', {
       return [...new Set(pool
         .map((item) => {
           const text = String(item || '').trim()
-          if (!text || removed.has(text) || text.startsWith('blob:') || text.startsWith('data:')) return ''
+          if (!text || removed.has(text) || text.startsWith('blob:') || text.startsWith('data:') || !keepProductImage(text)) return ''
           return text.startsWith('//') ? `https:${text}` : text
         })
-        .filter(Boolean))].slice(0, 6)
+        .filter(Boolean))]
     },
     async enrichProduct(productId) {
       const product = this.products.find((item) => item.id === productId)
@@ -1276,8 +1475,13 @@ export const useAppStore = defineStore('app', {
         if (!looked) return product
         const images = [...new Set([...(looked.images || []), looked.image, ...(product.images || []), product.image]
           .map((item) => String(item || '').trim())
-          .filter((item) => /^https?:\/\//.test(item)))].slice(0, 6)
-        if (looked.title && !/^商品 |^导入商品 /.test(looked.title)) product.title = looked.title
+          .filter((item) => keepProductImage(item)))]
+        if (looked.title && !/^商品 |^导入商品 /.test(looked.title)) {
+          const cleaned = cleanTitle(looked.title, this.settings.bannedWords)
+          product.rawTitle = cleaned.changed ? looked.title : (product.rawTitle || '')
+          product.title = cleaned.title
+          product.bannedHits = cleaned.hits
+        }
         if (Number(looked.price) > 0) product.price = Number(looked.price)
         if (Number(looked.rate) > 0) product.rate = Number(looked.rate)
         if (looked.category && !['链接导入', '未分类'].includes(looked.category)) product.category = looked.category
@@ -1314,9 +1518,11 @@ export const useAppStore = defineStore('app', {
           storyline: work.storyline,
           caption: work.caption,
           script: work.script,
-          compliance: work.compliance
+          compliance: work.compliance,
+          voice: work.voice || this.settings.voice
         }, product || { title: work.title })
-      if (!String(prompt || '').trim()) {
+      const voiced = withVoice(prompt, work.voice || this.settings.voice)
+      if (!String(voiced || '').trim()) {
         this.addLog('error', '豆包', `「${work.title}」没有提示词，重新生成已取消`)
         return '这条商品还没有提示词。先在设置或确认框里写好提示词'
       }
@@ -1326,9 +1532,11 @@ export const useAppStore = defineStore('app', {
       }
       work.images = images
       work.image = images[0]
-      work.prompt = prompt
+      work.prompt = voiced
       work.videoPath = ''
       work.doubaoChatUrl = ''
+      work.publishAccountId = ''
+      work.publishAccount = ''
       work.failReason = ''
       work.progress = 5
       work.status = '生成中'
@@ -1337,7 +1545,7 @@ export const useAppStore = defineStore('app', {
       for (let i = generatePending.length - 1; i >= 0; i -= 1) {
         if (generatePending[i] === workId) generatePending.splice(i, 1)
       }
-      const today = String(this.systemNow || formatTime(new Date())).slice(0, 10)
+      const today = todayKey()
       const account = (this.doubaoAccounts || []).find((item) => {
         if (!item.enabled || item.quotaDate === today) return false
         return doubaoQuotaUsed(this.works, item, today) < quotaLimit(item)
@@ -1402,9 +1610,9 @@ export const useAppStore = defineStore('app', {
         this.persist()
         return
       }
-      const today = String(this.systemNow || formatTime(new Date())).slice(0, 10)
+      const today = todayKey()
       const accounts = this.doubaoAccounts.filter((item) => {
-        if (!item.enabled || item.quotaDate === today || skipped.includes(item.id)) return false
+        if (!item.enabled || (item.quotaDate && item.quotaDate === today) || skipped.includes(item.id)) return false
         return doubaoQuotaUsed(this.works, item, today) < quotaLimit(item)
       }).sort((a, b) => {
         const load = (id) => this.works.filter((row) => row.doubaoAccountId === id && row.quotaPending && row.status === '生成中').length
@@ -1455,9 +1663,11 @@ export const useAppStore = defineStore('app', {
           compliance: work.compliance,
           duration: work.duration,
           ratio: work.ratio,
-          model: work.model
+          model: work.model,
+          voice: work.voice || this.settings.voice
         }, product || { title: work.title })
-      if (prompt && !work.prompt) work.prompt = prompt
+      const voiced = withVoice(prompt, work.voice || this.settings.voice)
+      if (voiced) work.prompt = voiced
       if (!window.tujian?.generateDoubao) {
         work.status = '生成失败'
         work.failReason = '请在桌面窗口里用网页版豆包生成'
@@ -1467,7 +1677,7 @@ export const useAppStore = defineStore('app', {
         this.persist()
         return
       }
-      if (!String(prompt || '').trim()) {
+      if (!String(voiced || '').trim()) {
         work.status = '生成失败'
         work.failReason = '提示词是空的。提示词和图片必须一起发'
         account.worker = '空闲'
@@ -1494,13 +1704,13 @@ export const useAppStore = defineStore('app', {
       work.sourceTags = sourceCopy.tags
       const slot = work.doubaoSlot || `gen-${work.id}`
       work.doubaoSlot = slot
-      work.quotaPending = true
+      chargeWorkQuota(work)
       this.syncDoubaoStats()
       this.addLog('info', '豆包', `${account.name} 正在打开豆包，发送提示词和 ${shots.length} 张商品图（额度先占 1，失败会退回）`)
       ensureDoubaoRules(this.settings)
       const payload = plainGeneratePayload({
         account,
-        prompt,
+        prompt: voiced,
         shots,
         slot,
         saveDir: this.settings.outputDir,
@@ -1531,7 +1741,7 @@ export const useAppStore = defineStore('app', {
       }
       if (this.isWorkCancelled(workId)) {
         cancelledWorks.delete(String(workId))
-        work.quotaPending = false
+        releaseWorkQuota(work)
         work.status = '待生成'
         work.failReason = '已在任务中心手动结束'
         this.endTask(taskId, work.failReason, 'cancelled')
@@ -1544,7 +1754,7 @@ export const useAppStore = defineStore('app', {
       if (Array.isArray(result?.optimizedTags) && result.optimizedTags.length) work.optimizedTags = result.optimizedTags
       markConfirm(result)
       if (result?.quota) {
-        work.quotaPending = false
+        releaseWorkQuota(work)
         account.quotaDate = today
         account.worker = '空闲'
         this.endTask(taskId, '额度不够，换号重试')
@@ -1577,6 +1787,9 @@ export const useAppStore = defineStore('app', {
       if (/关掉|被关/.test(String(result?.message || ''))) {
         work.status = '生成中'
         work.quotaPending = true
+        work.quotaCharged = true
+        work.quotaRefunded = false
+        if (!work.quotaChargedAt) work.quotaChargedAt = formatTime(new Date())
         work.failReason = '软件或窗口关掉了，重新打开后会接着原来的生成，不会重发'
         account.worker = '生成中'
         this.endTask(taskId, work.failReason)
@@ -1589,8 +1802,9 @@ export const useAppStore = defineStore('app', {
         if (chatUrl) work.doubaoChatUrl = chatUrl
         work.status = '已生成'
         work.progress = 100
-        work.finishedAt = formatTime(new Date())
-        work.quotaPending = false
+        work.generatedAt = formatTime(new Date())
+        work.finishedAt = work.generatedAt
+        keepWorkQuota(work)
         account.worker = '空闲'
         if (!this.settings.outputDir && result.saveDir) this.settings.outputDir = result.saveDir
         this.syncDoubaoStats()
@@ -1603,7 +1817,7 @@ export const useAppStore = defineStore('app', {
       }
       work.status = '生成失败'
       work.progress = 0
-      work.quotaPending = false
+      releaseWorkQuota(work)
       work.failReason = result?.message || '网页版豆包没有返回视频'
       account.worker = '空闲'
       this.endTask(taskId, work.failReason, 'failed')
@@ -1613,7 +1827,7 @@ export const useAppStore = defineStore('app', {
       } catch (error) {
         work.status = '生成失败'
         work.progress = 0
-        work.quotaPending = false
+        releaseWorkQuota(work)
         work.failReason = /could not be cloned/i.test(String(error?.message || error))
           ? '参数无法传给桌面进程，请再点一次重新生成'
           : (error.message || '生成中断')

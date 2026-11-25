@@ -3,6 +3,7 @@
     <Transition name="upd-fade">
       <div v-if="visible" class="upd-mask" @click.self="onMaskClick">
         <div class="upd-card" :class="status">
+          <button type="button" class="upd-close" aria-label="关闭" @click="close">×</button>
           <div class="upd-visual">
             <div v-if="status === 'checking'" class="orbit">
               <span /><span /><span />
@@ -28,6 +29,7 @@
           </div>
 
           <h3>{{ title }}</h3>
+          <p v-if="channelLabel" class="ver channel">{{ channelLabel }}</p>
           <p>{{ message }}</p>
           <p v-if="remoteVersion" class="ver">
             当前 {{ currentVersion || '—' }}
@@ -45,7 +47,7 @@
               再试一次
             </el-button>
             <el-button v-if="canOpenRelease" @click="openRelease">打开下载页</el-button>
-            <el-button v-if="canClose" @click="close">稍后再说</el-button>
+            <el-button v-if="canCloseNow" @click="close">稍后再说</el-button>
           </div>
         </div>
       </div>
@@ -86,7 +88,11 @@ const ringOffset = computed(() => {
   return c * (1 - p)
 })
 
-const canClose = computed(() => !['checking', 'downloading'].includes(status.value))
+const channelLabel = computed(() => {
+  if (!['available', 'downloading', 'downloaded'].includes(status.value)) return ''
+  return '更新通道：完整安装包。主程序有变化，下载的是 Setup 整包，不是组件增量。'
+})
+const canCloseNow = computed(() => status.value !== 'downloading')
 const canOpenRelease = computed(() => ['error', 'available', 'dev'].includes(status.value))
 
 function applyPayload(payload = {}) {
@@ -172,7 +178,7 @@ function close() {
 }
 
 function onMaskClick() {
-  if (canClose.value) close()
+  close()
 }
 
 onMounted(async () => {
@@ -199,12 +205,27 @@ defineExpose({ recheck, showManual: () => { manual.value = true; recheck() } })
   backdrop-filter: blur(6px);
 }
 .upd-card {
+  position: relative;
   width: min(420px, calc(100vw - 32px));
   padding: 28px 24px 22px;
   border-radius: 20px;
   background: linear-gradient(165deg, #ffffff 0%, #f3f7ff 55%, #eef6ff 100%);
   box-shadow: 0 24px 60px rgba(15, 23, 42, 0.22);
   text-align: center;
+}
+.upd-close {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: #334155;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
 }
 .upd-card h3 {
   margin: 14px 0 8px;

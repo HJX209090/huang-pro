@@ -13,7 +13,11 @@
     >
       <video v-if="video" ref="player" :src="video" controls autoplay playsinline @click.stop />
       <template v-else>
-        <img :src="shown" alt="" @click.stop="openFull" />
+        <div class="hover-frame">
+          <img :src="shown" alt="" @click.stop="openFull" />
+          <button v-if="urls.length > 1" type="button" class="hover-side left" @click.stop="step(-1)">‹</button>
+          <button v-if="urls.length > 1" type="button" class="hover-side right" @click.stop="step(1)">›</button>
+        </div>
         <div v-if="urls.length > 1" class="hover-nav">
           <button type="button" @click.stop="step(-1)">上一张</button>
           <span>{{ cursor + 1 }} / {{ urls.length }}</span>
@@ -29,13 +33,13 @@
       :z-index="5200"
       teleported
       @close="viewer = false"
-      @switch="cursor = $event"
+      @switch="onViewerSwitch"
     />
   </teleport>
 </template>
 
 <script setup>
-import { computed, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ElImageViewer } from 'element-plus'
 import { imageUrl } from '@/utils/format'
 
@@ -45,7 +49,7 @@ const props = defineProps({
   video: { type: String, default: '' },
   block: { type: Boolean, default: false }
 })
-const emit = defineEmits(['open'])
+const emit = defineEmits(['open', 'step'])
 
 const open = ref(false)
 const viewer = ref(false)
@@ -108,6 +112,12 @@ function step(delta) {
   const count = urls.value.length
   if (!count) return
   cursor.value = (cursor.value + delta + count) % count
+  emit('step', cursor.value)
+}
+
+function onViewerSwitch(index) {
+  cursor.value = index
+  emit('step', index)
 }
 
 function openFull() {
@@ -118,4 +128,16 @@ function openFull() {
   }
   if (urls.value.length) viewer.value = true
 }
+
+function onKey(event) {
+  if (!open.value && !viewer.value) return
+  if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+  if (props.video || viewer.value) return
+  event.preventDefault()
+  event.stopPropagation()
+  step(event.key === 'ArrowLeft' ? -1 : 1)
+}
+
+onMounted(() => window.addEventListener('keydown', onKey, true))
+onUnmounted(() => window.removeEventListener('keydown', onKey, true))
 </script>
