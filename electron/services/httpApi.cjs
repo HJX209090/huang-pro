@@ -434,6 +434,10 @@ function start(port = 17321, emit) {
       send(res, error.status || 500, { ok: false, message: error.message || '接口异常', logs: error.logs || [] })
     })
   })
+  server.on('error', (error) => {
+    if (error && error.code === 'EADDRINUSE') return
+    console.error(error)
+  })
   server.listen(port, '127.0.0.1')
   return server
 }

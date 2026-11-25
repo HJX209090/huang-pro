@@ -121,9 +121,8 @@ watch(() => store.promptVisible, (visible) => {
   form.duration = store.settings.duration || ''
   form.ratio = store.settings.ratio
   form.voice = store.settings.voice
-  // 若选品库已点过「生成提示词」，带入确认框，避免写了跟没写一样
-  const filled = rows.find((item) => String(item.filledPrompt || '').trim())?.filledPrompt
-  form.promptText = String(filled || store.settings.promptText || '').trim()
+  // 确认框只放模板。已经替换过的提示词里带着某一件商品的名字，不能拿来套下一件。
+  form.promptText = String(store.settings.promptText || '').trim()
 })
 
 async function uploadImages(item) {

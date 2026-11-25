@@ -3,7 +3,7 @@
     <div class="page-head">
       <div>
         <h1>发布中心 · 账号管理</h1>
-        <p class="muted">每个抖音号独立浏览器会话，登录后本地长期存活；可同时添加多个，并发窗口数由「同时打开」控制（1–10）。</p>
+        <p class="muted">这里只添加抖音创作者账号。填写用户名和分组后，会打开一个创作者窗口扫码，不再填写手机号，也不会连开多个浏览器。</p>
       </div>
     </div>
     <div class="panel filters">
@@ -76,30 +76,13 @@
         </el-table-column>
       </el-table>
     </div>
-    <el-dialog v-model="visible" :title="form.id ? '编辑抖音账号' : '添加抖音账号'" width="520px">
-      <p class="muted">填了账号密码：创作者页在后台自动填写，不显示；只打开达人工作台并点到扫码。没填密码：达人和创作者都会打开，各自出二维码。两边登录状态分开保存。</p>
-      <el-form label-width="96px">
-        <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>
-        <el-form-item label="登录方式">
-          <el-radio-group v-model="form.loginMode">
-            <el-radio value="password">密码（推荐）</el-radio>
-            <el-radio value="code">验证码</el-radio>
-            <el-radio value="qr">扫码</el-radio>
-          </el-radio-group>
-        </el-form-item>
-        <el-form-item v-if="form.loginMode !== 'qr'" label="抖音账号"><el-input v-model="form.login" placeholder="手机号 / 抖音号" /></el-form-item>
-        <el-form-item v-if="form.loginMode === 'password'" label="密码">
-          <el-input v-model="form.password" type="password" show-password :placeholder="form.id ? '不修改可留空' : '登录密码，用于过期自动重登'" />
-        </el-form-item>
+    <el-dialog v-model="visible" :title="form.id ? '编辑创作者账号' : '添加创作者账号'" width="460px">
+      <p class="muted">填写用户名，分组默认是「默认分组」。保存后只打开创作者中心，用扫码登录。</p>
+      <el-form label-width="88px">
+        <el-form-item label="用户名"><el-input v-model="form.name" placeholder="账号名称" /></el-form-item>
         <el-form-item label="分组">
           <el-select v-model="form.group" style="width: 100%">
             <el-option v-for="item in store.groups" :key="item" :label="item" :value="item" />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="发布方式">
-          <el-select v-model="form.publishMode" style="width: 100%">
-            <el-option label="自动发布" value="自动发布" />
-            <el-option label="手动确认" value="手动确认" />
           </el-select>
         </el-form-item>
       </el-form>
@@ -132,7 +115,7 @@ const selection = ref([])
 const visible = ref(false)
 const batchVisible = ref(false)
 const batchText = ref('')
-const form = reactive({ id: '', name: '', login: '', password: '', loginMode: 'password', group: '默认分组', publishMode: '手动确认' })
+const form = reactive({ id: '', name: '', login: '', password: '', loginMode: 'qr', group: '默认分组', publishMode: '手动确认' })
 const rows = computed(() => store.publishAccounts.filter((item) => {
   if (keyword.value && !item.name.includes(keyword.value.trim())) return false
   if (group.value && item.group !== group.value) return false
@@ -173,72 +156,65 @@ async function publishBatch() {
 }
 
 function edit(row) {
-  if (row) Object.assign(form, { id: row.id, name: row.name, login: row.loginMode === 'qr' ? '' : (row.login || row.accountId || ''), password: '', loginMode: ['code', 'qr'].includes(row.loginMode) ? row.loginMode : 'password', group: row.group, publishMode: row.publishMode })
-  else Object.assign(form, { id: '', name: '', login: '', password: '', loginMode: 'password', group: store.groups[0] || '默认分组', publishMode: '手动确认' })
+  store.addGroup('默认分组')
+  if (row) Object.assign(form, { id: row.id, name: row.name, login: '', password: '', loginMode: 'qr', group: row.group || '默认分组', publishMode: row.publishMode || '手动确认' })
+  else Object.assign(form, { id: '', name: '', login: '', password: '', loginMode: 'qr', group: '默认分组', publishMode: '手动确认' })
   visible.value = true
 }
 
 async function save() {
-  if (!form.name.trim()) return ElMessage.warning('填写名称')
-  if (form.loginMode !== 'qr' && !form.login.trim()) return ElMessage.warning('填写抖音账号')
-  if (form.loginMode === 'password' && !form.id && !form.password) return ElMessage.warning('填写密码')
+  if (!form.name.trim()) return ElMessage.warning('填写用户名')
   const id = form.id || uid('PB')
-  const login = form.loginMode === 'qr' ? '扫码登录' : form.login.trim()
-  try {
-    if (form.password) await store.saveAccountSecret(id, login, form.password)
-  } catch (error) {
-    return ElMessage.error(error.message || '密码保存失败')
-  }
+  const login = '扫码登录'
   if (form.id) {
     const target = store.publishAccounts.find((item) => item.id === form.id)
-    if (target) Object.assign(target, { name: form.name.trim(), login, loginMode: form.loginMode, accountId: login, phone: login, group: form.group, publishMode: form.publishMode, hasPassword: target.hasPassword || Boolean(form.password) })
+    if (target) Object.assign(target, { name: form.name.trim(), login, loginMode: 'qr', accountId: login, phone: '', group: form.group, publishMode: form.publishMode || '手动确认' })
   } else {
     store.publishAccounts.unshift({
       id,
       name: form.name.trim(),
       login,
-      loginMode: form.loginMode,
-      hasPassword: form.loginMode === 'password',
+      loginMode: 'qr',
+      hasPassword: false,
       enabled: true,
       accountId: login,
-      phone: login,
+      phone: '',
       fans: '0',
       todayPublish: 0,
       group: form.group,
       cart: true,
       loginStatus: '待登录',
-      publishMode: form.publishMode,
+      creatorLoginStatus: '待登录',
+      publishMode: form.publishMode || '手动确认',
       fetchMode: '手动',
       createdAt: formatTime(new Date())
     })
-    store.activeAccountId = id
   }
   store.persist()
   visible.value = false
   const row = store.publishAccounts.find((item) => item.id === id)
-  if (row) {
-    await bootstrapLogin(row)
-    if (!form.id) store.syncPlazaQuiet(id)
-  }
+  if (row) await bootstrapLogin(row)
 }
 
 async function bootstrapLogin(row) {
   if (!row) return
   if (!window.tujian?.bootstrapPublishLogin) return openWorkbench(row)
-  ElMessage.info(row.loginMode === 'password' ? '正在后台填写创作者账密，并打开达人工作台扫码…' : '正在打开达人工作台和创作者中心…')
+  ElMessage.info('正在打开创作者中心，请扫码')
   try {
     const result = await window.tujian.bootstrapPublishLogin({
       id: row.id,
       name: row.name,
-      login: row.loginMode === 'qr' ? '' : row.login,
-      mode: row.loginMode || 'qr'
+      login: '',
+      mode: 'qr',
+      scope: 'creator'
     })
     if (result?.buyinLoginStatus) row.buyinLoginStatus = result.buyinLoginStatus
     if (result?.creatorLoginStatus) row.creatorLoginStatus = result.creatorLoginStatus
-    if (result?.loginStatus) row.loginStatus = result.buyinLoginStatus || result.loginStatus
+    if (result?.creatorLoginStatus) row.loginStatus = result.creatorLoginStatus
+    else if (result?.loginStatus) row.loginStatus = result.loginStatus
     store.persist()
-    ElMessage.success(result?.message || '登录页已打开')
-    if (row.buyinLoginStatus !== '已登录') watchScan(row)
+    ElMessage.success(result?.message || '创作者登录页已打开')
+    if (row.creatorLoginStatus !== '已登录') watchScan(row)
   } catch (error) {
     ElMessage.warning(error?.message || '登录页没有打开')
   }
@@ -253,22 +229,12 @@ async function openWorkbench(row) {
     name: row.name,
     login: row.loginMode === 'qr' ? '' : row.login,
     mode: row.loginMode || 'password',
-    url: 'https://buyin.jinritemai.com/dashboard'
+    url: 'https://creator.douyin.com/creator-micro/content/upload'
   })
-  row.loginStatus = result.loginStatus
+  row.loginStatus = result.creatorLoginStatus || result.loginStatus
   store.persist()
-  if (result.loginStatus === '已登录') {
-    ElMessage.success('账号已添加，正在后台同步选品广场')
-    return
-  }
-  if (row.loginMode === 'qr') {
-    ElMessage.success('达人工作台已打开，扫一次即可，选品和广场都用这次登录')
-    watchScan(row)
-    return
-  }
-  ElMessage.success(row.loginMode === 'code'
-    ? '达人工作台已打开，正在自动填手机号并发验证码'
-    : (result?.message || '已打开达人工作台，并尝试自动填写账号密码'))
+  ElMessage.success(result?.message || '已打开创作者中心，请扫码')
+  if (row.loginStatus !== '已登录') watchScan(row)
 }
 
 async function scanLogin(row) {
@@ -281,13 +247,13 @@ async function scanLogin(row) {
     login: row.login,
     mode: 'qr',
     already: row.loginStatus === '已登录',
-    url: 'https://buyin.jinritemai.com/dashboard'
+    url: 'https://creator.douyin.com/creator-micro/content/upload'
   })
-  row.loginStatus = result.loginStatus
+  row.loginStatus = result.creatorLoginStatus || result.loginStatus
+  row.creatorLoginStatus = result.creatorLoginStatus || row.creatorLoginStatus
   store.persist()
-  if (result.loginStatus === '已登录') {
-    fetchLibrary(row.id)
-    ElMessage.success('这个账号已经登录，直接进入')
+  if (row.loginStatus === '已登录') {
+    ElMessage.success('这个创作者账号已经登录')
     return
   }
   ElMessage.success(result.message || '请用抖音 App 扫描窗口里的二维码')
@@ -301,11 +267,12 @@ async function watchScan(row) {
     const result = await window.tujian.accountStatus({ kind: 'publish', id: row.id })
     if (result.buyinLoginStatus) row.buyinLoginStatus = result.buyinLoginStatus
     if (result.creatorLoginStatus) row.creatorLoginStatus = result.creatorLoginStatus
-    if (result.loginStatus !== '已登录') continue
+    const signed = result.creatorLoginStatus === '已登录'
+    if (!signed) continue
+    row.creatorLoginStatus = '已登录'
     row.loginStatus = '已登录'
     store.persist()
-    store.syncPlazaQuiet(row.id)
-    ElMessage.success(`${row.name} 已登录，正在后台同步选品广场`)
+    ElMessage.success(`${row.name} 创作者已登录`)
     store.addLog('success', '发布', `${row.name} 扫码登录成功`)
     return
   }
@@ -319,30 +286,13 @@ async function openRow(row) {
       if (st?.loginStatus) row.loginStatus = st.loginStatus
     }
   } catch { /* ignore */ }
-  let already = row.loginStatus === '已登录'
-  if (window.tujian.ensurePublishLogin) {
-    try {
-      const ensured = await window.tujian.ensurePublishLogin({
-        id: row.id,
-        name: row.name,
-        login: row.login,
-        mode: row.loginMode || 'password',
-        url: 'https://creator.douyin.com/creator-micro/content/upload'
-      })
-      if (ensured?.loginStatus) row.loginStatus = ensured.loginStatus
-      already = ensured?.loginStatus === '已登录' || ensured?.ok
-      store.persist()
-      if (ensured?.loginStatus === '已登录') ElMessage.success(ensured.message || '已在同一浏览器会话打开创作者中心')
-      else if (ensured?.message) ElMessage.warning(ensured.message)
-    } catch { /* 继续打开 */ }
-  }
   const result = await window.tujian.openAccount({
     kind: 'publish',
     id: row.id,
     name: row.name,
-    login: row.login,
-    mode: row.loginMode || 'password',
-    already,
+    login: '',
+    mode: 'qr',
+    already: row.creatorLoginStatus === '已登录' || row.loginStatus === '已登录',
     url: 'https://creator.douyin.com/creator-micro/content/upload'
   })
   if (result?.loginStatus) {

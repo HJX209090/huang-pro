@@ -2,7 +2,7 @@
   <div class="page">
     <div class="page-head">
       <div>
-        <h1>剪辑中心 · 豆包账号</h1>
+        <h1>豆包管理</h1>
         <p>请先用豆包账号登录后再把任务丢给豆包。账号被限制或封停不可操作。同一账号每 5 秒内只开一个窗口，失败、高分自动拆。</p>
       </div>
       <el-button type="primary" @click="edit()">新建账号</el-button>
@@ -49,6 +49,7 @@
           <template #default="{ row }">
             <div class="row-ops">
               <el-button size="small" type="primary" plain @click="openRow(row)">打开</el-button>
+              <el-button size="small" @click="showBrowsers(row)">浏览器</el-button>
               <el-button size="small" plain @click="openExtra(row)">再开窗口</el-button>
               <el-button size="small" plain @click="talk(row)">对话</el-button>
               <el-button size="small" type="primary" plain @click="requestCode(row)">获取验证码</el-button>
@@ -69,26 +70,15 @@
       </el-table>
     </div>
     <el-dialog v-model="visible" :title="form.id ? '编辑豆包账号' : '新建豆包账号'" width="460px">
-      <p class="muted">保存后自动打开豆包网页：点「登录」，填入手机号，点「下一步」，再点「获取验证码」。有密码会先尝试账密登录。</p>
+      <p class="muted">只填写用户名和分组。保存后打开豆包网页，扫码登录，不填写手机号。</p>
       <el-form label-width="88px">
-        <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>
-        <el-form-item label="登录方式">
-          <el-radio-group v-model="form.loginMode">
-            <el-radio value="code">验证码（推荐）</el-radio>
-            <el-radio value="password">密码</el-radio>
-            <el-radio value="qr">扫码</el-radio>
-          </el-radio-group>
-        </el-form-item>
-        <el-form-item label="豆包账号"><el-input v-model="form.login" placeholder="手机号，保存后自动填入并发码" /></el-form-item>
-        <el-form-item v-if="form.loginMode === 'password'" label="密码">
-          <el-input v-model="form.password" type="password" show-password :placeholder="form.id ? '不修改可留空' : '登录密码'" />
-        </el-form-item>
+        <el-form-item label="用户名"><el-input v-model="form.name" placeholder="账号名称" /></el-form-item>
         <el-form-item label="分组">
           <el-select v-model="form.group" style="width: 100%">
             <el-option v-for="item in store.groups" :key="item" :label="item" :value="item" />
           </el-select>
         </el-form-item>
-        <el-form-item label="每日上限"><el-input v-model="form.quota" placeholder="例如 5，今日用掉的条数会自动加上" /></el-form-item>
+        <el-form-item label="每日上限"><el-input v-model="form.quota" placeholder="例如 5" /></el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="visible = false">取消</el-button>
@@ -318,31 +308,56 @@ function limitOf(row) {
 }
 
 function edit(row) {
-  if (row) Object.assign(form, { id: row.id, name: row.name, login: row.login || '', password: '', loginMode: row.loginMode || 'qr', group: row.group, quota: limitOf(row) })
-  else Object.assign(form, { id: '', name: '', login: '', password: '', loginMode: 'code', group: store.groups[0] || '默认分组', quota: '5' })
+  store.addGroup('默认分组')
+  if (row) Object.assign(form, { id: row.id, name: row.name, login: '', password: '', loginMode: 'qr', group: row.group || '默认分组', quota: limitOf(row) })
+  else Object.assign(form, { id: '', name: '', login: '', password: '', loginMode: 'qr', group: '默认分组', quota: '5' })
   visible.value = true
 }
 
+async function showBrowsers(row) {
+  const jobs = store.works.filter((work) => work.doubaoAccountId === row.id && (work.status === '生成中' || work.doubaoChatUrl))
+  const pages = jobs.filter((work) => work.doubaoChatUrl)
+  if (pages.length && window.tujian?.openAccount) {
+    for (const work of pages) {
+      await window.tujian.openAccount({
+        kind: 'doubao',
+        id: row.id,
+        name: row.name,
+        login: '',
+        mode: 'qr',
+        url: work.doubaoChatUrl,
+        slot: work.doubaoSlot || `gen-${work.id}`,
+        already: row.loginStatus === '已登录'
+      })
+    }
+    ElMessage.success(pages.length === 1 ? `已打开编号 ${pages[0].no || ''} 的生成页` : `已打开 ${pages.length} 个视频的生成页`)
+    return
+  }
+  if (!window.tujian?.listDoubaoWindows) return openRow(row)
+  const list = await window.tujian.listDoubaoWindows()
+  const mine = (list || []).filter((item) => String(item.key || '').startsWith(`doubao:${row.id}`))
+  if (!mine.length) {
+    ElMessage.info('这个账号还没有在跑的页面，已打开豆包')
+    return openRow(row)
+  }
+  for (const item of mine) {
+    if (window.tujian.focusDoubaoWindow) await window.tujian.focusDoubaoWindow(item.key)
+  }
+  ElMessage.success(mine.some((item) => item.hidden) ? '已把隐藏的豆包页面重新打开' : '已切到正在跑的豆包页面')
+}
+
 async function save() {
-  if (!form.name.trim()) return ElMessage.warning('填写账号名称')
-  if (!form.login.trim()) return ElMessage.warning('填写豆包账号')
-  if (form.loginMode === 'password' && !form.id && !form.password) return ElMessage.warning('填写密码')
+  if (!form.name.trim()) return ElMessage.warning('填写用户名')
   const id = form.id || uid('DB')
   const isNew = !form.id
   saving.value = true
-  try {
-    if (form.password) await store.saveAccountSecret(id, form.login.trim(), form.password)
-  } catch (error) {
-    saving.value = false
-    return ElMessage.error(error.message || '密码保存失败')
-  }
   let row = null
   if (form.id) {
     row = store.doubaoAccounts.find((item) => item.id === form.id)
-    if (row) Object.assign(row, { name: form.name.trim(), login: form.login.trim(), loginMode: form.loginMode, group: form.group, quotaLimit: Number(String(form.quota).match(/\d+/)?.[0]) || row.quotaLimit || 5, hasPassword: row.hasPassword || Boolean(form.password) })
+    if (row) Object.assign(row, { name: form.name.trim(), login: row.login && row.login !== '扫码登录' ? row.login : form.name.trim(), loginMode: 'qr', group: form.group, quotaLimit: Number(String(form.quota).match(/\d+/)?.[0]) || row.quotaLimit || 5 })
   } else {
     row = {
-      id, name: form.name.trim(), login: form.login.trim(), loginMode: form.loginMode, hasPassword: form.loginMode === 'password',
+      id, name: form.name.trim(), login: '扫码登录', loginMode: 'qr', hasPassword: false,
       group: form.group, quota: '0/5', quotaLimit: Number(String(form.quota).match(/\d+/)?.[0]) || 5,
       enabled: true, loginStatus: '待登录', worker: '空闲', recent: '成功 0 · 失败 0', createdAt: formatTime(new Date())
     }

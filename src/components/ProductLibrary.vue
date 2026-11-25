@@ -3,13 +3,14 @@
     <MatrixTabs />
     <div class="panel library-head">
       <div class="library-account">
-        <span class="muted">当前抖音账号</span>
-        <el-select v-model="store.activeAccountId" placeholder="先添加发布账号" style="width: 240px" @change="store.persist()">
-          <el-option v-for="item in store.publishAccounts" :key="item.id" :label="item.name" :value="item.id" />
+        <span class="muted">采集账号</span>
+        <el-select v-model="collectId" placeholder="先添加采集账号" style="width: 220px">
+          <el-option v-for="item in store.collectAccounts" :key="item.id" :label="`${item.name}（${item.loginStatus || '待登录'}）`" :value="item.id" />
         </el-select>
         <span class="muted">每个账号的选品分开保存</span>
       </div>
       <div class="library-actions">
+        <el-button type="primary" @click="editCollect()">添加采集账号</el-button>
         <el-button type="primary" plain @click="openTalent">打开达人选品</el-button>
         <el-button type="primary" plain :loading="syncing" @click="syncNow">同步选品车</el-button>
         <el-button @click="router.push({ path: '/products', query: { tab: 'cart' } })">去采集账号</el-button>
@@ -190,6 +191,21 @@
         <el-button type="primary" @click="saveEdit">保存</el-button>
       </template>
     </el-dialog>
+    <el-dialog v-model="collectVisible" title="添加采集账号" width="420px">
+      <p class="muted">只填写用户名，分组默认「默认分组」。保存后打开一个达人工作台窗口，扫码登录。</p>
+      <el-form label-width="72px">
+        <el-form-item label="用户名"><el-input v-model="collectForm.name" placeholder="账号名称" /></el-form-item>
+        <el-form-item label="分组">
+          <el-select v-model="collectForm.group" style="width: 100%">
+            <el-option v-for="item in store.groups" :key="item" :label="item" :value="item" />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="collectVisible = false">取消</el-button>
+        <el-button type="primary" @click="saveCollect">保存并扫码</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -200,7 +216,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import MatrixTabs from '@/components/MatrixTabs.vue'
 import { useAppStore } from '@/stores/app'
 import HoverPreview from '@/components/HoverPreview.vue'
-import { coverStyle, earn, formatTime, imageUrl } from '@/utils/format'
+import { coverStyle, earn, formatTime, imageUrl, uid } from '@/utils/format'
 import { sanitizeProductTitle } from '@/utils/banned'
 import { couponTags, goodsCategory, goodsTags, isFreeShipping } from '@/utils/goods'
 import { defaultPromptSettings, upgradePromptSettings } from '@/mock/data'
@@ -208,6 +224,9 @@ import PromptTemplateBar from '@/components/PromptTemplateBar.vue'
 import PromptDrawer from '@/components/PromptDrawer.vue'
 
 const store = useAppStore()
+const collectVisible = ref(false)
+const collectId = ref(store.collectAccounts[0]?.id || '')
+const collectForm = reactive({ name: '', group: '默认分组' })
 const router = useRouter()
 const keyword = ref('')
 const source = ref('')
@@ -246,7 +265,7 @@ function shotList(item) {
   return [...new Set([...(item?.images || []), item?.image].map((src) => String(src || '')).filter(Boolean))]
 }
 
-const accountProducts = computed(() => store.products.filter((item) => (item.accountId || '') === (store.activeAccountId || '')))
+const accountProducts = computed(() => store.products)
 const sources = computed(() => [...new Set(accountProducts.value.map((item) => item.source))])
 const categories = computed(() => [...new Set(accountProducts.value.map((item) => goodsCategory(item)))])
 const coupons = computed(() => [...new Set(accountProducts.value.flatMap((item) => couponTags(item)))])
@@ -306,7 +325,12 @@ async function syncNow() {
   syncing.value = true
   startProgress()
   try {
-    const result = await store.syncCatalog('products')
+    const account = currentCollect()
+    if (!account) {
+      clearInterval(progressTimer)
+      return ElMessage.warning('先添加采集账号，并在达人工作台扫码登录')
+    }
+    const result = await store.syncCatalog('products', account.id)
     const count = result.count || 0
     clearInterval(progressTimer)
     progress.value = 100
@@ -343,19 +367,54 @@ function makePrompts() {
   ElMessage.success(`已生成 ${count} 条提示词`)
 }
 
-async function openTalent() {
-  const account = store.publishAccounts.find((item) => item.id === store.activeAccountId) || store.publishAccounts[0]
-  if (!account) return ElMessage.warning('先添加一个发布账号，用来登录达人选品')
-  if (!window.tujian?.openAccount) return ElMessage.warning('请在桌面窗口里打开达人选品')
-  await window.tujian.openAccount({
-    kind: 'publish',
+function currentCollect() {
+  return store.collectAccounts.find((item) => item.id === collectId.value) || store.collectAccounts[0] || null
+}
+
+function editCollect() {
+  store.addGroup('默认分组')
+  collectForm.name = ''
+  collectForm.group = '默认分组'
+  collectVisible.value = true
+}
+
+async function openBuyin(account) {
+  if (!account) return ElMessage.warning('先添加采集账号')
+  if (!window.tujian?.bootstrapPublishLogin) return ElMessage.warning('请在桌面窗口里打开达人工作台')
+  const result = await window.tujian.bootstrapPublishLogin({
     id: account.id,
     name: account.name,
-    login: account.login,
-    mode: account.loginMode || 'password',
-    url: 'https://buyin.jinritemai.com/dashboard/merch-picking-library'
+    login: '',
+    mode: 'qr',
+    scope: 'buyin'
   })
-  ElMessage.success('达人选品已打开。在网页里手动加入后，回到这里点同步商品。')
+  account.loginStatus = result?.buyinLoginStatus || result?.loginStatus || account.loginStatus
+  store.persist()
+  ElMessage.success(result?.message || '已打开达人工作台，请扫码')
+}
+
+async function saveCollect() {
+  if (!collectForm.name.trim()) return ElMessage.warning('填写用户名')
+  const row = {
+    id: uid('CA'),
+    name: collectForm.name.trim(),
+    group: collectForm.group || '默认分组',
+    publishAccount: '',
+    enabled: true,
+    loginStatus: '待登录',
+    loginMode: 'qr',
+    lastCollect: '-',
+    createdAt: formatTime(new Date())
+  }
+  store.collectAccounts.unshift(row)
+  collectId.value = row.id
+  store.persist()
+  collectVisible.value = false
+  await openBuyin(row)
+}
+
+async function openTalent() {
+  await openBuyin(currentCollect())
 }
 
 function generateSelected() {

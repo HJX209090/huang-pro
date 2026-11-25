@@ -15,7 +15,7 @@ function toPlain(value) {
   }
 }
 
-function plainGeneratePayload({ account, prompt, shots, slot, saveDir, workId, captcha, replyRules, failMarkers, retryMarkers }) {
+function plainGeneratePayload({ account, prompt, shots, slot, saveDir, workId, captcha, replyRules, failMarkers, retryMarkers, copyNo, copyTitle, copyTags }) {
   const types = captcha?.types || {}
   const reply = replyRules || {}
   const mapRules = (list) => (Array.isArray(list) ? list : []).map((item) => ({
@@ -37,6 +37,9 @@ function plainGeneratePayload({ account, prompt, shots, slot, saveDir, workId, c
     imageCount: 0,
     saveDir: String(saveDir || ''),
     workId: String(workId || ''),
+    copyNo: String(copyNo || ''),
+    copyTitle: String(copyTitle || ''),
+    copyTags: (copyTags || []).map((item) => String(item || '').replace(/^#/, '').trim()).filter(Boolean).slice(0, 5),
     captcha: {
       enabled: captcha?.enabled !== false,
       token: String(captcha?.token || ''),
@@ -354,6 +357,30 @@ export const useAppStore = defineStore('app', {
       this.persist()
       return `已结束「${row.title}」`
     },
+    nextWorkNo() {
+      return this.works.reduce((max, work) => Math.max(max, Number(work.no) || 0), 0) + 1
+    },
+    ensureWorkNumbers() {
+      let next = this.works.reduce((max, work) => Math.max(max, Number(work.no) || 0), 0)
+      let changed = false
+      ;[...this.works].reverse().forEach((work) => {
+        if (work.no) return
+        next += 1
+        work.no = next
+        changed = true
+      })
+      if (changed) this.persist()
+    },
+    sourceCopy(work) {
+      const product = this.products.find((item) => item.id === work?.productId) || null
+      const goodsTitle = String(product?.title || work?.title || '').trim()
+      const title = publishTitleFromGoods(goodsTitle, product || { title: goodsTitle })
+      const tags = topicsFromGoods(goodsTitle, product || { title: goodsTitle })
+        .map((tag) => String(tag || '').replace(/^#/, '').trim())
+        .filter(Boolean)
+        .slice(0, 5)
+      return { title, tags }
+    },
     async cancelAllRuntimeTasks() {
       const running = this.runtimeTasks.filter((item) => item.status === 'running')
       for (const row of running) {
@@ -372,16 +399,22 @@ export const useAppStore = defineStore('app', {
       const title = wantTitle
         ? publishTitleFromGoods(goodsTitle, product || { title: goodsTitle, category: product?.category || item.category, shop: product?.shop || item.shop })
         : ''
+      const optimizedTitle = String(item.optimizedTitle || '').trim()
       // 兜底：生成结果为空时仍给一个可填短标题，避免发布页标题空白
-      const publishTitle = String(title || '').trim() || (wantTitle ? publishTitleFromGoods(goodsTitle || '今日好物分享', { title: goodsTitle || '今日好物分享' }) : '')
+      const publishTitle = optimizedTitle || String(title || '').trim() || (wantTitle ? publishTitleFromGoods(goodsTitle || '今日好物分享', { title: goodsTitle || '今日好物分享' }) : '')
       const productLink = String(product?.link || product?.goodsUrl || item.productLink || '').trim()
       // 有商品链接时默认挂购物车；设置里关掉 dyCart 才跳过
       const wantCart = page.dyCart !== false && Boolean(productLink)
+      const optimizedTags = Array.isArray(item.optimizedTags)
+        ? item.optimizedTags.map((tag) => String(tag || '').replace(/^#/, '').trim()).filter((tag) => tag && tag.length <= 12).slice(0, 5)
+        : []
       const tags = page.dyTags === false
         ? []
-        : topicsFromGoods(goodsTitle || item.title, product || { title: goodsTitle || item.title })
-          .map((tag) => String(tag || '').replace(/^#/, '').trim())
-          .filter((tag) => tag && tag.length <= 12 && !/^https?:/i.test(tag) && !/haohuo|jinritemai/i.test(tag))
+        : (optimizedTags.length
+          ? optimizedTags
+          : topicsFromGoods(goodsTitle || item.title, product || { title: goodsTitle || item.title })
+            .map((tag) => String(tag || '').replace(/^#/, '').trim())
+            .filter((tag) => tag && tag.length <= 12 && !/^https?:/i.test(tag) && !/haohuo|jinritemai/i.test(tag)))
       return {
         id: String(account.id || ''),
         name: String(account.name || ''),
@@ -539,6 +572,7 @@ export const useAppStore = defineStore('app', {
         this.systemNow = me.systemNow
         this.adminMode = false
         this.applyServer(await api.getState())
+        this.ensureWorkNumbers()
         this.apiError = ''
         this.resumeInterruptedJobs()
       } catch (error) {
@@ -568,64 +602,16 @@ export const useAppStore = defineStore('app', {
           note: work.status === '发布中' ? '软件重启后续传·发布中' : '软件重启后续传·生成中'
         })
       })
-      // 断线续传：有豆包对话链接的生成中任务，优先拉无水印；否则重新排队生成
+      // 关掉再打开：只续上还在生成的原对话，不重新发送提示词
       const interrupted = this.works.filter((item) => item.status === '生成中' && !item.videoPath)
-      interrupted.forEach((work, index) => {
-        this.addLog('info', '任务', `续传「${work.title}」${work.doubaoChatUrl ? '（先检测原对话是否还在生成）' : '（无对话链接，重新打开豆包）'}`)
-        setTimeout(() => {
-          if (work.doubaoChatUrl && window.tujian?.pullCleanDoubao) {
-            const account = this.doubaoAccounts.find((item) => item.id === work.doubaoAccountId) || this.doubaoAccount()
-            if (!account) {
-              this.kickGenerate(work.id, { immediate: index === 0 })
-              return
-            }
-            window.tujian.pullCleanDoubao({
-              id: account.id,
-              name: account.name,
-              login: account.login,
-              mode: account.loginMode || 'password',
-              chatUrl: work.doubaoChatUrl,
-              outputFile: '',
-              outputDir: this.settings.outputDir,
-              waitRunning: true,
-              waitMs: 10 * 60 * 1000
-            }).then((result) => {
-              if (result?.ok && result.videoPath) {
-                work.videoPath = result.videoPath
-                if (result.doubaoChatUrl) work.doubaoChatUrl = result.doubaoChatUrl
-                work.status = '已生成'
-                work.progress = 100
-                work.failReason = ''
-                this.addLog('success', '豆包', `续传成功，成片已回到待审核：${work.title}`)
-                this.persist()
-                return
-              }
-              // 还在排队/生成：保持生成中，稍后自动再拉，绝不立刻重发浪费额度
-              if (result?.stillRunning || result?.needRegenerate === false) {
-                work.status = '生成中'
-                work.failReason = result?.message || '原对话仍在生成，等待成片'
-                this.addLog('info', '豆包', `「${work.title}」${work.failReason}`)
-                this.persist()
-                setTimeout(() => {
-                  if (work.status === '生成中' && !work.videoPath) this.resumeOneDoubaoWork(work.id)
-                }, 90 * 1000)
-                return
-              }
-              if (result?.needRegenerate) {
-                this.addLog('warning', '豆包', `「${work.title}」原对话已结束且无成片，才重新发起：${result.message || ''}`)
-                this.kickGenerate(work.id, { immediate: true })
-                return
-              }
-              this.addLog('warning', '豆包', `「${work.title}」续传未拿到成片：${result?.message || '未知原因'}，暂不重发`)
-              this.persist()
-            }).catch((error) => {
-              this.addLog('warning', '豆包', `「${work.title}」续传检测失败：${error?.message || error}，暂不重发以免浪费额度`)
-              this.persist()
-            })
-            return
-          }
-          this.kickGenerate(work.id, { immediate: index === 0 })
-        }, 800 + index * 1200)
+      interrupted.forEach((work) => {
+        work.quotaPending = true
+        if (!work.doubaoChatUrl) {
+          this.addLog('info', '豆包', `「${work.title}」仍是生成中，没有对话链接，不会重新发送`)
+          return
+        }
+        this.addLog('info', '任务', `续传「${work.title}」（接着原来的豆包对话等成片，不重新生成）`)
+        setTimeout(() => this.resumeOneDoubaoWork(work.id), 800)
       })
       if (interrupted.length || this.runtimeTasks.some((item) => item.status === 'running')) {
         this.persist()
@@ -666,9 +652,15 @@ export const useAppStore = defineStore('app', {
           }, 120 * 1000)
           return
         }
-        if (result?.needRegenerate) {
-          this.addLog('warning', '豆包', `「${work.title}」确认原对话已结束，重新发起`)
-          this.kickGenerate(work.id, { immediate: true })
+        work.status = '生成中'
+        work.failReason = result?.message || '原对话还没出成片，不重新发送'
+        this.addLog('info', '豆包', `「${work.title}」${work.failReason}`)
+        this.persist()
+        work.resumeTries = (work.resumeTries || 0) + 1
+        if (work.resumeTries < 6) {
+          setTimeout(() => {
+            if (work.status === '生成中' && !work.videoPath) this.resumeOneDoubaoWork(work.id)
+          }, 120 * 1000)
         }
       }).catch(() => {})
     },
@@ -916,6 +908,14 @@ export const useAppStore = defineStore('app', {
         this.executeSchedule(task)
       })
     },
+    schedulePublishAccounts(task) {
+      const names = Array.isArray(task?.accounts) && task.accounts.length
+        ? task.accounts.map((item) => String(item || '').trim()).filter(Boolean)
+        : String(task?.account || '').split(/[、,，]/).map((item) => item.trim()).filter(Boolean)
+      const enabled = this.publishAccounts.filter((item) => item.enabled !== false)
+      if (!names.length) return enabled
+      return enabled.filter((item) => names.includes(item.name) || names.includes(item.id))
+    },
     async executeSchedule(task, options = {}) {
       if (!task) return '没有找到这条定时任务'
       if (task._running && !options.immediate) return '这条定时任务正在执行'
@@ -942,9 +942,7 @@ export const useAppStore = defineStore('app', {
       }
       if (task.type === '审核通过后发布' || task.type === '发布队列' || !task.type) {
         const ready = this.works.filter((item) => this.isPublishReady(item))
-        const account = this.publishAccounts.find((item) => item.name === task.account)
-          || this.publishAccounts.find((item) => item.enabled)
-          || this.publishAccounts[0]
+        const accounts = this.schedulePublishAccounts(task)
         task.lastRun = stamp
         this.persist()
         if (!ready.length) {
@@ -953,57 +951,66 @@ export const useAppStore = defineStore('app', {
           this.addLog('info', '定时', message)
           return message
         }
-        if (!account || !window.tujian?.publishWork) {
-          const message = `${task.name}：有 ${ready.length} 条可发布，但没有发布账号或没在桌面窗口里运行`
+        if (!accounts.length || !window.tujian?.publishWork) {
+          const message = `${task.name}：有 ${ready.length} 条可发布，但没有勾选发布账号或没在桌面窗口里运行`
           this.endTask(taskId, message, 'failed')
           this.addLog('warning', '定时', message)
           return message
         }
-        // 失败/关窗后 30 分钟内不自动再开抖音（立即执行可跳过）
         if (!immediate && task.lastLoginFailAt && Date.now() - Number(task.lastLoginFailAt) < 30 * 60 * 1000) {
           const message = `${task.name}：距上次发布未成功不足 30 分钟，暂不拉起抖音。登录创作者后可点「立即执行」`
           this.endTask(taskId, message)
           this.addLog('info', '定时', message)
           return message
         }
-        // 只查 cookie，预检绝不拉起/刷新页面
-        try {
-          if (window.tujian?.ensurePublishLogin) {
-            const ensured = await window.tujian.ensurePublishLogin({
-              id: account.id,
-              name: account.name,
-              login: account.login,
-              mode: account.loginMode || 'password',
-              url: 'https://creator.douyin.com/creator-micro/content/upload',
-              cookieOnly: true
-            })
-            if (ensured?.loginStatus) account.loginStatus = ensured.loginStatus
-            this.persist()
-            if (!ensured?.ok) {
-              task.lastLoginFailAt = Date.now()
-              const message = `${task.name}：${ensured.message || '创作者未登录'}。请先手动打开创作者中心登录一次；定时不会反复刷页`
-              this.endTask(taskId, message, 'failed')
-              this.addLog('warning', '定时', message)
-              return message
+        const buckets = accounts.map(() => [])
+        ready.forEach((work, index) => {
+          const preferred = accounts.findIndex((item) => item.id === work.publishAccountId || item.name === work.publishAccount)
+          buckets[preferred >= 0 ? preferred : index % accounts.length].push(work)
+        })
+        let posted = 0
+        let blocked = 0
+        for (let index = 0; index < accounts.length; index += 1) {
+          const account = accounts[index]
+          const batch = buckets[index]
+          if (!batch.length) continue
+          try {
+            if (window.tujian?.ensurePublishLogin) {
+              const ensured = await window.tujian.ensurePublishLogin({
+                id: account.id,
+                name: account.name,
+                login: account.login,
+                mode: account.loginMode || 'qr',
+                url: 'https://creator.douyin.com/creator-micro/content/upload',
+                cookieOnly: true
+              })
+              if (ensured?.loginStatus) account.loginStatus = ensured.loginStatus
+              if (ensured?.creatorLoginStatus) account.creatorLoginStatus = ensured.creatorLoginStatus
+              if (!ensured?.ok) {
+                blocked += 1
+                this.addLog('warning', '定时', `${account.name}：${ensured?.message || '创作者未登录'}`)
+                continue
+              }
             }
-            this.addLog('info', '定时', `${account.name}：${ensured.message || '登录态有效，开始发布'}`)
+          } catch (error) {
+            blocked += 1
+            this.addLog('warning', '定时', `${account.name}：检查登录态失败 ${error.message || ''}`)
+            continue
           }
-        } catch (error) {
-          this.addLog('warning', '定时', `${account.name}：检查登录态失败 ${error.message || ''}`)
+          posted += await this.publishWorksBatch(batch, account)
         }
-        const posted = await this.publishWorksBatch(ready, account)
         if (posted > 0) {
           task.lastSuccessDay = stamp.slice(0, 10)
           task.lastLoginFailAt = 0
           if (task.mode === '单次') task.enabled = false
         } else {
-          // 未发出（关窗/登录墙等）：冷却，避免点掉又自己打开
           task.lastLoginFailAt = Date.now()
         }
         this.persist()
+        const names = accounts.map((item) => item.name).join('、')
         const message = posted
-          ? `${task.name} 已把 ${posted} 条审核通过的成片送进抖音`
-          : `${task.name}：${when}，成片未发布成功。已暂停自动拉页 30 分钟；登录后可点「立即执行」`
+          ? `${task.name} 已用 ${names} 发布 ${posted} 条`
+          : `${task.name}：${when}，${names} 没有发出成片${blocked ? '，有账号未登录' : ''}。已暂停自动拉页 30 分钟`
         this.endTask(taskId, message, posted ? 'done' : 'failed')
         return message
       }
@@ -1153,12 +1160,17 @@ export const useAppStore = defineStore('app', {
       await Promise.all((ids || []).map((id) => this.enrichProduct(id)))
       this.promptVisible = true
     },
-    applyProgress({ workId, progress, status, videoPath, confirmSent, confirmNeeded, confirmNote }) {
+    applyProgress({ workId, progress, status, videoPath, confirmSent, confirmNeeded, confirmNote, doubaoChatUrl, optimizedTitle, optimizedTags }) {
       const work = this.works.find((item) => item.id === workId)
       if (!work) return
       if (progress != null) work.progress = progress
       if (status) work.status = status
       if (videoPath) work.videoPath = videoPath
+      if (doubaoChatUrl && /doubao\.com\/chat\/[^/?#]+/i.test(doubaoChatUrl)) work.doubaoChatUrl = doubaoChatUrl
+      if (optimizedTitle) work.optimizedTitle = String(optimizedTitle).slice(0, 30)
+      if (Array.isArray(optimizedTags) && optimizedTags.length) {
+        work.optimizedTags = optimizedTags.map((tag) => String(tag || '').replace(/^#/, '').trim()).filter(Boolean).slice(0, 5)
+      }
       if (confirmNote) {
         work.confirmNote = confirmNote
         work.confirmNeeded = Boolean(confirmNeeded)
@@ -1196,10 +1208,48 @@ export const useAppStore = defineStore('app', {
         slot: slot || 'gen'
       }).catch(() => null)
     },
+    promptFitsProduct(text, product) {
+      const body = String(text || '')
+      if (!body.trim()) return false
+      if (/\{\{title\}\}|商品标题/.test(body)) return true
+      const title = String(product?.title || '').trim()
+      const others = this.products.filter((item) => item.id !== product?.id && String(item.title || '').trim().length >= 4 && body.includes(item.title))
+      if (others.length) return false
+      if (title && body.includes(title)) return true
+      return !title
+    },
+    promptForProduct(form, product) {
+      const shared = String(form?.promptText || '').trim()
+      if (shared && this.promptFitsProduct(shared, product)) return composePrompt(form, product)
+      const own = String(product?.filledPrompt || '').trim()
+      if (own && this.promptFitsProduct(own, product)) return own
+      const template = String(this.settings.promptText || '').trim()
+      if (template && template !== shared && this.promptFitsProduct(template, product)) {
+        return composePrompt({ ...form, promptText: template }, product)
+      }
+      const rebuilt = composePrompt({
+        ...form,
+        promptText: '',
+        lockText: form?.lockText || this.settings.productLock,
+        storyline: form?.storyline || this.settings.storyline,
+        caption: form?.caption || this.settings.caption,
+        script: form?.script || this.settings.oral,
+        compliance: form?.compliance || this.settings.compliance
+      }, product)
+      if (String(rebuilt || '').trim()) return rebuilt
+      return composePrompt({
+        promptText: '围绕商品「商品标题」生成一条 9:16 抖音带货视频。只按上传的这件商品原图实拍口播，不要换成其他商品。直接生成视频。',
+        duration: form?.duration,
+        ratio: form?.ratio || '9:16',
+        model: form?.model
+      }, product)
+    },
     productShots(work) {
       const product = this.products.find((item) => item.id === work?.productId)
       const removed = new Set(product?.removedImages || [])
-      return [...new Set([...(product?.images || []), product?.image, ...(work?.images || []), work?.image]
+      const locked = [...(work?.images || []), work?.image].map((item) => String(item || '').trim()).filter(Boolean)
+      const pool = locked.length ? locked : [...(product?.images || []), product?.image]
+      return [...new Set(pool
         .map((item) => {
           const text = String(item || '').trim()
           if (!text || removed.has(text) || text.startsWith('blob:') || text.startsWith('data:')) return ''
@@ -1252,17 +1302,20 @@ export const useAppStore = defineStore('app', {
       upgradePromptSettings(this.settings)
       const template = (this.settings.promptTemplates || []).find((item) => item.id === this.settings.activePromptTemplateId)
         || (this.settings.promptTemplates || [])[0]
-      const prompt = composePrompt({
-        promptText: work.prompt || product?.filledPrompt || template?.promptText || this.settings.promptText || '',
-        model: work.model || template?.model || this.settings.model,
-        duration: work.duration || template?.duration || this.settings.duration,
-        ratio: work.ratio || template?.ratio || this.settings.ratio,
-        lockText: work.lockText,
-        storyline: work.storyline,
-        caption: work.caption,
-        script: work.script,
-        compliance: work.compliance
-      }, product || { title: work.title, category: '', price: '', shop: '' })
+      const storedPrompt = work.prompt || product?.filledPrompt || template?.promptText || this.settings.promptText || ''
+      const prompt = product && this.promptFitsProduct(storedPrompt, product)
+        ? storedPrompt
+        : this.promptForProduct({
+          promptText: template?.promptText || this.settings.promptText || '',
+          model: work.model || template?.model || this.settings.model,
+          duration: work.duration || template?.duration || this.settings.duration,
+          ratio: work.ratio || template?.ratio || this.settings.ratio,
+          lockText: work.lockText,
+          storyline: work.storyline,
+          caption: work.caption,
+          script: work.script,
+          compliance: work.compliance
+        }, product || { title: work.title })
       if (!String(prompt || '').trim()) {
         this.addLog('error', '豆包', `「${work.title}」没有提示词，重新生成已取消`)
         return '这条商品还没有提示词。先在设置或确认框里写好提示词'
@@ -1351,23 +1404,20 @@ export const useAppStore = defineStore('app', {
       }
       const today = String(this.systemNow || formatTime(new Date())).slice(0, 10)
       const accounts = this.doubaoAccounts.filter((item) => {
-        if (!item.enabled || item.quotaDate === today || skipped.includes(item.id) || busyDoubao.has(item.id)) return false
+        if (!item.enabled || item.quotaDate === today || skipped.includes(item.id)) return false
         return doubaoQuotaUsed(this.works, item, today) < quotaLimit(item)
+      }).sort((a, b) => {
+        const load = (id) => this.works.filter((row) => row.doubaoAccountId === id && row.quotaPending && row.status === '生成中').length
+        return load(a.id) - load(b.id)
       })
       const account = accounts.find((item) => item.loginStatus === '已登录') || accounts[0]
       if (!account) {
-        const waiting = this.doubaoAccounts.some((item) => item.enabled && busyDoubao.has(item.id))
-        if (waiting && !skipped.length) {
-          await new Promise((resolve) => setTimeout(resolve, 1200))
-          return this.runDoubao(workId, skipped)
-        }
         work.status = '待生成'
         work.failReason = skipped.length ? '豆包账号额度都不够，生成已停' : '先添加并登录一个豆包账号'
         this.addLog('warning', '豆包', work.failReason)
         this.persist()
         return
       }
-      busyDoubao.add(account.id)
       work.status = '生成中'
       work.progress = 10
       work.duration = Number(work.duration) || ''
@@ -1393,21 +1443,20 @@ export const useAppStore = defineStore('app', {
         this.addLog(result.confirmNeeded && !result.confirmSent ? 'warning' : 'info', '豆包', `${account.name} ${result.confirmNote}`)
       }
       const product = this.products.find((item) => item.id === work.productId)
-      const prompt = [
-        work.prompt
-          || product?.filledPrompt
-          || composePrompt({
-            promptText: this.settings.promptText,
-            lockText: work.lockText,
-            storyline: work.storyline,
-            caption: work.caption,
-            script: work.script,
-            compliance: work.compliance,
-            duration: work.duration,
-            ratio: work.ratio,
-            model: work.model
-          }, product || { title: work.title })
-      ].filter(Boolean).join('\n\n')
+      const storedPrompt = work.prompt || product?.filledPrompt || ''
+      const prompt = product && this.promptFitsProduct(storedPrompt, product)
+        ? storedPrompt
+        : this.promptForProduct({
+          promptText: this.settings.promptText,
+          lockText: work.lockText,
+          storyline: work.storyline,
+          caption: work.caption,
+          script: work.script,
+          compliance: work.compliance,
+          duration: work.duration,
+          ratio: work.ratio,
+          model: work.model
+        }, product || { title: work.title })
       if (prompt && !work.prompt) work.prompt = prompt
       if (!window.tujian?.generateDoubao) {
         work.status = '生成失败'
@@ -1439,6 +1488,10 @@ export const useAppStore = defineStore('app', {
       }
       work.images = shots
       work.image = shots[0]
+      if (!work.no) work.no = this.nextWorkNo()
+      const sourceCopy = this.sourceCopy(work)
+      work.sourceTitle = sourceCopy.title
+      work.sourceTags = sourceCopy.tags
       const slot = work.doubaoSlot || `gen-${work.id}`
       work.doubaoSlot = slot
       work.quotaPending = true
@@ -1461,7 +1514,10 @@ export const useAppStore = defineStore('app', {
         retryMarkers: {
           copyright: (this.settings.doubaoFail?.retryCopyright || []).filter((item) => item.enabled !== false && item.match).map((item) => item.match),
           busy: (this.settings.doubaoFail?.retryBusy || []).filter((item) => item.enabled !== false && item.match).map((item) => item.match)
-        }
+        },
+        copyNo: work.no,
+        copyTitle: sourceCopy.title,
+        copyTags: sourceCopy.tags
       })
       let result
       try {
@@ -1484,6 +1540,8 @@ export const useAppStore = defineStore('app', {
         return
       }
       if (result?.loginStatus) account.loginStatus = result.loginStatus
+      if (result?.optimizedTitle) work.optimizedTitle = result.optimizedTitle
+      if (Array.isArray(result?.optimizedTags) && result.optimizedTags.length) work.optimizedTags = result.optimizedTags
       markConfirm(result)
       if (result?.quota) {
         work.quotaPending = false
@@ -1514,6 +1572,17 @@ export const useAppStore = defineStore('app', {
           chatUrl = pulled.doubaoChatUrl || chatUrl
           clean = true
         }
+      }
+      if (chatUrl) work.doubaoChatUrl = chatUrl
+      if (/关掉|被关/.test(String(result?.message || ''))) {
+        work.status = '生成中'
+        work.quotaPending = true
+        work.failReason = '软件或窗口关掉了，重新打开后会接着原来的生成，不会重发'
+        account.worker = '生成中'
+        this.endTask(taskId, work.failReason)
+        this.addLog('info', '豆包', `「${work.title}」${work.failReason}`)
+        this.persist()
+        return
       }
       if (videoPath) {
         work.videoPath = videoPath
@@ -1553,7 +1622,8 @@ export const useAppStore = defineStore('app', {
         this.persist()
       } finally {
         busyDoubao.delete(account.id)
-        if (account.worker === '生成中') account.worker = '空闲'
+        const still = this.works.some((item) => item.id !== work.id && item.doubaoAccountId === account.id && item.quotaPending && item.status === '生成中')
+        if (!still && account.worker === '生成中') account.worker = '空闲'
         const task = this.runtimeTasks.find((item) => item.id === taskId)
         if (task?.status === 'running') this.endTask(taskId, '已结束')
       }
@@ -1571,6 +1641,7 @@ export const useAppStore = defineStore('app', {
         const work = {
           id: uid('W'),
           productId: product?.id || '',
+          no: this.nextWorkNo(),
           title: product?.title || '未命名带货视频',
           hue: product?.hue ?? 210,
           status: '生成中',
@@ -1587,9 +1658,7 @@ export const useAppStore = defineStore('app', {
           image: images[0] || '',
           images,
           // 确认框里的提示词优先；否则用选品库已生成的 filledPrompt
-          prompt: String(form?.promptText || '').trim()
-            ? composePrompt(form, product)
-            : (String(product?.filledPrompt || '').trim() || composePrompt(form, product)),
+          prompt: this.promptForProduct(form, product),
           kind: form.kind || 'AI',
           doubaoAccount: '',
           failReason: '',
@@ -1616,6 +1685,7 @@ export const useAppStore = defineStore('app', {
         if (!String(work.prompt || '').trim()) {
           work.status = '生成失败'
           work.failReason = '提示词是空的。提示词和图片必须一起发'
+          this.addLog('warning', '豆包', `「${work.title}」${work.failReason}`)
           return
         }
         if (!(work.images || []).length && !work.image) {

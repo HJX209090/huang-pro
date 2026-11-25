@@ -2,7 +2,7 @@
   <div class="page">
     <div class="page-head">
       <div>
-        <h1>剪辑中心 · 选品车</h1>
+        <h1>豆包管理 · 选品车</h1>
         <p>请先用采集账号登录后再把选品车交给豆包。账号被限制或封停不可操作。同一账号每 5 秒内只开一个窗口。</p>
       </div>
     </div>
@@ -47,16 +47,12 @@
     </div>
 
     <el-dialog v-model="visible" :title="form.id ? '编辑采集账号' : '新建采集账号'" width="460px">
+      <p class="muted">只填写用户名。保存后打开一个达人工作台窗口，扫码登录。</p>
       <el-form label-width="88px">
-        <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>
+        <el-form-item label="用户名"><el-input v-model="form.name" placeholder="账号名称" /></el-form-item>
         <el-form-item label="分组">
           <el-select v-model="form.group" style="width: 100%">
             <el-option v-for="item in store.groups" :key="item" :label="item" :value="item" />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="发布账号">
-          <el-select v-model="form.publishAccount" style="width: 100%">
-            <el-option v-for="item in store.publishAccounts" :key="item.id" :label="item.name" :value="item.name" />
           </el-select>
         </el-form-item>
       </el-form>
@@ -214,44 +210,24 @@ function publishOf(account) {
 }
 
 async function openCart(account) {
-  const publish = publishOf(account)
-  if (!publish) return ElMessage.warning('先给这个采集账号选择一个发布账号')
-  if (!window.tujian?.openAccount) return ElMessage.warning('请在桌面窗口里打开选品页')
-  const result = await window.tujian.openAccount({
-    kind: 'publish',
-    id: publish.id,
-    name: publish.name,
-    login: publish.login,
-    mode: publish.loginMode || 'password',
-    url: 'https://buyin.jinritemai.com/dashboard/merch-picking-library'
+  if (!window.tujian?.bootstrapPublishLogin) return ElMessage.warning('请在桌面窗口里打开选品页')
+  const result = await window.tujian.bootstrapPublishLogin({
+    id: account.id,
+    name: account.name,
+    login: '',
+    mode: 'qr',
+    scope: 'buyin'
   })
-  if (result?.loginStatus) {
-    publish.loginStatus = result.loginStatus
-    account.loginStatus = result.loginStatus
-    store.persist()
-  }
-  ElMessage.success(result?.message || '选品页已打开。登录并加入商品后，点同步选品库。')
+  account.loginStatus = result?.buyinLoginStatus || result?.loginStatus || account.loginStatus
+  store.persist()
+  ElMessage.success(result?.message || '达人工作台已打开，扫码后点同步选品库。')
 }
 
 async function collectNext(account) {
   if (!account.enabled) return ElMessage.warning('这个采集账号没有启用')
-  const publish = publishOf(account)
-  if (!publish) return ElMessage.warning('先给这个采集账号选择一个发布账号')
   if (!window.tujian?.openAccount) return ElMessage.warning('请在桌面窗口里同步选品')
-  const opened = await window.tujian.openAccount({
-    kind: 'publish',
-    id: publish.id,
-    name: publish.name,
-    login: publish.login,
-    mode: publish.loginMode || 'password',
-    url: 'https://buyin.jinritemai.com/dashboard/merch-picking-cart'
-  })
-  if (opened?.loginStatus) {
-    publish.loginStatus = opened.loginStatus
-    account.loginStatus = opened.loginStatus
-  }
   try {
-    const result = await store.syncCatalog('products', publish.id)
+    const result = await store.syncCatalog('products', account.id)
     account.lastCollect = formatTime(new Date())
     store.persist()
     const count = result?.count || 0
@@ -264,30 +240,35 @@ async function collectNext(account) {
 }
 
 function edit(row) {
+  store.addGroup('默认分组')
   if (row) Object.assign(form, row)
-  else Object.assign(form, { id: '', name: '', group: store.groups[0] || '默认分组', publishAccount: store.publishAccounts[0]?.name || '' })
+  else Object.assign(form, { id: '', name: '', group: '默认分组', publishAccount: '' })
   visible.value = true
 }
 
-function save() {
-  if (!form.name.trim()) return ElMessage.warning('填写账号名称')
+async function save() {
+  if (!form.name.trim()) return ElMessage.warning('填写用户名')
+  let row = null
   if (form.id) {
-    const target = store.collectAccounts.find((item) => item.id === form.id)
-    if (target) Object.assign(target, { name: form.name, group: form.group, publishAccount: form.publishAccount })
+    row = store.collectAccounts.find((item) => item.id === form.id)
+    if (row) Object.assign(row, { name: form.name.trim(), group: form.group, loginMode: 'qr' })
   } else {
-    store.collectAccounts.unshift({
+    row = {
       id: uid('CA'),
-      name: form.name,
+      name: form.name.trim(),
       group: form.group,
-      publishAccount: form.publishAccount,
+      publishAccount: '',
       enabled: true,
-      loginStatus: '未检测',
+      loginStatus: '待登录',
+      loginMode: 'qr',
       lastCollect: '-',
       createdAt: formatTime(new Date())
-    })
+    }
+    store.collectAccounts.unshift(row)
   }
   store.persist()
   visible.value = false
+  if (row && !form.id) await openCart(row)
 }
 
 async function remove(row) {

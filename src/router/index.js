@@ -9,7 +9,7 @@ const routes = [
   { path: '/workbench', component: () => import('@/views/Workbench.vue') },
   { path: '/plaza', component: () => import('@/views/Plaza.vue') },
   { path: '/products', component: () => import('@/views/Products.vue') },
-  { path: '/digital', component: () => import('@/views/DigitalHuman.vue') },
+  { path: '/digital', redirect: '/doubao' },
   { path: '/doubao', component: () => import('@/views/Doubao.vue') },
   { path: '/publish', component: () => import('@/views/Publish.vue') },
   { path: '/rpa', component: () => import('@/views/Rpa.vue') },

@@ -11,14 +11,14 @@
         :class="{ on: work.id === currentId }"
         @click="router.replace({ path: '/workbench', query: { id: work.id } })"
       >
-        <div class="goods-title">{{ work.title }}</div>
-        <div class="goods-sub">{{ displayWorkStatus(work.status) }} · {{ work.model || '未填模型' }}</div>
+        <div class="goods-title">{{ work.no ? `编号${work.no} ` : '' }}{{ work.title }}</div>
+        <div class="goods-sub"><span class="q-status" :class="queueTone(work)">{{ queueLabel(work) }}</span> · {{ displayWorkStatus(work.status) }}</div>
       </button>
     </section>
 
     <section class="stage">
       <div class="player-frame">
-        <video v-if="current?.videoPath" ref="player" :src="videoUrl(current.videoPath)" @click="playCurrent"></video>
+        <video v-if="current?.videoPath" :key="current.videoPath" ref="player" :src="videoUrl(current.videoPath)" preload="auto" playsinline @click="playCurrent"></video>
         <p v-else>暂无待审核任务，请等待新任务</p>
         <p v-if="captionOn && current?.script" class="caption-line">{{ current.script }}</p>
       </div>
@@ -31,7 +31,7 @@
       </div>
     </section>
 
-    <section class="panel" style="overflow: auto">
+    <section class="panel review-side" style="overflow: auto">
       <h1 style="font-size: 16px; margin: 0 0 8px">{{ current ? displayWorkStatus(current.status) : '等待任务' }}</h1>
       <p v-if="current" class="goods-title">{{ current.title }}</p>
       <p v-if="feedback" class="review-note">{{ feedback }}</p>
@@ -82,6 +82,9 @@
         </div>
       </template>
     </section>
+    <div v-if="shotUrls.length" class="filmstrip">
+      <img v-for="(src, index) in shotUrls" :key="`${src}-${index}`" :src="src" alt="" />
+    </div>
   </div>
 </template>
 
@@ -90,7 +93,7 @@ import { computed, onDeactivated, onMounted, onUnmounted, ref, watch } from 'vue
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAppStore } from '@/stores/app'
-import { displayWorkStatus, publishTitleFromGoods, topicsFromGoods, videoUrl } from '@/utils/format'
+import { displayWorkStatus, imageUrl, publishTitleFromGoods, topicsFromGoods, videoUrl } from '@/utils/format'
 import AppIcon from '@/components/AppIcon.vue'
 
 const store = useAppStore()
@@ -116,8 +119,13 @@ const currentProduct = computed(() => {
     || store.plaza.find((row) => row.id === work.productId)
     || null
 })
-const previewPublishTitle = computed(() => publishTitleFromGoods(current.value?.title, currentProduct.value || { title: current.value?.title }))
-const previewTopics = computed(() => topicsFromGoods(current.value?.title, currentProduct.value || { title: current.value?.title }))
+const previewPublishTitle = computed(() => current.value?.optimizedTitle || publishTitleFromGoods(current.value?.title, currentProduct.value || { title: current.value?.title }))
+const previewTopics = computed(() => (current.value?.optimizedTags?.length ? current.value.optimizedTags : topicsFromGoods(current.value?.title, currentProduct.value || { title: current.value?.title })))
+const shotUrls = computed(() => {
+  const work = current.value
+  if (!work) return []
+  return store.productShots(work).map((item) => imageUrl(item)).filter(Boolean)
+})
 const accountId = ref('')
 const player = ref(null)
 const reason = ref('')
@@ -147,6 +155,19 @@ watch(current, (work) => {
   const logged = store.publishAccounts.find((item) => item.loginStatus === '已登录')
   accountId.value = saved?.id || logged?.id || store.publishAccounts[0]?.id || ''
 }, { immediate: true })
+
+function queueLabel(work) {
+  if (work.id === currentId.value) return '正在查看'
+  if (['审核通过', '已发布', '发布中'].includes(work.status)) return '已审核'
+  return '未审核'
+}
+
+function queueTone(work) {
+  const label = queueLabel(work)
+  if (label === '正在查看') return 'viewing'
+  if (label === '已审核') return 'done'
+  return 'pending'
+}
 
 function stepState(step) {
   const work = current.value
@@ -397,10 +418,22 @@ function waitTask() {
 </script>
 
 <style scoped>
-.review-bench { grid-template-columns: 220px minmax(0, 1fr) 280px; background: transparent; }
-.queue-pane { background: #fff; }
-.stage { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; }
-.player-frame { width: min(420px, 100%); aspect-ratio: 9 / 16; background: #111; color: #fff; border-radius: 28px; display: grid; place-items: center; position: relative; overflow: hidden; }
+.review-bench {
+  height: calc(100dvh - 88px);
+  min-height: 0;
+  grid-template-columns: minmax(150px, 18%) minmax(240px, 1fr) minmax(200px, 26%);
+  grid-template-rows: minmax(0, 1fr) auto;
+  background: transparent;
+}
+.queue-pane { background: #fff; overflow: auto; }
+.stage { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; min-width: 0; min-height: 0; }
+.player-frame { width: min(360px, 100%); max-height: calc(100dvh - 280px); aspect-ratio: 9 / 16; background: #111; color: #fff; border-radius: 28px; display: grid; place-items: center; position: relative; overflow: hidden; }
+.filmstrip { grid-column: 1 / -1; display: flex; gap: 8px; overflow-x: auto; padding: 8px; background: #fff; border: 1px solid var(--tj-line); border-radius: 12px; }
+.filmstrip img { width: 72px; height: 96px; object-fit: cover; border-radius: 8px; background: #111; flex: none; }
+.q-status { display: inline-block; padding: 0 6px; border-radius: 999px; font-size: 12px; }
+.q-status.viewing { background: #e8f0ff; color: #2f5bff; }
+.q-status.done { background: #e8f8ef; color: #067647; }
+.q-status.pending { background: #fff4e8; color: #d46b08; }
 .player-frame video { width: 100%; height: 100%; object-fit: contain; background: #000; }
 .caption-line { position: absolute; left: 16px; right: 16px; bottom: 28px; text-align: center; font-size: 14px; }
 .stage-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: center; }
@@ -409,4 +442,8 @@ function waitTask() {
 .review-actions { display: flex; gap: 8px; margin: 8px 0; }
 .review-actions .el-button { flex: 1; }
 .review-note { margin: 0 0 8px; color: #7c5cfc; }
+@media (max-width: 1100px) {
+  .review-bench { grid-template-columns: 1fr; grid-template-rows: auto; height: auto; }
+  .player-frame { max-height: 70dvh; }
+}
 </style>

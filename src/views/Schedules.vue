@@ -27,7 +27,9 @@
           <el-table-column label="触发时间" width="160">
             <template #default="{ row }">{{ triggerLabel(row) }}</template>
           </el-table-column>
-          <el-table-column prop="account" label="发布账号" width="140" />
+          <el-table-column label="发布账号" min-width="160">
+            <template #default="{ row }">{{ accountLabel(row) }}</template>
+          </el-table-column>
           <el-table-column label="状态" width="80">
             <template #default="{ row }"><el-switch v-model="row.enabled" @change="onToggle(row)" /></template>
           </el-table-column>
@@ -66,15 +68,15 @@
           <p class="muted">到点后打开这个账号的抖音上传页，写入作品标题和按标题生成的 5 个标签，并点击发布。</p>
           <el-button @click="router.push('/rpa')">管理本机流程</el-button>
           <h3>3. 选择发布账号</h3>
-          <el-select v-model="form.account" clearable placeholder="全部账号" style="width: 100%" @visible-change="(open) => open && syncAccountStatus()">
+          <el-select v-model="form.accounts" multiple collapse-tags clearable placeholder="不选则用全部已启用账号" style="width: 100%" @visible-change="(open) => open && syncAccountStatus()">
             <el-option
               v-for="item in store.publishAccounts"
               :key="item.id"
-              :label="`${item.name}（${item.loginStatus || '未检测'}）`"
-              :value="item.name"
+              :label="`${item.name}（${item.creatorLoginStatus || '未检测'}）`"
+              :value="item.id"
             />
           </el-select>
-          <p class="muted">定时与发布共用同一浏览器会话。请先在「发布账号」里同窗口登录百应+创作者；登录后定时不会反复刷页。</p>
+          <p class="muted">可以多选。例如勾选 A、B、C，到点就只用这三个创作者账号发布。</p>
         </template>
         <template v-else>
           <h3>2. 任务说明</h3>
@@ -129,6 +131,7 @@ const form = reactive({
   time: '13:00',
   intervalMinutes: 30,
   account: '',
+  accounts: [],
   enabled: true,
   builtin: false,
   desc: ''
@@ -144,6 +147,24 @@ const drawerTitle = computed(() => {
   if (!form.id) return '新建任务组'
   return form.builtin ? '编辑系统内置任务' : '编辑任务组'
 })
+
+function accountName(idOrName) {
+  const found = store.publishAccounts.find((item) => item.id === idOrName || item.name === idOrName)
+  return found?.name || idOrName
+}
+
+function accountIds(row) {
+  const raw = Array.isArray(row?.accounts) && row.accounts.length
+    ? row.accounts
+    : (row?.account ? String(row.account).split(/[、,，]/).map((item) => item.trim()).filter(Boolean) : [])
+  return raw.map((item) => store.publishAccounts.find((account) => account.id === item || account.name === item)?.id || item)
+}
+
+function accountLabel(row) {
+  const ids = accountIds(row)
+  if (!ids.length) return '全部账号'
+  return ids.map((item) => accountName(item)).join('、')
+}
 
 function triggerLabel(row) {
   if (row.mode === '循环') return `每 ${row.intervalMinutes || 30} 分钟`
@@ -166,6 +187,7 @@ function edit(row, preset) {
       builtin: false,
       desc: '',
       ...row,
+      accounts: accountIds(row),
       builtin: isBuiltinSchedule(row)
     })
   } else {
@@ -178,6 +200,7 @@ function edit(row, preset) {
       time: '13:00',
       intervalMinutes: 30,
       account: '',
+      accounts: [],
       enabled: true,
       builtin: false,
       desc: ''
@@ -196,7 +219,8 @@ function save() {
     date: form.mode === '单次' ? (form.date || '') : '',
     time: form.mode === '循环' ? '' : form.time,
     intervalMinutes: form.mode === '循环' ? Math.max(5, Number(form.intervalMinutes) || 30) : 0,
-    account: form.account || '',
+    account: (form.accounts || []).map((item) => accountName(item)).join('、'),
+    accounts: [...(form.accounts || [])],
     enabled: form.enabled !== false,
     desc: form.desc || ''
   }
@@ -222,7 +246,9 @@ async function syncAccountStatus() {
   for (const account of store.publishAccounts) {
     try {
       const st = await window.tujian.accountStatus({ kind: 'publish', id: account.id })
-      if (st?.loginStatus) account.loginStatus = st.loginStatus
+      account.creatorLoginStatus = st?.creatorLoginStatus || '待登录'
+      account.buyinLoginStatus = st?.buyinLoginStatus || account.buyinLoginStatus || '待登录'
+      account.loginStatus = account.creatorLoginStatus
     } catch { /* ignore */ }
   }
   store.persist()

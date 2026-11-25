@@ -3,6 +3,7 @@ const netSocket = require('net')
 const fs = require('fs')
 const path = require('path')
 const { pathToFileURL } = require('url')
+const { Readable } = require('stream')
 const store = require('./services/store.cjs')
 const secrets = require('./services/secrets.cjs')
 const taskRunner = require('./services/taskRunner.cjs')
@@ -35,6 +36,11 @@ try {
 
 function loadAppPage(win) {
   if (!win || win.isDestroyed()) return
+  const reveal = () => {
+    if (!win.isDestroyed() && !win.isVisible()) win.show()
+  }
+  win.webContents.once('did-finish-load', reveal)
+  setTimeout(reveal, 2500)
   if (isDev) win.loadURL('http://127.0.0.1:5173')
   else win.loadFile(path.join(__dirname, '../dist/index.html'))
 }
@@ -61,7 +67,9 @@ function createWindow(size = {}) {
   })
 
   win.once('ready-to-show', () => {
-    if (!win.isDestroyed()) win.show()
+    if (win.isDestroyed()) return
+    const url = String(win.webContents.getURL() || '')
+    if (/127\.0\.0\.1:5173|index\.html/i.test(url)) win.show()
   })
 
   // 渲染进程崩溃/白屏时自动重载，避免整窗空白
@@ -114,8 +122,31 @@ app.whenReady().then(() => {
   })
   protocol.handle('local-video', (request) => {
     const filePath = new URL(request.url).searchParams.get('path')
-    if (!filePath) return new Response('missing', { status: 400 })
-    return net.fetch(pathToFileURL(filePath).toString())
+    if (!filePath || !fs.existsSync(filePath)) return new Response('missing', { status: 404 })
+    const stat = fs.statSync(filePath)
+    const size = stat.size
+    const type = /\.webm$/i.test(filePath) ? 'video/webm' : /\.mov$/i.test(filePath) ? 'video/quicktime' : 'video/mp4'
+    const range = request.headers.get('range')
+    const match = range && /bytes=(\d*)-(\d*)/.exec(range)
+    let start = 0
+    let end = size - 1
+    if (match) {
+      if (match[1] !== '') start = Math.min(size - 1, Number(match[1]) || 0)
+      if (match[2] !== '') end = Math.min(size - 1, Number(match[2]))
+      if (match[1] === '' && match[2] !== '') {
+        start = Math.max(0, size - Number(match[2]))
+        end = size - 1
+      }
+    }
+    if (end < start) end = start
+    const stream = fs.createReadStream(filePath, { start, end })
+    const headers = {
+      'Accept-Ranges': 'bytes',
+      'Content-Type': type,
+      'Content-Length': String(end - start + 1)
+    }
+    if (match) headers['Content-Range'] = `bytes ${start}-${end}/${size}`
+    return new Response(Readable.toWeb(stream), { status: match ? 206 : 200, headers })
   })
   Menu.setApplicationMenu(null)
   const userData = app.getPath('userData')

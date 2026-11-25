@@ -48,15 +48,15 @@
       </div>
       <div v-if="!filtered.length" class="empty-works">
         <p>「{{ store.settings.model || '全部模型' }} · {{ status }}」下暂无作品</p>
-        <p class="muted">可切换上方状态筛选，或去剪辑中心生成新成片</p>
-        <el-button type="primary" @click="router.push('/doubao')">去剪辑中心</el-button>
+        <p class="muted">可切换上方状态筛选，或去豆包管理生成新成片</p>
+        <el-button type="primary" @click="router.push('/doubao')">去豆包管理</el-button>
       </div>
       <el-table v-else-if="viewMode === 'list'" :data="pageRows" @selection-change="onTableSelect">
         <el-table-column type="selection" width="42" />
         <el-table-column label="标题" min-width="240">
           <template #default="{ row }">
-            <div class="list-title">{{ row.title }}</div>
-            <div class="goods-sub">{{ row.platform || '抖音' }} · {{ row.model || '未设置模型' }}</div>
+            <div class="list-title">{{ row.no ? `编号${row.no} ` : '' }}{{ row.title }}</div>
+            <div class="goods-sub">{{ row.optimizedTitle ? `发布标题：${row.optimizedTitle}` : (row.platform || '抖音') }} · {{ row.model || '未设置模型' }}</div>
           </template>
         </el-table-column>
         <el-table-column label="状态" width="110">
@@ -66,6 +66,8 @@
         <el-table-column label="操作" width="220" fixed="right">
           <template #default="{ row }">
             <div class="row-ops">
+              <el-button v-if="row.videoPath" link type="primary" @click="playWork(row)">播放</el-button>
+              <el-button v-if="row.doubaoChatUrl" link type="primary" @click="openDoubao(row)">生成页</el-button>
               <el-button v-if="canReview(row)" link type="primary" @click="open(row)">审核</el-button>
               <el-button v-if="canRepublish(row)" link type="primary" :loading="publishId === row.id" @click="republish(row)">再发布</el-button>
               <el-button v-if="canRegenerate(row)" link type="primary" :loading="regenId === row.id" @click="regenerate(row)">重新生成</el-button>
@@ -80,7 +82,8 @@
           <div class="work-cover" :class="{ generating: !work.videoPath && work.status === '生成中' }">
             <el-checkbox class="work-pick" :model-value="selected.includes(work.id)" @click.stop @change="toggle(work.id)" />
             <el-tag class="badge" size="small" :type="statusType(work.status)">{{ displayWorkStatus(work.status) }}</el-tag>
-            <video v-if="work.videoPath" class="work-cover" :src="videoUrl(work.videoPath)" muted></video>
+            <video v-if="work.videoPath" class="work-cover" :src="videoUrl(work.videoPath)" muted preload="metadata" @click.stop="playWork(work)"></video>
+            <button v-if="work.videoPath" type="button" class="play-btn" @click.stop="playWork(work)">播放</button>
             <div v-else-if="work.status === '生成中'" class="gen-motion">
               <i class="gen-spin"></i>
               <div class="gen-walk"><i></i></div>
@@ -88,13 +91,14 @@
             <span v-else class="cover-empty">{{ work.status === '生成失败' ? '生成失败' : '暂无成片' }}</span>
           </div>
           <div class="work-body">
-            <div class="goods-title">{{ work.title }}</div>
-            <div class="goods-sub">{{ work.platform || '抖音' }} · {{ work.createdAt }}</div>
+            <div class="goods-title">{{ work.no ? `编号${work.no} ` : '' }}{{ work.title }}</div>
+            <div class="goods-sub">{{ work.optimizedTitle ? `发布标题：${work.optimizedTitle}` : (work.platform || '抖音') }} · {{ work.createdAt }}</div>
             <div v-if="work.failReason" class="fail-line">{{ work.failReason }}</div>
             <div class="work-actions" @click.stop>
               <el-button v-if="canRepublish(work)" size="small" type="primary" :loading="publishId === work.id" @click="republish(work)">再发布</el-button>
               <el-button v-if="canRegenerate(work)" size="small" type="primary" :loading="regenId === work.id" @click="regenerate(work)">重新生成</el-button>
               <el-button v-if="canReview(work)" size="small" @click="open(work)">审核</el-button>
+              <el-button v-if="work.doubaoChatUrl" size="small" @click="openDoubao(work)">生成页</el-button>
             </div>
           </div>
         </article>
@@ -110,6 +114,9 @@
         />
       </div>
     </div>
+    <el-dialog v-model="playerOpen" :title="playerTitle || '播放'" width="420px" align-center destroy-on-close @closed="playerSrc = ''">
+      <video v-if="playerSrc" class="player-dialog" :src="playerSrc" controls autoplay preload="auto"></video>
+    </el-dialog>
   </div>
 </template>
 
@@ -132,6 +139,33 @@ const selected = ref([])
 const viewMode = ref('card')
 const page = ref(1)
 const pageSize = ref(12)
+const playerOpen = ref(false)
+const playerSrc = ref('')
+const playerTitle = ref('')
+
+async function openDoubao(work) {
+  const account = store.doubaoAccounts.find((item) => item.id === work.doubaoAccountId) || store.doubaoAccounts[0]
+  if (!account || !work.doubaoChatUrl) return ElMessage.warning('这条还没有豆包生成页')
+  if (!window.tujian?.openAccount) return ElMessage.warning('请在桌面窗口里打开')
+  await window.tujian.openAccount({
+    kind: 'doubao',
+    id: account.id,
+    name: account.name,
+    login: '',
+    mode: 'qr',
+    url: work.doubaoChatUrl,
+    slot: work.doubaoSlot || `gen-${work.id}`,
+    already: account.loginStatus === '已登录'
+  })
+  ElMessage.success(`已打开编号 ${work.no || ''} 的生成页`)
+}
+
+function playWork(work) {
+  if (!work?.videoPath) return
+  playerTitle.value = work.title || '播放'
+  playerSrc.value = videoUrl(work.videoPath)
+  playerOpen.value = true
+}
 
 function matchStatus(work) {
   if (status.value === '全部') return true
@@ -368,6 +402,20 @@ async function removeSelected() {
   object-fit: cover;
 }
 .work-pick { position: absolute; left: 6px; top: 6px; z-index: 2; }
+.play-btn {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 2;
+  border: 0;
+  border-radius: 999px;
+  padding: 6px 12px;
+  background: rgba(0, 0, 0, .55);
+  color: #fff;
+  cursor: pointer;
+}
+.player-dialog { width: 100%; max-height: 72vh; background: #000; border-radius: 12px; }
 .badge { position: absolute; right: 6px; top: 6px; z-index: 2; }
 .cover-empty { color: #d0d5dd; font-size: 12px; font-weight: 600; }
 .work-body { display: flex; flex-direction: column; gap: 4px; flex: 1; padding: 8px 9px 10px; }

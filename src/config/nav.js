@@ -10,11 +10,10 @@ export const navGroups = [
     ]
   },
   {
-    label: '剪辑中心',
+    label: '豆包管理',
     items: [
-      { path: '/doubao', title: '剪辑中心', icon: 'chat' },
-      { path: '/products', title: '选品库', icon: 'box' },
-      { path: '/digital', title: '数字人账号', icon: 'user' }
+      { path: '/doubao', title: '豆包管理', icon: 'chat' },
+      { path: '/products', title: '选品库', icon: 'box' }
     ]
   },
   {

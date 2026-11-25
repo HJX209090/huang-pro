@@ -76,6 +76,31 @@ function bringToFront(win) {
   }, 500)
 }
 
+/** 网页里的 window.open 一律留在当前窗口，避免越点越多浏览器 */
+function bindSameWindow(win) {
+  if (!win || win.isDestroyed() || win.__boundOpen) return
+  win.__boundOpen = true
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    const next = String(url || '')
+    if (/^https?:/i.test(next)) {
+      const current = String(win.webContents.getURL() || '')
+      if (current !== next) win.loadURL(next).catch(() => {})
+    }
+    return { action: 'deny' }
+  })
+}
+
+/** 生成中点关闭只隐藏，页面继续跑 */
+function pinHideOnClose(win) {
+  if (!win || win.isDestroyed() || win.__pinned) return
+  win.__pinned = true
+  win.on('close', (event) => {
+    if (win.__allowDestroy) return
+    event.preventDefault()
+    try { win.hide() } catch { /* 已关 */ }
+  })
+}
+
 function samePage(current, target) {
   try {
     const left = new URL(current)
@@ -876,6 +901,7 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
     }
   }
   if (existing && !existing.isDestroyed() && !force) {
+    bindSameWindow(existing)
     if (kind === 'doubao') attachDoubaoPromoGuard(existing)
     if (!quiet) bringToFront(existing)
     let cookies = await existing.webContents.session.cookies.get({})
@@ -953,6 +979,7 @@ async function openAccountNow({ kind, id, name, mode, login, force, skipSend, al
     }
   })
   windows.set(key, win)
+  bindSameWindow(win)
   if (kind === 'doubao') attachDoubaoPromoGuard(win)
   if (quiet) hardenSilentWindow(win)
   if (!quiet) {
@@ -1114,21 +1141,20 @@ async function requestCode({ kind, id, name, login, captcha }) {
   }
 }
 
-/** 新建账号后：自动打开豆包 → 填手机号 → 主动点获取验证码（验证弹窗自动处理） */
+/** 新建账号后打开豆包。没有手机号就只出扫码，不再强制关掉重开 */
 async function bootstrapDoubaoLogin({ id, name, login, captcha }) {
-  const phone = String(login || secrets.read(id)?.login || '').replace(/\D/g, '').slice(-11)
+  const digits = String(login || '').replace(/\D/g, '')
+  const phone = digits.length >= 11 ? digits.slice(-11) : ''
   const secret = secrets.read(id)
   const page = 'https://www.doubao.com/chat/'
-  runtimeLog.info('doubao.bootstrap', `打开豆包并自动登录 phone=${phone ? `${phone.slice(0, 3)}****` : '无'}`)
-  // 用 code 模式打开，避免一上来就切到扫码页导致填不了手机号
+  runtimeLog.info('doubao.bootstrap', `打开豆包扫码登录 phone=${phone ? '有' : '无'}`)
   const opened = await openAccount({
     kind: 'doubao',
     id,
     name,
-    login: phone || login,
-    mode: secret?.password ? 'password' : 'code',
+    login: phone,
+    mode: phone ? (secret?.password ? 'password' : 'code') : 'qr',
     url: page,
-    force: true,
     skipSend: true,
     captcha: captcha || { enabled: true }
   })
@@ -1139,10 +1165,21 @@ async function bootstrapDoubaoLogin({ id, name, login, captcha }) {
   bringToFront(target)
   attachDoubaoPromoGuard(target)
   await dismissDoubaoPromo(target)
-  await wait(1200)
+  await wait(800)
+  const already = await target.webContents.session.cookies.get({}).catch(() => [])
+  if (loggedIn(already, 'doubao')) {
+    return { ok: true, loginStatus: '已登录', message: '豆包已登录，沿用这个窗口' }
+  }
+  if (!phone) {
+    await runInFrames(target, clickExactScript('登录'))
+    await wait(500)
+    await runInFrames(target, clickTextScript(['扫码登录', '扫码']))
+    bringToFront(target)
+    return { ok: true, loginStatus: '待确认', message: '已打开豆包，请扫码登录' }
+  }
 
-  // 有密码：先尝试账密登录
-  if (secret?.password && (phone || login)) {
+  // 旧账号仍可走账密 / 验证码
+  if (secret?.password && phone) {
     const filled = await autoFillPasswordLogin(target, phone || login, secret.password, { times: 6 })
     await watchCaptcha(target, captcha || { enabled: true })
     if (filled === 'filled') {
@@ -1190,73 +1227,37 @@ function publishPartitionStatus(id) {
 }
 
 /**
- * 添加抖音账号：
- * 有账密 → 创作者页在隐藏窗口自动填账密；只把达人工作台亮出来并点到扫码。
- * 无账密 → 达人工作台和创作者中心都打开，并各自点出二维码。
- * 两边登录态分开记。
+ * 只打开一个窗口。
+ * scope=buyin：达人工作台扫码。
+ * 其他：抖音创作者扫码。
  */
-async function bootstrapPublishLogin({ id, name, login, mode }) {
-  const secret = secrets.read(id)
-  const account = String(login || secret?.login || '').trim()
-  const password = String(secret?.password || '').trim()
-  const realAccount = account && account !== '扫码登录' ? account : ''
-  const hasSecret = Boolean(password && realAccount && mode !== 'qr' && mode !== 'code')
-  const buyinUrl = 'https://buyin.jinritemai.com/dashboard'
-  const creatorUrl = 'https://creator.douyin.com/creator-micro/content/upload'
-  runtimeLog.info('publish.bootstrap', `达人+创作者 hasSecret=${hasSecret} mode=${mode || ''}`)
-
+async function bootstrapPublishLogin({ id, name, login, mode, scope }) {
+  const buyin = scope === 'buyin'
+  const url = buyin
+    ? 'https://buyin.jinritemai.com/dashboard'
+    : 'https://creator.douyin.com/creator-micro/content/upload'
+  runtimeLog.info('publish.bootstrap', `${buyin ? '达人' : '创作者'} 单窗口扫码`)
   await openAccount({
     kind: 'publish',
     id,
-    name: name || '创作者',
-    login: realAccount,
-    mode: hasSecret ? 'password' : 'qr',
-    url: creatorUrl,
-    slot: 'creator-boot',
-    hidden: hasSecret
-  })
-  const creatorWin = windows.get(sessionKey('publish', id, creatorUrl, 'creator-boot'))
-  if (creatorWin && !creatorWin.isDestroyed()) {
-    if (hasSecret) {
-      hardenSilentWindow(creatorWin)
-      await autoFillPasswordLogin(creatorWin, realAccount, password, { times: 8 })
-      await wait(1200)
-      hardenSilentWindow(creatorWin)
-    } else {
-      for (let attempt = 0; attempt < 5; attempt += 1) {
-        const clicked = await runInFrames(creatorWin, clickTextScript(['扫码登录', '扫码']))
-        if (clicked === 'clicked') break
-        await wait(500)
-      }
-      try { creatorWin.show() } catch { /* ignore */ }
-      bringToFront(creatorWin)
-    }
-  }
-
-  await openAccount({
-    kind: 'publish',
-    id,
-    name: name || '达人',
-    login: realAccount,
+    name: name || (buyin ? '达人' : '创作者'),
+    login: '',
     mode: 'qr',
-    url: buyinUrl
+    url
   })
-  const buyinWin = windows.get(sessionKey('publish', id, buyinUrl)) || findPublishMainWindow(id)
-  if (buyinWin && !buyinWin.isDestroyed()) {
-    await enterBuyinTalent(buyinWin)
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const clicked = await runInFrames(buyinWin, clickTextScript(['扫码登录', '扫码']))
-      if (clicked === 'clicked') break
-      await wait(500)
-    }
-    bringToFront(buyinWin)
+  const win = findPublishMainWindow(id)
+  if (win && !win.isDestroyed()) {
+    bindSameWindow(win)
+    if (buyin) await enterBuyinTalent(win)
+    else await runInFrames(win, clickTextScript(['扫码登录', '扫码']))
+    bringToFront(win)
   }
-
   const status = await publishPartitionStatus(id)
-  const message = hasSecret
-    ? '创作者登录已在后台自动填写账号密码（窗口不显示）。达人工作台已打开，请扫码。'
-    : '已打开达人工作台和创作者中心，请分别扫码。两边登录状态分开保存。'
-  return { ok: true, ...status, hiddenCreator: hasSecret, message }
+  return {
+    ok: true,
+    ...status,
+    message: buyin ? '已打开达人工作台，请扫码登录' : '已打开创作者中心，请扫码登录'
+  }
 }
 
 /** 账密账号过期：隐藏窗口自动登录，不把页面亮给用户 */
@@ -1362,6 +1363,7 @@ async function collectProducts({ id, target, pageLimit = 0, onPage }) {
       }
     })
     win.webContents.setUserAgent(CHROME_UA)
+    bindSameWindow(win)
     await within(win.loadURL(page, { userAgent: CHROME_UA }).catch(() => {}), 10000)
     if (!win || win.isDestroyed()) {
       logs.push('会话窗口已关闭')
@@ -1960,6 +1962,7 @@ function doubaoStateScript(snippet, minVideos) {
     const tail = body.slice(-2500)
     const ownPromptAsks = Boolean(needle) && needle.includes('确认后再开始生成')
     const asks = /视频生成参数确认/.test(tail) || (/确认后再开始生成/.test(tail) && !ownPromptAsks) || /请确认参数|回复确认后开始/.test(tail)
+    const mismatch = /无法严格锁定|品类完全不同|货不对版|请确认一个执行方向|两者外观/.test(tail)
     const generating = /视频生成中|正在生成|生成中|排队中|排队生成|稍等片刻|仍在排队/.test(body.slice(-2500))
     const confirmVisible = Boolean(confirm)
     const copyrightMarkers = ${JSON.stringify(activeRetryCopyright)}
@@ -1985,6 +1988,7 @@ function doubaoStateScript(snippet, minVideos) {
       replyAction: replyHit?.action || ''
     }
     if (/额度不足|次数已用完|今日次数已用完|已达上限|没有剩余次数/.test(body.slice(-4000))) return { state: 'quota', ...base }
+    if (mismatch) return { state: 'mismatch', ...base }
     const videos = Array.from(document.querySelectorAll('video'))
     const video = videos.length > ${Number(minVideos) || 0} ? videos[videos.length - 1] : null
     const src = video ? (video.currentSrc || video.src || '') : ''
@@ -2007,7 +2011,7 @@ async function readDoubao(win, snippet, minVideos) {
     try {
       const result = await frame.executeJavaScript(script)
       if (!result || typeof result !== 'object') continue
-      if (result.confirmVisible || result.state === 'ready' || result.state === 'quota' || result.state === 'failed' || result.state === 'retry_copyright' || result.state === 'retry_busy' || result.asks) return result
+      if (result.confirmVisible || result.state === 'ready' || result.state === 'quota' || result.state === 'failed' || result.state === 'mismatch' || result.state === 'retry_copyright' || result.state === 'retry_busy' || result.asks) return result
       if (result.inputHasPrompt || result.echoed || result.generating) best = result
     } catch { /* 这个框架读不到页面 */ }
   }
@@ -2044,6 +2048,9 @@ async function pressConfirm(win, snippet, minVideos) {
   let state = await readDoubao(win, snippet, minVideos)
   if (state.state === 'quota') {
     return { ...state, quota: true, confirmNeeded: false, confirmSent: false, confirmNote: '这个豆包账号额度不够' }
+  }
+  if (state.state === 'mismatch') {
+    return { ...state, confirmNeeded: false, confirmSent: false, confirmNote: '图片和商品对不上，已停止，没有回复 1 或 2' }
   }
   if (state.inputHasPrompt && !state.echoed && !state.confirmVisible && !state.asks) {
     await runInFrames(win, sendScript())
@@ -2091,6 +2098,7 @@ async function ensureDelivered(win, snippet, notify, workId, minVideos) {
     if (!win || win.isDestroyed()) return { ...last, confirmNote: '豆包窗口被关掉了' }
     const state = await readDoubao(win, snippet, minVideos)
     if (state.state === 'quota') return { ...state, quota: true, confirmNeeded: false, confirmSent: false, confirmNote: '这个豆包账号额度不够' }
+    if (state.state === 'mismatch') return { ...state, mismatch: true, confirmNeeded: false, confirmSent: false, confirmNote: '图片和商品对不上，已停止，没有回复 1 或 2' }
     if (state.state === 'ready') return { ...state, ready: true, confirmNeeded: last.confirmNeeded, confirmSent: last.confirmSent, confirmNote: last.confirmNote || '已直接发送，没有出现确认框' }
     if (state.confirmVisible || state.asks || (state.inputHasPrompt && !state.echoed)) {
       last = await pressConfirm(win, snippet, minVideos)
@@ -2173,7 +2181,30 @@ async function resubmitDoubaoJob(win, { text, savedImages, filePayload, freshCha
   return { ok: true, note: freshChat ? '已新开对话并重发图+提示词' : '已再次发送提示词', attached }
 }
 
-async function generateOnDoubao({ id, name, login, mode, prompt, image, images, imageCount, saveDir, workId, notify, slot, failMarkers, replyRules, captcha, retryMarkers }) {
+function parseOptimizedCopy(text) {
+  const body = String(text || '')
+  const titleMatch = body.match(/优化标题\s*[:：]\s*([^\n\r]{2,40})/)
+  const tagMatch = body.match(/优化标签\s*[:：]\s*([^\n\r]{2,160})/)
+  const title = titleMatch ? titleMatch[1].replace(/^#/, '').trim().slice(0, 30) : ''
+  const tags = tagMatch
+    ? [...new Set(tagMatch[1].split(/[#\s,，、]+/).map((item) => item.replace(/^#/, '').trim()).filter((item) => item.length >= 2 && item.length <= 12 && !/优化|标题|标签|编号|原标题|原标签/.test(item)))].slice(0, 5)
+    : []
+  if (!title && !tags.length) return null
+  return { optimizedTitle: title, optimizedTags: tags }
+}
+
+async function readOptimizedCopy(win) {
+  if (!win || win.isDestroyed()) return null
+  const text = await win.webContents.executeJavaScript(`(() => (document.body && document.body.innerText) || '')()`).catch(() => '')
+  return parseOptimizedCopy(text)
+}
+
+function optimizeAsk(no, title, tags) {
+  const tagText = (Array.isArray(tags) ? tags : []).map((item) => `#${String(item || '').replace(/^#/, '')}`).filter((item) => item.length > 1).join(' ')
+  return `编号${no || ''}。请只优化这条抖音发布文案，不要重新生成视频，也不要重复我下面的说明。\n原标题：${title || ''}\n原标签：${tagText}\n只回复两行，把内容换成优化后的标题和标签：\n优化标题：\n优化标签：`
+}
+
+async function generateOnDoubao({ id, name, login, mode, prompt, image, images, imageCount, saveDir, workId, notify, slot, failMarkers, replyRules, captcha, retryMarkers, copyNo, copyTitle, copyTags }) {
   const copyrightList = Array.isArray(retryMarkers?.copyright) && retryMarkers.copyright.length
     ? retryMarkers.copyright
     : DEFAULT_RETRY_COPYRIGHT
@@ -2194,7 +2225,8 @@ async function generateOnDoubao({ id, name, login, mode, prompt, image, images, 
   await openAccount({ kind: 'doubao', id, name, login, mode: mode || 'password', url: page, slot })
   const win = windows.get(sessionKey('doubao', id, page, slot))
   if (!win || win.isDestroyed()) return { ok: false, message: '网页版豆包没有打开' }
-  win.setTitle(`${name || '豆包'} · 网页版`)
+  pinHideOnClose(win)
+  win.setTitle(`${name || '豆包'} · 生成中`)
   bringToFront(win)
   attachDoubaoPromoGuard(win)
   await dismissDoubaoPromo(win)
@@ -2212,10 +2244,15 @@ async function generateOnDoubao({ id, name, login, mode, prompt, image, images, 
   }
   const savedImages = []
   const filePayload = []
+  const currentChat = String(win.webContents.getURL() || '')
+  if (/doubao\.com\/chat\/[^/?#]+/i.test(currentChat)) {
+    await loadPage(win, page)
+    await wait(1200)
+  }
   for (let attempt = 0; attempt < 16; attempt += 1) {
     const ready = await runInFrames(win, `(() => document.querySelector('textarea,[contenteditable="true"]') ? 'filled' : 'miss')()`)
     if (ready === 'filled') break
-    if (attempt === 3) await runInFrames(win, clickTextScript(['新对话', '新的对话', '开启新对话']))
+    if (attempt === 4) await runInFrames(win, clickTextScript(['视频生成', '生成视频']))
     await wait(700)
   }
   await runInFrames(win, clickTextScript(['视频生成', '生成视频']))
@@ -2309,6 +2346,7 @@ async function generateOnDoubao({ id, name, login, mode, prompt, image, images, 
   let delivery = await ensureDelivered(win, snippet, notify, workId, before)
   const withConfirm = (payload) => ({
     ...payload,
+    ...(latestCopy || {}),
     confirmNeeded: Boolean(delivery.confirmNeeded),
     confirmSent: Boolean(delivery.confirmSent),
     confirmNote: delivery.confirmNote || ''
@@ -2317,6 +2355,10 @@ async function generateOnDoubao({ id, name, login, mode, prompt, image, images, 
     await endChain()
     return withConfirm({ ok: false, quota: true, saveDir: folder, message: '这个豆包账号额度不够' })
   }
+  if (delivery.mismatch) {
+    await endChain()
+    return withConfirm({ ok: false, saveDir: folder, imagePaths: savedImages, message: '豆包发现上传的图片和商品不是同一件，已停止。不会改成别的商品，也不会用这组图硬生成。' })
+  }
   let confirmTries = 0
   let heldUrl = ''
   let reloaded = false
@@ -2324,6 +2366,10 @@ async function generateOnDoubao({ id, name, login, mode, prompt, image, images, 
   let nudged = false
   let copyrightRetries = 0
   let busyRetries = 0
+  let plainResent = false
+  let notedChat = false
+  let copySent = false
+  let latestCopy = null
   let lastRetryAt = 0
   const maxCopyrightRetries = 5
   const maxBusyRetries = 4
@@ -2334,7 +2380,37 @@ async function generateOnDoubao({ id, name, login, mode, prompt, image, images, 
       await endChain()
       return withConfirm({ ok: false, saveDir: folder, message: '豆包网页被关掉了' })
     }
+    if (!notedChat) {
+      const pageUrl = String(win.webContents.getURL() || '')
+      if (/doubao\.com\/chat\/[^/?#]+/i.test(pageUrl)) {
+        notedChat = true
+        notify?.({ workId, status: '生成中', doubaoChatUrl: pageUrl })
+      }
+    }
     const state = await readDoubao(win, snippet, before)
+    if (state.state === 'mismatch') {
+      await endChain()
+      return withConfirm({
+        ok: false,
+        saveDir: folder,
+        imagePaths: savedImages,
+        message: '豆包发现上传的图片和商品不是同一件，已停止。不会改成别的商品，也不会用这组图硬生成。'
+      })
+    }
+    if (!copySent && copyTitle && (state.generating || state.state === 'ready')) {
+      copySent = true
+      const ask = optimizeAsk(copyNo, copyTitle, copyTags)
+      await fillPrompt(win, ask)
+      await runInFrames(win, sendScript())
+      notify?.({ workId, status: '生成中', confirmNote: `已把编号${copyNo || ''}的原标题和标签发给豆包优化` })
+    }
+    if (tick % 2 === 0) {
+      const parsed = await readOptimizedCopy(win)
+      if (parsed) {
+        latestCopy = parsed
+        notify?.({ workId, status: '生成中', ...parsed })
+      }
+    }
     if ((state.state === 'confirm' || state.confirmVisible || state.asks) && !state.confirmEcho && !delivery.confirmSent && confirmTries < 3) {
       confirmTries += 1
       const again = await pressConfirm(win, snippet, before)
@@ -2405,6 +2481,15 @@ async function generateOnDoubao({ id, name, login, mode, prompt, image, images, 
       await endChain()
       return withConfirm({ ok: false, saveDir: folder, message: `豆包拒绝生成：${state.failMarker || '页面出现失败话术'}` })
     }
+    if (!plainResent && !readySince && tick >= 24 && savedImages.length && !state.generating && state.state !== 'ready') {
+      plainResent = true
+      const note = '还没有成片，正在再次发送图片和提示词'
+      delivery = { ...delivery, confirmNote: note }
+      notify?.({ workId, progress: Math.min(90, 50 + tick), status: '生成中', confirmNote: note })
+      const again = await resubmitDoubaoJob(win, { text, savedImages, filePayload, freshChat: false })
+      delivery = { ...delivery, confirmNote: again.ok ? `${note}：${again.note}` : `${note}失败：${again.note}` }
+      continue
+    }
     {
       const midGate = await doubaoCaptcha.checkNow(win, captchaConfig, (data) => notify?.({ workId, progress: Math.min(90, 50 + tick), status: '生成中', ...data }))
       if (midGate.hit && !midGate.cleared) {
@@ -2442,6 +2527,20 @@ async function generateOnDoubao({ id, name, login, mode, prompt, image, images, 
     }
     if (state.state !== 'ready' || !state.src) continue
     if (!readySince) readySince = Date.now()
+    if (Date.now() - readySince >= 12000) {
+      const saved = await downloadCleanFile(state.src, file, win.webContents.session)
+      if (saved) {
+        await endChain()
+        return withConfirm({
+          ok: true,
+          clean: false,
+          videoPath: saved,
+          saveDir: folder,
+          doubaoChatUrl: win.webContents.getURL(),
+          message: `成片已自动保存到 ${saved}`
+        })
+      }
+    }
     if (!reloaded && Date.now() - readySince >= 6000) {
       reloaded = true
       const current = win.webContents.getURL()
@@ -3710,7 +3809,8 @@ function listWindows() {
       key,
       title: win.getTitle(),
       url: String(win.webContents.getURL() || ''),
-      kind: String(key).split(':')[0] || ''
+      kind: String(key).split(':')[0] || '',
+      hidden: !win.isVisible()
     })
   }
   return rows
