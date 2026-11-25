@@ -101,6 +101,12 @@ function pinHideOnClose(win) {
   })
 }
 
+function closeDoubaoWindow(win) {
+  if (!win || win.isDestroyed()) return
+  win.__allowDestroy = true
+  try { win.close() } catch { /* 已经关了 */ }
+}
+
 function samePage(current, target) {
   try {
     const left = new URL(current)
@@ -1929,7 +1935,8 @@ function sendScript() {
     walk(document)
     const send = buttons.find((el) => {
       const label = ((el.innerText || '') + (el.getAttribute('aria-label') || '')).replace(/\\s+/g, '')
-      return /发送/.test(label) && !el.disabled && el.getAttribute('aria-disabled') !== 'true'
+      if (!/发送/.test(label) || /确认发送|确定发送/.test(label)) return false
+      return !el.disabled && el.getAttribute('aria-disabled') !== 'true'
     }) || buttons.find((el) => /send/i.test((el.className || '') + (el.getAttribute('aria-label') || '')) && !el.disabled)
     if (send) { send.click(); return 'clicked' }
     const box = boxes.filter((el) => el.getBoundingClientRect().width > 40).pop()
@@ -1975,8 +1982,13 @@ function confirmClickScript() {
   })()`
 }
 
-function doubaoStateScript(snippet, minVideos) {
+function doubaoStateScript(snippet, minVideos, rules) {
   const needle = String(snippet || '').replace(/\s+/g, '').slice(0, 16)
+  const replySource = rules?.replyRules || activeReplyRules
+  const replyList = [...(replySource?.first || []), ...(replySource?.follow || []).map((item) => ({ ...item, action: 'text', buttonLabel: '' }))]
+  const failMarkers = rules?.failMarkers || activeFailMarkers
+  const copyrightMarkers = rules?.copyright || activeRetryCopyright
+  const busyMarkers = rules?.busy || activeRetryBusy
   return `(() => {
     const needle = ${JSON.stringify(needle)}
     const compact = (value) => String(value || '').replace(/\\s+/g, '')
@@ -2011,7 +2023,7 @@ function doubaoStateScript(snippet, minVideos) {
     const inputHasPrompt = Boolean(needle) && inputText.includes(needle.slice(0, 8))
     const body = compact(document.body?.innerText || '')
     const echoed = Boolean(needle) && body.includes(needle.slice(0, 8)) && !inputHasPrompt
-    const rules = ${JSON.stringify([...(activeReplyRules?.first || []), ...(activeReplyRules?.follow || []).map((item) => ({ ...item, action: 'text', buttonLabel: '' }))])}
+    const rules = ${JSON.stringify(replyList)}
     const replyPhrases = rules.map((rule) => String(rule.reply || '').replace(/\\s+/g, '')).filter(Boolean)
     const confirmEcho = (replyPhrases.some((text) => body.includes(text) && !inputText.includes(text.slice(0, 8))) || /确认，直接开始生成|确认直接开始生成/.test(body)) && !inputText.includes('确认，直接开始生成')
     const tail = body.slice(-2500)
@@ -2020,9 +2032,9 @@ function doubaoStateScript(snippet, minVideos) {
     const mismatch = /无法严格锁定|品类完全不同|货不对版|请确认一个执行方向|两者外观/.test(tail)
     const generating = /视频生成中|正在生成|生成中|排队中|排队生成|稍等片刻|仍在排队/.test(body.slice(-2500))
     const confirmVisible = Boolean(confirm)
-    const copyrightMarkers = ${JSON.stringify(activeRetryCopyright)}
-    const busyMarkers = ${JSON.stringify(activeRetryBusy)}
-    const markers = ${JSON.stringify(activeFailMarkers)}
+    const copyrightMarkers = ${JSON.stringify(copyrightMarkers)}
+    const busyMarkers = ${JSON.stringify(busyMarkers)}
+    const markers = ${JSON.stringify(failMarkers)}
     const findHit = (list) => (list || []).find((item) => item && tail.includes(String(item).replace(/\\s+/g, '')))
     const copyrightHit = findHit(copyrightMarkers)
     const busyHit = findHit(busyMarkers)
@@ -2059,7 +2071,7 @@ function doubaoStateScript(snippet, minVideos) {
 }
 
 async function readDoubao(win, snippet, minVideos) {
-  const script = doubaoStateScript(snippet, minVideos)
+  const script = doubaoStateScript(snippet, minVideos, win && win.__huangDoubaoRules)
   let best = { state: 'wait', confirmVisible: false, inputHasPrompt: false, echoed: false, generating: false, asks: false }
   if (!win || win.isDestroyed()) return best
   for (const frame of framesOf(win.webContents.mainFrame)) {
@@ -2369,31 +2381,45 @@ async function sendPreparedDoubao(win, text, savedImages, filePayload) {
   return { ok: true, message: '已发送' }
 }
 
-async function waitFreshChatUrl(win, before) {
+function pageChatUrl(win) {
+  const url = String(win?.webContents?.getURL?.() || '')
+  const matched = url.match(/doubao\.com\/chat\/([^/?#]+)/i)
+  if (!matched || matched[1] === 'chat') return ''
+  return `https://www.doubao.com/chat/${matched[1]}`
+}
+
+async function waitOwnChatUrl(win, used) {
   for (let attempt = 0; attempt < 16; attempt += 1) {
-    const url = String(win.webContents.getURL() || '')
-    const matched = url.match(/doubao\.com\/chat\/([^/?#]+)/i)
-    if (matched && !before.has(matched[1])) return `https://www.doubao.com/chat/${matched[1]}`
-    const now = await collectChatIds(win)
-    for (const id of now) {
-      if (!before.has(id)) return `https://www.doubao.com/chat/${id}`
-    }
+    const current = pageChatUrl(win)
+    if (current && !used.has(current)) return current
     await wait(500)
   }
   return ''
+}
+
+async function waitDoubaoComposer(win) {
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    if (!win || win.isDestroyed()) return false
+    const ready = await runInFrames(win, `(() => document.querySelector('textarea,[contenteditable="true"]') ? 'filled' : 'miss')()`)
+    if (ready === 'filled') return true
+    if (attempt === 3 || attempt === 8) await runInFrames(win, clickTextScript(['视频生成', '生成视频']))
+    await wait(700)
+  }
+  return false
 }
 
 async function readAssignedTask(win, job) {
   const chain = startChainCapture(win)
   try {
     await chain.ready
-    await loadPage(win, job.chatUrl, { quiet: true })
-    await wait(1600)
+    const here = pageChatUrl(win)
+    if (here !== job.chatUrl) await loadPage(win, job.chatUrl, { quiet: true })
+    await wait(here === job.chatUrl ? 400 : 900)
     const state = await readDoubao(win, job.snippet, 0)
     let held = await cleanUrlFromBodies(win.webContents.session, chain.bodies.splice(0))
     if (!held && state.state === 'ready') {
       try { win.webContents.reload() } catch { /* 刷新失败就等下一轮 */ }
-      await wait(2200)
+      await wait(1600)
       held = await cleanUrlFromBodies(win.webContents.session, chain.bodies.splice(0))
     }
     if (state.state === 'mismatch') {
@@ -2437,6 +2463,12 @@ async function generateAssignedTasks(payload) {
     .filter((item) => item && !copyrightSet.has(item.replace(/\s+/g, '')) && !activeRetryBusy.some((busy) => item.includes(busy) || busy.includes(item)))
     .slice(0, 30)
   activeReplyRules = replyRules && typeof replyRules === 'object' ? replyRules : null
+  const taskRules = {
+    failMarkers: activeFailMarkers.slice(),
+    replyRules: activeReplyRules,
+    copyright: activeRetryCopyright.slice(),
+    busy: activeRetryBusy.slice()
+  }
   const captchaConfig = doubaoCaptcha.normalizeConfig(captcha)
   const page = 'https://www.doubao.com/chat/'
   const folder = saveDir || path.join(app.getPath('videos'), 'huang-plusplus-pro')
@@ -2446,12 +2478,19 @@ async function generateAssignedTasks(payload) {
   if (!win || win.isDestroyed()) {
     return { ok: false, message: '网页版豆包没有打开', results: list.map((job) => ({ workId: job.workId, outcome: 'failed', message: '网页版豆包没有打开' })) }
   }
+  win.__huangDoubaoRules = taskRules
   pinHideOnClose(win)
   win.setTitle(`${name || '豆包'} · ${list.length}个任务`)
   bringToFront(win)
   attachDoubaoPromoGuard(win)
   await dismissDoubaoPromo(win)
+  if (!String(win.webContents.getURL() || '').startsWith('https://www.doubao.com')) {
+    await loadPage(win, page)
+    await dismissDoubaoPromo(win)
+  }
+  await waitDoubaoComposer(win)
   const tasks = []
+  const usedChats = new Set()
   for (let index = 0; index < list.length; index += 1) {
     const job = list[index]
     const workId = String(job.workId || '')
@@ -2467,19 +2506,26 @@ async function generateAssignedTasks(payload) {
       tasks.push({ workId, done: true, last: { outcome: 'failed', message: !text ? '提示词是空的' : '没有商品图' } })
       continue
     }
-    const before = await collectChatIds(win)
     let opened = 'miss'
-    for (let attempt = 0; attempt < 4 && opened !== 'clicked'; attempt += 1) {
+    for (let attempt = 0; attempt < 6 && opened !== 'clicked'; attempt += 1) {
       opened = await runInFrames(win, clickNewWorkTaskScript())
-      if (opened !== 'clicked') await wait(500)
+      if (opened !== 'clicked') await wait(600)
     }
-    if (opened !== 'clicked') {
-      tasks.push({ workId, done: true, last: { outcome: 'failed', message: '没有点到左侧的「新工作任务」' } })
+    if (opened === 'clicked') {
+      await wait(900)
+    } else {
+      const here = String(win.webContents.getURL() || '')
+      if (index > 0 || /doubao\.com\/chat\/[^/?#]+/i.test(here)) {
+        await loadPage(win, page)
+        await wait(800)
+      }
+    }
+    await runInFrames(win, clickTextScript(['视频生成', '生成视频']))
+    const composer = await waitDoubaoComposer(win)
+    if (!composer) {
+      tasks.push({ workId, done: true, last: { outcome: 'failed', message: '豆包输入框还没出来，图片和提示词没有发送' } })
       continue
     }
-    await wait(900)
-    await runInFrames(win, clickTextScript(['视频生成', '生成视频']))
-    await wait(700)
     const prepared = await materializeDoubaoImages(win, urls, folder, workId)
     if (!prepared.savedImages.length) {
       tasks.push({ workId, done: true, last: { outcome: 'failed', message: '商品图没有下载下来，这条任务没有发送' } })
@@ -2495,15 +2541,29 @@ async function generateAssignedTasks(payload) {
       tasks.push({ workId, done: true, last: { outcome: 'failed', message: captchaGate.error || '验证码没有通过' } })
       continue
     }
-    const chatUrl = await waitFreshChatUrl(win, before)
+    const chatUrl = await waitOwnChatUrl(win, usedChats)
     if (!chatUrl) {
-      tasks.push({ workId, done: true, last: { outcome: 'failed', message: '这条任务已发送，但没有拿到它自己的对话地址，已停住，避免和旧任务混在一起' } })
+      tasks.push({ workId, done: true, last: { outcome: 'failed', message: '图片和提示词已经发出，但这条还停在上一条任务的页面，已停住，避免两条记混' } })
       continue
     }
-    notify?.({ workId, status: '生成中', progress: 30 + index * 8, doubaoChatUrl: chatUrl, confirmNote: `已挂到第 ${index + 1}/${list.length} 条新工作任务` })
-    tasks.push({ workId, snippet: text.slice(0, 12), chatUrl, file, done: false, last: { outcome: 'running', confirmNote: '已挂上，等待结果', doubaoChatUrl: chatUrl } })
+    usedChats.add(chatUrl)
+    const pressed = await pressConfirm(win, text.slice(0, 12), 0)
+    notify?.({
+      workId,
+      status: '生成中',
+      progress: 30 + index * 8,
+      doubaoChatUrl: chatUrl,
+      confirmNeeded: Boolean(pressed.confirmNeeded),
+      confirmSent: Boolean(pressed.confirmSent),
+      confirmNote: pressed.confirmNote || `已把第 ${index + 1}/${list.length} 条的图片和提示词发出`
+    })
+    if (pressed.quota) {
+      tasks.push({ workId, done: true, chatUrl, file, last: { outcome: 'quota', message: '这个豆包账号额度不够', doubaoChatUrl: chatUrl } })
+      continue
+    }
+    tasks.push({ workId, snippet: text.slice(0, 12), chatUrl, file, done: false, last: { outcome: 'running', confirmNote: pressed.confirmNote || '已挂上，等待结果', doubaoChatUrl: chatUrl, confirmNeeded: Boolean(pressed.confirmNeeded), confirmSent: Boolean(pressed.confirmSent) } })
   }
-  const rounds = watch ? 12 : 24
+  const rounds = watch ? 8 : 16
   for (let round = 0; round < rounds; round += 1) {
     const pending = tasks.filter((item) => !item.done && item.chatUrl)
     if (!pending.length || win.isDestroyed()) break
@@ -2522,8 +2582,10 @@ async function generateAssignedTasks(payload) {
       if (read.outcome === 'success' || read.outcome === 'failed' || read.outcome === 'quota') task.done = true
     }
     if (tasks.every((item) => item.done || !item.chatUrl)) break
-    await wait(5000)
+    await wait(8000)
   }
+  const stillOpen = tasks.some((item) => item.chatUrl && !item.done)
+  if (!stillOpen) closeDoubaoWindow(win)
   return {
     ok: true,
     saveDir: folder,
@@ -2559,11 +2621,18 @@ async function generateOnDoubao(payload = {}) {
     .filter((item) => item && !copyrightSet.has(item.replace(/\s+/g, '')) && !activeRetryBusy.some((busy) => item.includes(busy) || busy.includes(item)))
     .slice(0, 30)
   activeReplyRules = replyRules && typeof replyRules === 'object' ? replyRules : null
+  const taskRules = {
+    failMarkers: activeFailMarkers.slice(),
+    replyRules: activeReplyRules,
+    copyright: activeRetryCopyright.slice(),
+    busy: activeRetryBusy.slice()
+  }
   const captchaConfig = doubaoCaptcha.normalizeConfig(captcha)
   const page = 'https://www.doubao.com/chat/'
   await openAccount({ kind: 'doubao', id, name, login, mode: mode || 'password', url: page, slot })
   const win = windows.get(sessionKey('doubao', id, page, slot))
   if (!win || win.isDestroyed()) return { ok: false, message: '网页版豆包没有打开' }
+  win.__huangDoubaoRules = taskRules
   pinHideOnClose(win)
   win.setTitle(`${name || '豆包'} · 生成中`)
   bringToFront(win)
@@ -3651,14 +3720,16 @@ function selectAiDeclareScript() {
     }
     const option = nodes.find((el) => {
       const text = compact(el.innerText || el.getAttribute('aria-label') || '')
-      if (!text || text.length > 18 || /AI分身/.test(text)) return false
+      if (!text || text.length > 24 || /AI分身/.test(text)) return false
       if (!visible(el)) return false
-      return text === 'AI自主声明' || text === '内容由AI生成' || text === '由AI生成' || text.includes('AI自主声明')
+      return text === 'AI自主声明' || text === '内容由AI生成' || text === '由AI生成'
+        || text.includes('AI自主声明') || text.includes('内容由AI生成') || text.includes('人工智能生成')
+        || text === 'AI生成' || text === 'AIGC' || text.includes('由AI生成')
     })
     if (!option) {
       const opener = nodes.find((el) => {
         const text = compact(el.innerText || '')
-        return visible(el) && text.length < 12 && (text === '自主声明' || text === '添加声明' || text === '内容声明')
+        return visible(el) && text.length < 16 && (text === '自主声明' || text === '添加声明' || text === '内容声明' || text === '发文助手' || text.includes('添加声明'))
       })
       if (opener) {
         opener.click()
@@ -3691,8 +3762,8 @@ async function applyPublishOptions(win, options = {}, productLink = '', productI
       let cartOk = false
       for (let attempt = 0; attempt < 5 && !cartOk; attempt += 1) {
         await runInFrames(win, clickByLabelsScript([
-          '添加标签和商品', '添加商品', '挂载购物车', '购物车', '商品链接', '添加链接',
-          '关联商品', '选择商品', '带货'
+          '添加标签和商品', '添加商品', '挂载购物车', '挂小黄车', '小黄车', '购物车', '商品链接', '添加链接',
+          '关联商品', '选择商品', '带货商品', '推广商品', '添加橱窗', '带货'
         ], 32))
         await wait(700 + attempt * 150)
         if (goodsId) {
@@ -3706,7 +3777,8 @@ async function applyPublishOptions(win, options = {}, productLink = '', productI
             await wait(800)
           }
           const picked = await runInFrames(win, selectProductByIdScript(goodsId))
-          if (picked === 'picked') {
+          const shown = await runInFrames(win, `(() => String(document.body?.innerText || '').includes(${JSON.stringify(goodsId)}) ? 'yes' : 'no')()`)
+          if (picked === 'picked' && shown === 'yes') {
             await wait(300)
             await runInFrames(win, clickByLabelsScript(['确定', '完成', '确认添加', '添加', '保存', '确认']))
             await wait(500)
@@ -3762,9 +3834,13 @@ async function applyPublishOptions(win, options = {}, productLink = '', productI
       if (clicked === 'opened') {
         await wait(500)
         const again = await runInFrames(win, selectAiDeclareScript())
-        if (again === 'clicked') declared = true
+        if (again === 'clicked') {
+          const marked = await runInFrames(win, `(() => /AI自主声明|内容由AI生成|人工智能生成|由AI生成|AIGC/.test(String(document.body?.innerText || '')) ? 'yes' : 'no')()`)
+          if (marked === 'yes') declared = true
+        }
       } else if (clicked === 'clicked') {
-        declared = true
+        const marked = await runInFrames(win, `(() => /AI自主声明|内容由AI生成|人工智能生成|由AI生成|AIGC/.test(String(document.body?.innerText || '')) ? 'yes' : 'no')()`)
+        if (marked === 'yes') declared = true
       } else {
         await wait(400)
       }

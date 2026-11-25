@@ -61,9 +61,12 @@
             <el-table-column label="图片" min-width="220">
               <template #default="{ row }">
                 <div v-if="rowShots(row).length" class="thumb-row">
-                  <HoverPreview v-for="(src, index) in rowShots(row)" :key="`${row.id}-${index}`" :images="rowShots(row)" :start="index">
-                    <img class="cart-thumb" :src="imageUrl(src)" alt="" />
-                  </HoverPreview>
+                  <div v-for="(src, index) in rowShots(row)" :key="`${row.id}-${index}`" class="thumb-cell">
+                    <HoverPreview :images="rowShots(row)" :start="index">
+                      <img class="cart-thumb" :src="imageUrl(src)" alt="" />
+                    </HoverPreview>
+                    <button type="button" class="thumb-delete" title="删除这张，不再发给豆包" @click.stop="removeShot(row, src)">删除</button>
+                  </div>
                 </div>
                 <span v-else class="thumb-empty">无图</span>
               </template>
@@ -206,7 +209,13 @@ const bannedOpen = ref(false)
 const bannedText = ref('')
 
 function rowShots(row) {
-  return [...new Set([...(row?.images || []), row?.image].map((item) => String(item || '').trim()).filter(keepProductImage))]
+  const removed = new Set(row?.removedImages || [])
+  return [...new Set([...(row?.images || []), row?.image].map((item) => String(item || '').trim()).filter((item) => item && !removed.has(item) && keepProductImage(item)))]
+}
+
+function removeShot(row, src) {
+  store.removeProductImage(row.id, src)
+  ElMessage.success('这张图已删除，之后不会发给豆包')
 }
 const visible = ref(false)
 const form = reactive({ id: '', name: '', group: '默认分组', publishAccount: '' })
@@ -582,7 +591,22 @@ function onBgm(event) {
 .goods-panel { min-width: 0; }
 .table-scroll { width: 100%; overflow-x: auto; }
 .cart-thumb { width: 56px; height: 56px; object-fit: cover; border-radius: 8px; background: #f3f4f6; display: block; }
-.thumb-row { display: flex; flex-wrap: wrap; gap: 6px; max-width: 280px; }
+.thumb-row { display: flex; flex-wrap: wrap; gap: 6px; max-width: 320px; }
+.thumb-cell { position: relative; width: 56px; height: 56px; }
+.thumb-delete {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  z-index: 2;
+  border: 0;
+  border-radius: 6px;
+  padding: 0 4px;
+  background: rgba(17, 24, 39, .78);
+  color: #fff;
+  font-size: 11px;
+  line-height: 18px;
+  cursor: pointer;
+}
 .thumb-btn { border: 0; padding: 0; background: transparent; cursor: zoom-in; }
 .thumb-empty { display: grid; place-items: center; width: 56px; height: 56px; border-radius: 8px; background: #f3f4f6; color: #98a2b3; font-size: 12px; }
 .shot-preview { width: 100%; max-height: 78vh; object-fit: contain; background: #111; border-radius: 12px; }

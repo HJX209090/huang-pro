@@ -67,7 +67,7 @@
     </div>
     <template #footer>
       <el-button @click="store.promptVisible = false">取消</el-button>
-      <el-button type="primary" @click="confirm">确认生成视频</el-button>
+      <el-button type="primary" :loading="confirming" @click="confirm">确认生成视频</el-button>
     </template>
   </el-dialog>
 </template>
@@ -83,6 +83,7 @@ import { composePrompt, imageUrl } from '@/utils/format'
 
 const store = useAppStore()
 const form = reactive(emptyForm())
+const confirming = ref(false)
 
 function emptyForm() {
   return {
@@ -103,7 +104,8 @@ const filledRows = computed(() => drafts.value.filter((item) => item.id).map((it
 })))
 
 function productImages(item) {
-  return [...new Set([...(item?.images || []), item?.image].map((src) => String(src || '')).filter((src) => /^https?:\/\//.test(src) || /^[a-zA-Z]:[\\/]/.test(src) || String(src).startsWith('\\\\')))]
+  const removed = new Set(item?.removedImages || [])
+  return [...new Set([...(item?.images || []), item?.image].map((src) => String(src || '').trim()).filter((src) => src && !removed.has(src) && (/^https?:\/\//.test(src) || src.startsWith('//') || /^[a-zA-Z]:[\\/]/.test(src) || src.startsWith('\\\\') || src.startsWith('file:') || src.startsWith('local-video:'))))]
 }
 
 watch(() => store.promptVisible, (visible) => {
@@ -149,10 +151,17 @@ function applyTemplate(item) {
   form.duration = item.duration || ''
 }
 
-function confirm() {
+async function confirm() {
+  if (confirming.value) return
+  confirming.value = true
+  try {
   const account = store.doubaoAccount()
   if (!account) {
-    ElMessage.warning('先添加一个豆包账号，确认后才会打开网页')
+    ElMessage.error('先添加一个豆包账号。没有账号时，确认生成视频不会打开网页')
+    return
+  }
+  if (!window.tujian?.openAccount || !window.tujian?.generateDoubao) {
+    ElMessage.error('请在桌面的 huang++pro 窗口里点确认生成视频')
     return
   }
   if (!String(form.promptText || '').trim()) {
@@ -161,7 +170,7 @@ function confirm() {
   }
   const missing = drafts.value.filter((item) => item.id && !item.images.length)
   if (missing.length) {
-    ElMessage.warning(`「${missing[0].title}」没有商品图。先上传图片，或回到选品库同步/补全后再生成`)
+    ElMessage.warning(`「${missing[0].title}」没有商品图。先上传图片，或回到选品库同步后再生成`)
     return
   }
   store.settings.promptText = form.promptText
@@ -172,16 +181,47 @@ function confirm() {
   const active = (store.settings.promptTemplates || []).find((item) => item.id === store.settings.activePromptTemplateId)
   if (active) Object.assign(active, { promptText: form.promptText, model: form.model, duration: form.duration, ratio: form.ratio, voice: form.voice })
   store.persist()
+  try {
+    const opened = await window.tujian.openAccount({
+      kind: 'doubao',
+      id: account.id,
+      name: account.name,
+      login: account.login || '',
+      mode: account.loginMode || 'password',
+      url: 'https://www.doubao.com/chat/',
+      slot: 'acct',
+      already: account.loginStatus === '已登录'
+    })
+    if (opened && opened.ok === false) {
+      ElMessage.error(opened.message || '豆包网页没有打开')
+      return
+    }
+  } catch (error) {
+    ElMessage.error(error?.message || '豆包网页没有打开')
+    return
+  }
   const imagesByProduct = {}
-  drafts.value.forEach((item) => { imagesByProduct[item.id] = [...item.images] })
-  // 把确认框里的图写回选品，避免重新生成时又丢图
+  drafts.value.forEach((item) => {
+    const product = store.products.find((row) => row.id === item.id)
+    const removed = new Set(product?.removedImages || [])
+    const images = (item.images || []).filter((src) => src && !removed.has(src))
+    item.images = images
+    imagesByProduct[item.id] = [...images]
+  })
   drafts.value.forEach((item) => {
     if (!item.id || !item.images.length) return
     store.setProductImages(item.id, item.images)
   })
-  store.createWorks(store.promptProductIds, { ...form, imagesByProduct })
+  const created = store.createWorks(store.promptProductIds, { ...form, imagesByProduct })
+  if (!created?.length) {
+    ElMessage.error('豆包网页已打开，但这几件商品没有生成任务')
+    return
+  }
   store.promptVisible = false
-  ElMessage.success('正在打开网页版豆包。提示词和商品图片会自动发出，成片下载到保存位置。')
+  ElMessage.success(`已打开豆包，正在发送 ${created.length} 条的图片和提示词`)
+  } finally {
+    confirming.value = false
+  }
 }
 </script>
 

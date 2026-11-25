@@ -85,7 +85,7 @@ const doubaoRunning = new Set()
 const doubaoWatchAfter = new Map()
 let generateActive = 0
 const generatePending = []
-let nextDoubaoLaunch = 0
+let lastQueueNote = 0
 
 function quotaLimit(account) {
   if (Number(account?.quotaLimit) > 0) return Number(account.quotaLimit)
@@ -1573,7 +1573,8 @@ export const useAppStore = defineStore('app', {
       const accounts = (this.doubaoAccounts || []).filter((item) => {
         if (!item.enabled || skipped.includes(item.id) || doubaoRunning.has(item.id)) return false
         if (item.quotaDate && item.quotaDate === today) return false
-        if (this.works.some((row) => row.doubaoAccountId === item.id && row.status === '生成中')) return false
+        const generating = this.works.filter((row) => row.doubaoAccountId === item.id && row.status === '生成中').length
+        if (generating >= 5) return false
         return doubaoQuotaUsed(this.works, item, today) < quotaLimit(item)
       }).sort((a, b) => {
         const load = (id) => this.works.filter((row) => row.doubaoAccountId === id && row.quotaPending && row.status === '生成中').length
@@ -1591,24 +1592,54 @@ export const useAppStore = defineStore('app', {
       return accounts[0] || null
     },
     pumpGenerate(options = {}) {
-      const limit = Math.max(1, Math.min(10, Number(this.settings.doubaoOpen) || 1))
+      this.releaseStuckGenerations()
+      const configured = Math.max(1, Math.min(10, Number(this.settings.doubaoOpen) || 1))
+      const idleCount = (this.doubaoAccounts || []).filter((item) => {
+        if (!item.enabled || doubaoRunning.has(item.id)) return false
+        if (item.quotaDate && item.quotaDate === todayKey()) return false
+        const generating = this.works.filter((row) => row.doubaoAccountId === item.id && row.status === '生成中').length
+        return generating < 5 && doubaoQuotaUsed(this.works, item, todayKey()) < quotaLimit(item)
+      }).length
+      const needed = Math.ceil(generatePending.length / 5)
+      const limit = Math.min(10, Math.max(configured, Math.min(idleCount, needed || configured)))
       while (generateActive < limit) {
+        if (generatePending.length) {
+          const account = this.pickIdleDoubaoAccount()
+          if (account) {
+            const generating = this.works.filter((row) => row.doubaoAccountId === account.id && row.status === '生成中').length
+            const room = Math.min(5 - generating, quotaLimit(account) - doubaoQuotaUsed(this.works, account, todayKey()))
+            if (room > 0) {
+              const ids = []
+              while (ids.length < room && generatePending.length) ids.push(generatePending.shift())
+              if (ids.length) {
+                this.launchDoubaoBatch(ids, account.id, false, options)
+                continue
+              }
+            }
+          }
+        }
         const watchAccount = this.pickWatchDoubaoAccount()
         if (watchAccount) {
           const ids = this.works.filter((row) => row.doubaoAccountId === watchAccount.id && row.status === '生成中' && row.doubaoChatUrl).slice(0, 5).map((row) => row.id)
           this.launchDoubaoBatch(ids, watchAccount.id, true, options)
           continue
         }
-        if (!generatePending.length) break
-        const account = this.pickIdleDoubaoAccount()
-        if (!account) break
-        const room = Math.min(5, quotaLimit(account) - doubaoQuotaUsed(this.works, account, todayKey()))
-        if (room <= 0) break
-        const ids = []
-        while (ids.length < room && generatePending.length) ids.push(generatePending.shift())
-        if (!ids.length) break
-        this.launchDoubaoBatch(ids, account.id, false, options)
+        break
       }
+      if (generatePending.length && !this.pickIdleDoubaoAccount() && !this.pickWatchDoubaoAccount() && Date.now() - lastQueueNote > 60000) {
+        lastQueueNote = Date.now()
+        this.addLog('warning', '豆包', `还有 ${generatePending.length} 条在排队。每个号最多同时挂 5 条，额度用完后要等明天或换一个豆包号。`)
+      }
+    },
+    releaseStuckGenerations() {
+      this.works.forEach((work) => {
+        if (work.status !== '生成中' || work.doubaoChatUrl || work.videoPath) return
+        if (work.doubaoAccountId && doubaoRunning.has(work.doubaoAccountId)) return
+        if (generatePending.includes(work.id)) return
+        work.status = '待生成'
+        work.failReason = ''
+        if (work.quotaPending) releaseWorkQuota(work)
+      })
     },
     launchDoubaoBatch(workIds, accountId, watch, options = {}) {
       doubaoRunning.add(accountId)
@@ -1670,17 +1701,24 @@ export const useAppStore = defineStore('app', {
             voice: work.voice || this.settings.voice
           }, product || { title: work.title })
         const voiced = withVoice(prompt, work.voice || this.settings.voice)
+        const removed = new Set(product?.removedImages || [])
         const shots = this.productShots(work)
+        const fallbackShots = shots.length
+          ? shots
+          : [...new Set([...(work.images || []), work.image]
+            .map((item) => String(item || '').trim())
+            .filter((item) => item && !removed.has(item) && (/^https?:\/\//i.test(item) || item.startsWith('//') || /^file:/i.test(item) || /^local-video:/i.test(item) || /^[a-zA-Z]:[\\/]/.test(item)))
+            .map((item) => (item.startsWith('//') ? `https:${item}` : item)))]
         if (!watch) {
-          if (!String(voiced || '').trim() || !shots.length) {
+          if (!String(voiced || '').trim() || !fallbackShots.length) {
             work.status = '生成失败'
             work.failReason = !String(voiced || '').trim() ? '提示词是空的。提示词和图片必须一起发' : '没有商品图。提示词和图片必须一起发'
             this.addLog('warning', '豆包', `「${work.title}」${work.failReason}`)
             continue
           }
           work.prompt = voiced
-          work.images = shots
-          work.image = shots[0]
+          work.images = fallbackShots
+          work.image = fallbackShots[0]
           if (!work.no) work.no = this.nextWorkNo()
           work.status = '生成中'
           work.progress = 10
@@ -1694,7 +1732,7 @@ export const useAppStore = defineStore('app', {
         jobs.push({
           workId: work.id,
           prompt: voiced,
-          images: shots,
+          images: fallbackShots,
           chatUrl: work.doubaoChatUrl || ''
         })
         taskIds.set(work.id, this.beginTask({
@@ -2081,7 +2119,7 @@ export const useAppStore = defineStore('app', {
           no: this.nextWorkNo(),
           title: product?.title || '未命名带货视频',
           hue: product?.hue ?? 210,
-          status: '生成中',
+          status: '待生成',
           progress: 0,
           model: form.model,
           duration: form.duration,
@@ -2131,7 +2169,7 @@ export const useAppStore = defineStore('app', {
           this.addLog('warning', '豆包', `「${work.title}」${work.failReason}`)
           return
         }
-        this.kickGenerate(id)
+        this.kickGenerate(id, { immediate: true })
       })
       this.persist()
       this.queueOpen = true
@@ -2187,7 +2225,7 @@ export const useAppStore = defineStore('app', {
       const previous = new Set([...(product.images || []), product.image].filter(Boolean))
       const removed = [...previous].filter((item) => !next.includes(item))
       product.imagesEdited = true
-      product.removedImages = [...new Set([...(product.removedImages || []), ...removed])]
+      product.removedImages = [...new Set([...(product.removedImages || []), ...removed])].filter((item) => !next.includes(item))
       product.images = next
       product.image = next[0] || ''
       this.persist()
